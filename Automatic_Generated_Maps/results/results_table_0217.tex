@@ -1,0 +1,19 @@
+\begin{table}[htbp]
+\centering
+\caption{Benchmark results on automatically generated maps. Improvement shows the percentage reduction in expected travel cost of RepeatedTopK over shortest-path replanning. Mean, Var, and Std are pooled across all runs.}
+\label{tab:auto_benchmark}
+\begin{tabular}{lccccccccc}
+\toprule
+Category & Maps & Runs & \multicolumn{3}{c}{SP Agent} & \multicolumn{3}{c}{Our Agent} & Impr. (\%) \\
+\cmidrule(lr){4-6} \cmidrule(lr){7-9}
+ & & & Mean & Var & Std & Mean & Var & Std & \\
+\midrule
+Dense & 45 & 5493 & 42.01 & 209.01 & 14.46 & 46.49 & 293.56 & 17.13 & -12.49 \\
+Many & 15 & 1741 & 43.37 & 180.02 & 13.42 & 50.45 & 333.91 & 18.27 & -17.18 \\
+Medium & 45 & 5456 & 38.57 & 160.65 & 12.67 & 44.92 & 269.31 & 16.41 & -16.33 \\
+Narrow & 45 & 5378 & 41.78 & 209.51 & 14.47 & 46.09 & 328.91 & 18.14 & -10.27 \\
+\midrule
+\textbf{Overall} & 150 & 18068 & 41.03 & 194.58 & 13.95 & 46.28 & 302.91 & 17.40 & \textbf{-13.44} \\
+\bottomrule
+\end{tabular}
+\end{table}

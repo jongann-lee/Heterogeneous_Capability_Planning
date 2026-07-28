@@ -1,0 +1,15 @@
+{
+  "total_maps": 150,
+  "total_runs": 18068,
+  "overall_sp_mean": 41.031658180208105,
+  "overall_our_mean": 46.28016382554793,
+  "overall_improvement_pct": -12.791356426027836,
+  "total_wins": 3619,
+  "total_ties": 4972,
+  "total_losses": 9477,
+  "win_rate_pct": 20.029887093203453,
+  "maps_with_positive_improvement": 29,
+  "mean_per_map_improvement_pct": -13.44356465350806,
+  "median_per_map_improvement_pct": -8.798604131011558,
+  "std_per_map_improvement_pct": 19.001951133022246
+}

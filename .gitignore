@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.python-version
+
+# Virtual environments
+.venv
+
+# Claude Code
+.Claude
+
+
+# Cache
+cache/
+
+# Mac OS
+*.DS_Store
+
+# Simulation Results
+Multi_Agent/my_policy_simulation/
+
+
+

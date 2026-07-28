@@ -1,0 +1,61 @@
+{
+  "map": "WV_DEM_64x64",
+  "num_ovals": 3,
+  "block_prob": 0.5,
+  "num_runs": 200,
+  "valid_runs": 200,
+  "agent_params": {
+    "reward_ratio": 1.0,
+    "target_recursion": 4,
+    "target_num_obstacles": 3,
+    "target_obstacle_hop": 4,
+    "sample_recursion": 4,
+    "sample_num_obstacle": 3,
+    "sample_obstacle_hop": 4
+  },
+  "ovals": [
+    {
+      "center": [
+        59,
+        55
+      ],
+      "rx": 5,
+      "ry": 3,
+      "num_nodes": 44,
+      "path_type": "shortest_path"
+    },
+    {
+      "center": [
+        26,
+        33
+      ],
+      "rx": 4,
+      "ry": 4,
+      "num_nodes": 49,
+      "path_type": "shortest_path"
+    },
+    {
+      "center": [
+        2,
+        6
+      ],
+      "rx": 4,
+      "ry": 4,
+      "num_nodes": 43,
+      "path_type": "shortest_path"
+    }
+  ],
+  "sp_mean": 154.25638377227682,
+  "sp_var": 33.83771349937847,
+  "sp_std": 5.817019296803,
+  "our_mean": 155.9129724905096,
+  "our_var": 46.978031451611386,
+  "our_std": 6.854052192069402,
+  "improvement_pct": -1.0739190675429882,
+  "wins": 65,
+  "ties": 0,
+  "losses": 135,
+  "win_rate_pct": 32.5,
+  "sp_avg_runtime": 2.0117493295669555,
+  "our_avg_runtime": 6.5247686421871185
+}
