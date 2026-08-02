@@ -260,32 +260,33 @@ agent starting positions.
 Every random instance must be reproducible from a recorded seed and serialized
 configuration.
 
-## 7. Recommended software architecture
+## 7. Software architecture
 
-Do not carry the old RPS names into core abstractions. Suggested modules:
+The repository cleanup implemented the following top-level packages. New work
+should extend these packages instead of recreating `Multi_Agent/` or adding more
+root-level experiment scripts:
 
 ```text
-src/
-  domain.py              # Agent, Target, capabilities, outcomes
-  belief.py              # planner-visible target/edge state
-  simulator.py           # discrete-event mechanics
-  policy.py              # policy protocol/interface
-  terrain/
-    dem.py                # geospatial loading and graph construction
-    traversal.py          # travel-time model
-    visibility.py         # viewshed/observation model
-  policies/
-    nearest_capable.py
-    information_greedy.py
-    omniscient.py
-  rendering.py
-  instances.py
+simulation/
+  agent.py                # mutable per-episode agent state
+  domain.py               # capabilities, target types, encounters
+  engine.py               # discrete-event mechanics
+  real_map_benchmark.py   # DEM-backed experiment entry point
+  rendering.py            # optional PNG/MP4 adapter
+planning/
+  policies/               # active hand-written baselines
+  finite_horizon.py       # retained assignment methods
+  legacy/                 # comparison code outside the active pipeline
+learning/                 # future learned centralized planner
 tests/
+outputs/                  # ignored generated artifacts
 ```
 
-Core domain logic should not import rasterio, matplotlib, or real-map code.
-Terrain loading, rendering, and policy implementations should be adapters around
-the simulation kernel.
+Core domain logic does not import rasterio, matplotlib, or real-map code.
+Terrain loading, rendering, and policy implementations remain adapters around
+the simulation kernel. The legacy node attribute `rps_type` is still accepted
+as a serialization compatibility detail; new module and public function names
+are capability-based rather than RPS-based.
 
 ### 7.1 Suggested data model
 
@@ -435,4 +436,3 @@ The minimum information needed from the owner is:
 - whether collisions and communication constraints are in scope;
 - whether the first milestone should use synthetic graphs or immediately adapt
   the DEM pipeline.
-

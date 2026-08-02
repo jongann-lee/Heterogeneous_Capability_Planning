@@ -21,7 +21,6 @@ cache/
 *.DS_Store
 
 # Simulation Results
-Multi_Agent/my_policy_simulation/
-
+outputs/
 
 

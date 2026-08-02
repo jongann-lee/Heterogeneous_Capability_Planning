@@ -47,14 +47,20 @@ branch rather than assuming.**
   a TSP via `lin_kernighan_tsp.py`). `reward_functions.py` defines the
   per-node visibility reward. `calculate_path_reward` (in `repeated_topk.py`)
   is the shared reward function used by both single- and multi-agent code.
-- `Multi_Agent/` — the multi-agent extension.
-  - `finite_horizon_MA.py` — `Agent` class + assignment policies:
-    `finite_horizon_assignment` (Hungarian) and `sequential_greedy_assignment`
-    (submodular-aware greedy; the one actually used).
-  - `multi_agent_simulation.py` — turn-based simulation driver + the real-DEM
-    benchmark. CLI entry point (`main()` with argparse; see `--help`).
-  - `simulation_utils.py` — PNG/MP4 rendering of runs.
-  - `TSP_solver.py` — standalone nearest-neighbor / brute-force Hamiltonian helpers.
+- `simulation/` — execution and environment-facing interfaces.
+  - `agent.py` — mutable `Agent` episode state.
+  - `domain.py` — target types, capabilities, encounters, and random assignment.
+  - `engine.py` — map-agnostic continuous-time discrete-event simulator.
+  - `real_map_benchmark.py` — real-DEM CLI entry point.
+  - `rendering.py` — PNG/MP4 rendering, kept out of the core engine import path.
+- `planning/` — hand-written planning algorithms.
+  - `policies/baseline1.py` — independent capability-aware routing.
+  - `policies/baseline2.py` + `policies/scout_wrp.py` — WRP scout baseline.
+  - `finite_horizon.py` — older Hungarian and sequential-greedy assignments.
+  - `legacy/` — retained comparison algorithms, not active entry points.
+- `learning/` — dependency-free placeholder for the learned centralized planner.
+- `tests/` — fast synthetic regression tests for the generalized simulator.
+- `outputs/` — ignored run artifacts moved intact from `Multi_Agent/`.
 - `Graph_Generation/` — environment construction. `target_graph.py` has
   `stochastic_accumulated_blockage_path` (the diverse-path sampler used
   everywhere) and `create_fully_connected_target_graph`. Also `visibility.py`,
@@ -99,21 +105,21 @@ venv — **system `python` lacks them.** Use `uv run python ...` (pyproject is
 present on `main`/`fixed_key`); the `.venv` is untracked so it persists across
 branch switches, so `.venv/bin/python` also works.
 
-Multi-agent simulation on the real DEM map:
+Generalized simulation on the real DEM map:
 ```
-uv run python Multi_Agent/multi_agent_simulation.py --render        # writes PNGs + MP4
-uv run python Multi_Agent/multi_agent_simulation.py --debug         # per-replan debug frames
-uv run python Multi_Agent/multi_agent_simulation.py --help          # all flags (vary by branch)
+uv run python -m simulation.real_map_benchmark --help
+uv run python -m simulation.real_map_benchmark --policy baseline1
+uv run python -m simulation.real_map_benchmark --policy baseline2 --render
+uv run python -m tests.test_simulation
 ```
-Outputs land in `Multi_Agent/my_policy_simulation/`. Algorithm hyperparameters
-are set inside `main()` (not all are CLI flags). MP4 export needs `ffmpeg`.
+Outputs land in `outputs/my_policy_simulation/`. MP4 export needs `ffmpeg`.
 
 ## Conventions / things that bite
 
 - **Seeds:** set `random.seed(...)` and `np.random.seed(...)` once in `main()`;
   the diverse-path sampler and any lock/target randomization derive from there.
-- **Verify before deleting/overwriting** the generated frames/CSVs in
-  `my_policy_simulation/` — they're run artifacts.
+- **Verify before deleting/overwriting** generated frames/CSVs in `outputs/` —
+  they are run artifacts.
 - Some older benchmark scripts (`benchmark.py`, `Real_Life_Maps/*benchmark*.py`,
   `Automatic_Generated_Maps/run_benchmark.py`) call `RepeatedTopK` with an
   out-of-date signature and may be stale on some branches — check before relying

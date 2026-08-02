@@ -1,0 +1,16 @@
+[project]
+name = "heterogeneous-capability-planning"
+version = "0.1.0"
+description = "Centralized planning for heterogeneous agents on uncertain terrain"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.11.1",
+    "networkx>=3.6.1",
+    "numpy>=2.5.1",
+    "osmnx>=2.1.1",
+    "pyproj>=3.7.2",
+    "rasterio>=1.5.0",
+    "scipy>=1.18.0",
+    "tqdm>=4.70.0",
+]
