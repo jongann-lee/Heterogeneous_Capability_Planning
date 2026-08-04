@@ -365,6 +365,11 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
         # committed to their current edge until they arrive.
         planners = [a for i, a in enumerate(agents)
                     if a.alive and transit[i] is None]
+        # Learned centralized policies need the observable state of the whole
+        # team.  The legacy callable interface remains unchanged for baselines.
+        runtime_hook = getattr(policy, "set_runtime_state", None)
+        if runtime_hook is not None:
+            runtime_hook(agents, transit, clock)
         policy(env_map, planners, reward_ratio=reward_ratio,
                obs_discount_factor=obs_discount_factor,
                sample_recursion=sample_recursion,
