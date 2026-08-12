@@ -1,0 +1,29 @@
+model:
+  num_target_types: 3
+  model_dim: 128
+  num_heads: 4
+  num_world_blocks: 2
+  dropout: 0.0
+  relation_hidden_dim: 64
+
+candidates:
+  staging_per_target: 2
+  staging_capacity: 1
+  include_wait: true
+  include_continue: true
+
+reinforce:
+  learning_rate: 0.0003
+  entropy_coefficient: 0.01
+  baseline_decay: 0.95
+  death_penalty: 100.0
+  incomplete_penalty: 1000.0
+  gradient_clip_norm: 1.0
+
+training:
+  episodes: 100
+  num_agents: 4
+  grid_size: 5
+  seed: 0
+  device: auto
+  checkpoint: learning_policy.pt

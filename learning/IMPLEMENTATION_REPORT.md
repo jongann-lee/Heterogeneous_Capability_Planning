@@ -24,11 +24,11 @@ smoke checks were performed. Full experiment execution remains with the user.
 
 ### Core configuration
 
-- `learning/config.py`
-  - Defines immutable configuration dataclasses for the model, candidate
-    generator, and REINFORCE trainer.
-  - Validates important architectural constraints, such as requiring the model
-    dimension to be divisible by the number of attention heads.
+- `learning/config.yaml`
+  - Stores model, candidate-generation, REINFORCE, and smoke-training settings.
+- `learning/configuration.py`
+  - Loads YAML into typed immutable objects and validates architectural and
+    numerical constraints.
 
 ### Candidate generation
 
@@ -72,11 +72,12 @@ smoke checks were performed. Full experiment execution remains with the user.
     vectors.
 
 - `learning/attention.py`
-  - Implements residual multi-head attention with layer normalization,
-    feed-forward layers, dropout, and padding masks.
-  - Implements the bidirectional world block in which agents and targets first
-    perform self-attention and then read from one another through separate
-    cross-attention directions.
+  - Uses PyTorch `TransformerDecoderLayer` rather than custom residual
+    attention machinery.
+  - Each block performs built-in self-attention, cross-attention, residual,
+    normalization, feed-forward, and dropout processing with padding masks.
+  - Implements bidirectional agent-target blocks and action-target
+    contextualization without positional encoding, preserving set symmetry.
 
 - `learning/model.py`
   - Implements the complete `CentralizedPolicy` network.
@@ -259,7 +260,8 @@ style, so they do not require `pytest`.
 
 ## Debugging and Verification Performed
 
-The following checks were run with the repository's `.venv` Python:
+The following checks were run for the initial implementation with the
+repository's `.venv` Python:
 
 ```bash
 .venv/bin/python -m tests.test_learning
@@ -292,7 +294,12 @@ successfully. A model trained for only one sampled episode is not expected to
 perform reliably in greedy evaluation, so that smoke evaluation was treated as
 an interface/debugging check rather than a performance result.
 
-The installed PyTorch build reported `2.12.0+cu130`. CUDA was not available to
+The subsequent YAML and standard-Transformer refactor was made in
+an environment where Python execution was unavailable. Run the commands above
+on the GPU desktop before treating those historical results as verification of
+the refactored version.
+
+The installed PyTorch build previously reported `2.12.0+cu130`. CUDA was not available to
 the isolated debugging process, so the checks ran on CPU. This verifies the CPU
 execution path but does not constitute a CUDA performance or correctness run.
 
@@ -309,6 +316,7 @@ uv run python -m tests.test_simulation
 
 ```bash
 uv run python -m learning.train \
+  --config learning/config.yaml \
   --episodes 100 \
   --num-target-types 3 \
   --num-agents 4 \
@@ -410,4 +418,3 @@ planner. Important current limitations are:
 7. Only after the fixed-map behavior is stable, expand toward blockages, map
    encoders, learned baselines, or other extensions excluded from the initial
    scope.
-

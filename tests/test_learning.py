@@ -1,12 +1,13 @@
 """Fast checks for the centralized learned planner."""
 
 import copy
+from dataclasses import replace
 
 import networkx as nx
 import torch
 
 from learning.candidates import Candidate, generate_candidates
-from learning.config import ModelConfig
+from learning.configuration import load_config
 from learning.decoder import AssignmentDecoder, DecoderOutput
 from learning.model import CentralizedPolicy
 from learning.observation import batch_observations, build_observation
@@ -39,10 +40,24 @@ def _instance(two_agents=True):
 
 def _model():
     torch.manual_seed(7)
-    model = CentralizedPolicy(ModelConfig(
-        2, model_dim=32, num_heads=4, num_world_blocks=1))
+    config = replace(
+        load_config().model,
+        num_target_types=2,
+        model_dim=32,
+        num_heads=4,
+        num_world_blocks=1,
+    )
+    model = CentralizedPolicy(config)
     model.eval()
     return model
+
+
+def test_yaml_configuration_loads_and_validates():
+    config = load_config()
+    assert config.model.model_dim % config.model.num_heads == 0
+    assert config.candidates.include_wait
+    assert config.candidates.include_continue
+    assert config.training.device in {"auto", "cpu", "cuda"}
 
 
 def test_hidden_ground_truth_never_enters_observation():
@@ -114,7 +129,7 @@ def test_agent_action_target_permutation_equivariance():
 def test_masks_enforce_dead_transit_scout_and_compatibility_rules():
     graph, agents = _instance()
     agents[1].alive = False
-    candidates = generate_candidates(graph)
+    candidates = generate_candidates(graph, load_config().candidates)
     observation = build_observation(graph, agents, 2, candidates)
     assert not observation.feasible_action_mask[0, 1].any()
     target_index = next(i for i, c in enumerate(candidates) if c.is_target)

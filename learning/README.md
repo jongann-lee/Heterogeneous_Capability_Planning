@@ -10,10 +10,16 @@ agents currently at nodes. Agents traversing an edge are restricted to the
 `CONTINUE_CURRENT_ROUTE` action. No ground-truth graph is accepted by the
 observation builder or policy.
 
+Experiment settings live in `learning/config.yaml`; `learning/configuration.py`
+only loads and validates that file. The attention stack uses PyTorch's
+`TransformerDecoderLayer` for self-attention, cross-attention, residuals,
+normalization, and feed-forward processing.
+
 Quick smoke training and greedy evaluation on the included fixed grid:
 
 ```bash
 uv run python -m learning.train --episodes 100 --checkpoint learning_policy.pt
+uv run python -m learning.train --config learning/config.yaml
 uv run python -m learning.evaluate learning_policy.pt
 ```
 

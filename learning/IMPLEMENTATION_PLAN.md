@@ -147,7 +147,8 @@ C = ActionEncoder(action_features)     # [B, C, d]
 ```
 
 Small MLPs with categorical embeddings are sufficient for the initial
-encoders. Transformer layers provide contextual representations afterward.
+encoders. Use PyTorch's standard Transformer layers for contextual processing
+rather than maintaining custom attention/residual/feed-forward machinery.
 
 ### Agent-target world blocks
 
@@ -348,7 +349,8 @@ learning/
     reinforce.py          # loss and optimizer logic
     train.py              # training CLI
     evaluate.py           # greedy benchmark evaluation
-    config.py             # configuration dataclasses
+    config.yaml           # experiment and model settings
+    configuration.py      # YAML loading and validation
 
 tests/
     test_learning_observation.py

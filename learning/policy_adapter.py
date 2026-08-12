@@ -4,6 +4,7 @@ import networkx as nx
 import torch
 
 from learning.candidates import generate_candidates
+from learning.configuration import CandidateConfig, load_config
 from learning.observation import build_observation
 
 
@@ -11,11 +12,11 @@ class LearnedPolicyAdapter:
     """Callable simulator policy retaining differentiable decision traces."""
 
     def __init__(self, model, num_target_types: int, training: bool = False,
-                 staging_per_target: int = 2, device=None):
+                 candidate_config: CandidateConfig | None = None, device=None):
         self.model = model
         self.num_target_types = num_target_types
         self.training = training
-        self.staging_per_target = staging_per_target
+        self.candidate_config = candidate_config or load_config().candidates
         self.device = device or next(model.parameters()).device
         self.decision_log_probs = []
         self.decision_entropies = []
@@ -53,8 +54,7 @@ class LearnedPolicyAdapter:
     def __call__(self, env_map, at_node_agents, **_kwargs):
         all_agents = self._all_agents or list(at_node_agents)
         transit = self._transit or [None] * len(all_agents)
-        candidates = generate_candidates(
-            env_map, staging_per_target=self.staging_per_target)
+        candidates = generate_candidates(env_map, self.candidate_config)
         observation = build_observation(
             env_map, all_agents, self.num_target_types,
             candidates=candidates, transit=transit, clock=self._clock).to(self.device)
@@ -77,4 +77,3 @@ class LearnedPolicyAdapter:
                 continue
             agent.planned_path = self._route(
                 env_map, agent.position, candidate, live)
-

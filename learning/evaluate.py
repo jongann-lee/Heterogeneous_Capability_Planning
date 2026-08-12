@@ -4,7 +4,7 @@ import argparse
 
 import torch
 
-from learning.config import ModelConfig
+from learning.configuration import CandidateConfig, ModelConfig, load_config
 from learning.model import CentralizedPolicy
 from learning.instances import make_fixed_grid
 from learning.policy_adapter import LearnedPolicyAdapter
@@ -14,11 +14,18 @@ from simulation.engine import run_simulation
 def load_policy(checkpoint, device="cpu"):
     payload = torch.load(checkpoint, map_location=device, weights_only=True)
     config = ModelConfig(**payload["model_config"])
+    if "candidate_config" in payload:
+        candidate_payload = dict(payload["candidate_config"])
+        candidate_payload.setdefault("include_continue", True)
+        candidate_config = CandidateConfig(**candidate_payload)
+    else:
+        candidate_config = load_config().candidates
     model = CentralizedPolicy(config).to(device)
     model.load_state_dict(payload["model"])
     model.eval()
     return model, LearnedPolicyAdapter(
-        model, config.num_target_types, training=False, device=device)
+        model, config.num_target_types, training=False,
+        candidate_config=candidate_config, device=device)
 
 
 def evaluate_instance(checkpoint, env_map, ground_truth, agents,

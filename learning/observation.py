@@ -7,6 +7,7 @@ import networkx as nx
 import torch
 
 from learning.candidates import Candidate, generate_candidates
+from learning.configuration import CandidateConfig, load_config
 from simulation.domain import UNKNOWN_TYPE
 
 
@@ -77,11 +78,13 @@ def _path_distance(graph, path):
 def build_observation(graph: nx.Graph, agents, num_target_types: int,
                       candidates: list[Candidate] | None = None,
                       transit: list | None = None, clock: float = 0.0,
-                      committed_targets: dict[Any, Any] | None = None
+                      committed_targets: dict[Any, Any] | None = None,
+                      candidate_config: CandidateConfig | None = None,
                       ) -> PlannerObservation:
     """Build one observation using only ``graph`` (the planner's view)."""
     if candidates is None:
-        candidates = generate_candidates(graph)
+        candidates = generate_candidates(
+            graph, candidate_config or load_config().candidates)
     agents = list(agents)
     transit = list(transit) if transit is not None else [None] * len(agents)
     if len(transit) != len(agents):
@@ -146,7 +149,8 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
             x, y, float(candidate.is_target), float(candidate.is_observation),
             float(candidate.is_staging), float(candidate.is_wait),
             float(candidate.is_continue), len(candidate.associated_targets) /
-            max(len(targets), 1), len(candidate.observed_targets) /
+            max(len(targets), 1),
+            len(candidate.observed_targets) /
             max(len(targets), 1), height,
             float(candidate.capacity is None),
             0.0 if candidate.capacity is None else float(candidate.capacity),

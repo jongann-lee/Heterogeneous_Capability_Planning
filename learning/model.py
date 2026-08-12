@@ -5,8 +5,8 @@ import math
 import torch
 from torch import nn
 
-from learning.attention import ResidualAttention, WorldBlock
-from learning.config import ModelConfig
+from learning.attention import CrossTransformerBlock, WorldBlock
+from learning.configuration import ModelConfig
 from learning.decoder import AssignmentDecoder
 from learning.encoders import EntityEncoder
 from learning.observation import feature_dimensions
@@ -24,8 +24,7 @@ class CentralizedPolicy(nn.Module):
         self.world_blocks = nn.ModuleList([
             WorldBlock(d, config.num_heads, config.dropout)
             for _ in range(config.num_world_blocks)])
-        self.action_self = ResidualAttention(d, config.num_heads, config.dropout)
-        self.action_reads_target = ResidualAttention(
+        self.action_reads_target = CrossTransformerBlock(
             d, config.num_heads, config.dropout)
         self.action_target_relation = nn.Sequential(
             nn.Linear(fct, config.relation_hidden_dim), nn.GELU(),
@@ -48,10 +47,8 @@ class CentralizedPolicy(nn.Module):
         mask = observation.target_mask[:, None, :, None]
         relation = (relation * mask).sum(dim=2) / mask.sum(dim=2).clamp_min(1)
         c = c + relation
-        c = self.action_self(c, c, observation.action_mask,
-                             observation.action_mask)
-        c = self.action_reads_target(c, t, observation.target_mask,
-                                     observation.action_mask)
+        c = self.action_reads_target(
+            c, t, observation.action_mask, observation.target_mask)
         logits = torch.einsum("bad,bcd->bac", self.query(a), self.key(c))
         logits = logits / math.sqrt(self.config.model_dim)
         logits = logits + self.pair_relation(

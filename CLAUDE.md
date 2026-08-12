@@ -58,7 +58,8 @@ branch rather than assuming.**
   - `policies/baseline2.py` + `policies/scout_wrp.py` — WRP scout baseline.
   - `finite_horizon.py` — older Hungarian and sequential-greedy assignments.
   - `legacy/` — retained comparison algorithms, not active entry points.
-- `learning/` — dependency-free placeholder for the learned centralized planner.
+- `learning/` — PyTorch centralized attention planner, YAML configuration,
+  candidate generation, constrained decoding, and REINFORCE training tools.
 - `tests/` — fast synthetic regression tests for the generalized simulator.
 - `outputs/` — ignored run artifacts moved intact from `Multi_Agent/`.
 - `Graph_Generation/` — environment construction. `target_graph.py` has

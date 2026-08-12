@@ -9,7 +9,8 @@ each positive agent capability identifies a target type it can service.
 - `simulation/`: domain model, agent state, event engine, rendering, and the
   real-map benchmark entry point.
 - `planning/`: hand-written policies and retained comparison planners.
-- `learning/`: home for the future episodic PyTorch/REINFORCE planner.
+- `learning/`: centralized PyTorch attention policy, YAML configuration,
+  candidate generation, constrained decoding, and REINFORCE training.
 - `tests/`: small synthetic regression suite.
 - `Graph_Generation/`, `Real_Life_Maps/`, `Single_Agent/`: retained map and
   algorithm dependencies from the original research repository.

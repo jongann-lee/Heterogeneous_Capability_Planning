@@ -5,6 +5,7 @@ from typing import Any
 
 import networkx as nx
 
+from learning.configuration import CandidateConfig
 from simulation.domain import UNKNOWN_TYPE
 
 
@@ -42,9 +43,8 @@ def _visible_nodes(graph, node):
     return visible
 
 
-def generate_candidates(graph: nx.Graph, staging_per_target: int = 2,
-                        staging_capacity: int = 1, include_wait: bool = True,
-                        include_continue: bool = True) -> list[Candidate]:
+def generate_candidates(graph: nx.Graph,
+                        config: CandidateConfig) -> list[Candidate]:
     """Generate candidates without consulting a ground-truth graph.
 
     Physical nodes are deduplicated and receive multi-role flags. Staging
@@ -80,17 +80,17 @@ def generate_candidates(graph: nx.Graph, staging_per_target: int = 2,
         ranked = sorted(
             (n for n in non_targets if n in distances),
             key=lambda n: (distances[n], repr(n)),
-        )[:max(0, staging_per_target)]
+        )[:config.staging_per_target]
         for node in ranked:
             item = at(node)
             item.is_staging = True
             item.staging_targets.add(target)
             item.associated_targets.add(target)
-            item.capacity = staging_capacity
+            item.capacity = config.staging_capacity
 
     result = [by_node[node] for node in sorted(by_node, key=repr)]
-    if include_wait:
+    if config.include_wait:
         result.append(Candidate(None, is_wait=True, capacity=None))
-    if include_continue:
+    if config.include_continue:
         result.append(Candidate(None, is_continue=True, capacity=None))
     return result
