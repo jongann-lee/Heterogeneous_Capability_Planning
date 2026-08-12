@@ -5,9 +5,10 @@ description = "Centralized planning for heterogeneous agents on uncertain terrai
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
+    "cugraph-cu13==26.6.0",
     "matplotlib>=3.11.1",
     "networkx>=3.6.1",
-    "numpy>=2.5.1",
+    "numpy>=2.4,<2.5",
     "osmnx>=2.1.1",
     "pyproj>=3.7.2",
     "pyyaml>=6.0.3",
@@ -15,4 +16,13 @@ dependencies = [
     "scipy>=1.18.0",
     "torch==2.12.0",
     "tqdm>=4.70.0",
+    "wandb>=0.28.2",
 ]
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[tool.uv.sources]
+cugraph-cu13 = { index = "nvidia" }

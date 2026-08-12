@@ -19,7 +19,8 @@ from learning.configuration import (
 from learning.model import CentralizedPolicy
 from learning.instances import make_wv_dem_instance
 from learning.policy_adapter import LearnedPolicyAdapter
-from learning.reinforce import EMABaseline, optimization_step
+from learning.reinforce import (EMABaseline, batched_optimization_step,
+                                optimization_step)
 from learning.rollout import collect_episode
 
 
@@ -125,11 +126,93 @@ def train(instance_factory, num_target_types, episodes=100,
     return model, history
 
 
+def train_gpu(env, truth, agents, episodes, batch_size, model_config,
+              candidate_config, reinforce_config, run_config, device,
+              checkpoint=None):
+    """Train with parallel CUDA tensor episodes on one immutable WV world."""
+    from learning.gpu.observation import TensorObservationBuilder
+    from learning.gpu.rollout import collect_tensor_episodes
+    from learning.gpu.state import TensorEpisodeState
+    from learning.gpu.world import TensorWorld
+
+    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S_%f")
+    run_directory = Path(checkpoint) / timestamp if checkpoint else None
+    if run_directory is not None:
+        run_directory.mkdir(parents=True, exist_ok=False)
+    wandb_run = None
+    if run_config.training.wandb:
+        import wandb
+        logged_config = asdict(run_config)
+        logged_config["instance"] = _instance_config()
+        logged_config["backend"] = "cuda_tensor"
+        wandb_run = wandb.init(
+            project="heterogeneous-capability-planning", name=timestamp,
+            config=logged_config,
+            dir=str(run_directory) if run_directory is not None else None)
+
+    world = TensorWorld.from_networkx(env, candidate_config, device=device)
+    builder = TensorObservationBuilder(world, model_config.num_target_types)
+    model = CentralizedPolicy(model_config).to(device)
+    optimizer = torch.optim.Adam(model.parameters(),
+                                 lr=reinforce_config.learning_rate)
+    baseline = EMABaseline(reinforce_config.baseline_decay)
+    source = world.node_index[agents[0].position]
+    caps = torch.zeros((len(agents), model_config.num_target_types + 1),
+                       dtype=torch.bool, device=device)
+    for agent_index, agent in enumerate(agents):
+        for capability in agent.capabilities:
+            caps[agent_index, capability] = True
+    types = torch.tensor(
+        [truth.nodes[target]["rps_type"] for target in world.targets],
+        dtype=torch.long, device=device)
+    history = []
+    completed_episodes = 0
+    try:
+        while completed_episodes < episodes:
+            current_batch = min(batch_size, episodes - completed_episodes)
+            state = TensorEpisodeState.create(
+                world, torch.full((current_batch,), source, device=device),
+                caps[None].expand(current_batch, -1, -1).clone(),
+                types[None].expand(current_batch, -1).clone())
+            rollout = collect_tensor_episodes(
+                model, state, builder, reinforce_config.death_penalty,
+                reinforce_config.incomplete_penalty, training=True)
+            loss, _gradient_norm = batched_optimization_step(
+                optimizer, rollout, baseline,
+                reinforce_config.entropy_coefficient,
+                reinforce_config.gradient_clip_norm)
+            for item in range(current_batch):
+                episode = completed_episodes + item
+                metrics = {
+                    "episode": episode,
+                    "return": float(rollout.returns[item]),
+                    "loss": loss,
+                    "makespan": float(rollout.makespans[item]),
+                    "completed": bool(rollout.completed[item]),
+                }
+                history.append(metrics)
+                if wandb_run is not None:
+                    wandb_run.log(metrics, step=episode)
+            completed_episodes += current_batch
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
+    if run_directory is not None:
+        torch.save(model.state_dict(), run_directory / "trained_weights.pt")
+        saved_config = asdict(run_config)
+        saved_config["instance"] = _instance_config()
+        saved_config["backend"] = "cuda_tensor"
+        with (run_directory / "config.yaml").open("w", encoding="utf-8") as stream:
+            yaml.safe_dump(saved_config, stream, sort_keys=False)
+    return model, history, world, run_directory
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train the centralized policy on the 64x64 WV DEM")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--episodes", type=int)
+    parser.add_argument("--batch-size", type=int)
     parser.add_argument("--num-target-types", type=int)
     parser.add_argument("--num-agents", type=int)
     parser.add_argument("--seed", type=int)
@@ -141,6 +224,8 @@ def main():
     config = load_config(args.config)
     training = config.training
     episodes = args.episodes if args.episodes is not None else training.episodes
+    batch_size = (args.batch_size if args.batch_size is not None
+                  else training.batch_size)
     num_target_types = (args.num_target_types if args.num_target_types is not None
                         else config.model.num_target_types)
     num_agents = args.num_agents if args.num_agents is not None else training.num_agents
@@ -151,7 +236,8 @@ def main():
     checkpoint = args.checkpoint or training.checkpoint
     model_config = replace(config.model, num_target_types=num_target_types)
     resolved_training = replace(
-        training, episodes=episodes, num_agents=num_agents, seed=seed,
+        training, episodes=episodes, batch_size=batch_size,
+        num_agents=num_agents, seed=seed,
         device=requested_device, checkpoint=checkpoint)
     resolved_config = LearningConfig(
         model_config, config.candidates, config.reinforce, resolved_training)
@@ -165,11 +251,19 @@ def main():
             target_types=globals().get("TARGET_TYPES"),
             agent_capabilities=globals().get("AGENT_CAPABILITIES"))
 
-    _model, history = train(
-        factory, num_target_types, episodes,
-        model_config=model_config, candidate_config=config.candidates,
-        reinforce_config=config.reinforce, device=device,
-        checkpoint=checkpoint, run_config=resolved_config)
+    if device == "cuda":
+        env, truth, agents = factory(0)
+        _model, history, _world, run_directory = train_gpu(
+            env, truth, agents, episodes, batch_size, model_config,
+            config.candidates, config.reinforce, resolved_config, device,
+            checkpoint=checkpoint)
+        train.last_run_directory = run_directory
+    else:
+        _model, history = train(
+            factory, num_target_types, episodes,
+            model_config=model_config, candidate_config=config.candidates,
+            reinforce_config=config.reinforce, device=device,
+            checkpoint=checkpoint, run_config=resolved_config)
     last = history[-1] if history else {}
     print(f"run_directory={train.last_run_directory} episodes={episodes} "
           f"last_return={last.get('return')} completed={last.get('completed')}")

@@ -2,6 +2,7 @@
 
 import copy
 from dataclasses import replace
+from types import SimpleNamespace
 
 import networkx as nx
 import torch
@@ -9,6 +10,8 @@ import torch
 from learning.candidates import Candidate, generate_candidates
 from learning.configuration import load_config
 from learning.decoder import AssignmentDecoder, DecoderOutput
+from learning.gpu.routing import GridRouter
+from learning.gpu.state import TensorEpisodeState
 from learning.model import CentralizedPolicy
 from learning.observation import batch_observations, build_observation
 from learning.policy_adapter import LearnedPolicyAdapter
@@ -52,11 +55,63 @@ def _model():
     return model
 
 
+def test_tensor_router_matches_masked_networkx_shortest_paths():
+    graph = _line(6)
+    edges = list(graph.edges(data="distance"))
+    router = GridRouter.from_edges(
+        len(graph), [u for u, _v, _w in edges],
+        [v for _u, v, _w in edges], [w for _u, _v, w in edges])
+    blocked = torch.zeros((2, len(graph)), dtype=torch.bool)
+    blocked[1, 3] = True
+    result = router.shortest_paths(torch.tensor([0, 0]),
+                                   torch.tensor([5, 5]), blocked)
+    assert result.distances[0] == 5
+    assert result.goals_reached.tolist() == [True, False]
+    paths, lengths = router.reconstruct_paths(
+        result, torch.tensor([0, 0]), torch.tensor([5, 5]))
+    assert paths[0, :lengths[0]].tolist() == [0, 1, 2, 3, 4, 5]
+
+
+def test_tensor_episode_transition_matches_cpu_line_episode():
+    graph, agents = _instance(False)
+    agents[0].capabilities = frozenset({0, 1})
+
+    def straight_line(env, active_agents, **_kwargs):
+        for agent in active_agents:
+            agent.planned_path = list(range(agent.position, 5))
+
+    cpu = run_simulation(graph, graph.copy(), agents, policy=straight_line)
+    neighbors = torch.full((5, 2), -1, dtype=torch.long)
+    costs = torch.full((5, 2), torch.inf)
+    for node in range(5):
+        adjacent = list(graph.successors(node))
+        neighbors[node, :len(adjacent)] = torch.tensor(adjacent)
+        costs[node, :len(adjacent)] = 1.0
+    visible = torch.zeros((5, 1), dtype=torch.bool)
+    visible[3:, 0] = True
+    world = SimpleNamespace(
+        positions=torch.zeros((5, 2)), targets=[4],
+        target_nodes=torch.tensor([4]), visible_targets=visible,
+        neighbors=neighbors, edge_cost=costs)
+    state = TensorEpisodeState.create(
+        world, [0], [[[True, True]]], [[1]])
+    for next_node in range(1, 5):
+        state.dispatch_next_hops(torch.tensor([[next_node]]),
+                                 torch.tensor([[True]]))
+        state.advance()
+    assert state.completed().item() == cpu["completed"]
+    assert state.clock.item() == cpu["makespan"]
+    assert state.traversal_cost.sum().item() == cpu["total_cost"]
+    assert state.deaths.item() == cpu["num_deaths"]
+    assert state.target_known.item()
+
+
 def test_yaml_configuration_loads_and_validates():
     config = load_config()
     assert config.model.model_dim % config.model.num_heads == 0
     assert config.candidates.include_wait
     assert config.candidates.include_continue
+    assert config.training.batch_size >= 1
     assert config.training.device in {"auto", "cpu", "cuda"}
 
 

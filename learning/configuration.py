@@ -73,6 +73,7 @@ class ReinforceConfig:
 @dataclass(frozen=True)
 class TrainingConfig:
     episodes: int
+    batch_size: int
     num_agents: int
     seed: int
     device: str
@@ -80,8 +81,8 @@ class TrainingConfig:
     wandb: bool
 
     def __post_init__(self):
-        if self.episodes < 1 or self.num_agents < 1:
-            raise ValueError("episodes and num_agents must be positive")
+        if self.episodes < 1 or self.batch_size < 1 or self.num_agents < 1:
+            raise ValueError("episodes, batch_size, and num_agents must be positive")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be one of: auto, cpu, cuda")
         if not self.checkpoint:

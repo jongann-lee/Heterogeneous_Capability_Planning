@@ -22,6 +22,7 @@ class Candidate:
     associated_targets: set = field(default_factory=set)
     observed_targets: set = field(default_factory=set)
     staging_targets: set = field(default_factory=set)
+    region_nodes: frozenset = field(default_factory=frozenset)
     capacity: int | None = 1  # None means unlimited.
 
     @property
@@ -30,6 +31,9 @@ class Candidate:
             return ("special", "wait")
         if self.is_continue:
             return ("special", "continue")
+        if self.is_observation and self.region_nodes:
+            return ("observation_region", tuple(sorted(self.region_nodes,
+                                                        key=repr)))
         return ("node", self.node)
 
 
@@ -47,8 +51,10 @@ def generate_candidates(graph: nx.Graph,
                         config: CandidateConfig) -> list[Candidate]:
     """Generate candidates without consulting a ground-truth graph.
 
-    Physical nodes are deduplicated and receive multi-role flags. Staging
-    nodes are the nearest non-target nodes to each unknown target.
+    Each observation action represents every node (possibly disconnected)
+    that reveals exactly the same set of currently unknown targets. Its
+    selected destination is agent-dependent. Physical target/staging nodes
+    remain deduplicated.
     """
     live = [n for n, d in graph.nodes(data=True)
             if d.get("type") == "target_unreached"]
@@ -64,16 +70,25 @@ def generate_candidates(graph: nx.Graph,
         item.is_target = True
         item.associated_targets.add(target)
 
+    live_set = set(live)
+    non_targets = [n for n in graph.nodes if n not in live_set]
+    signature_nodes = {}
     unknown_set = set(unknown)
-    for node in sorted(graph.nodes, key=repr):
-        seen = _visible_nodes(graph, node) & unknown_set
-        if seen and node not in unknown_set:
-            item = at(node)
-            item.is_observation = True
-            item.observed_targets.update(seen)
-            item.associated_targets.update(seen)
+    for node in non_targets:
+        signature = frozenset(_visible_nodes(graph, node) & unknown_set)
+        if signature:
+            signature_nodes.setdefault(signature, set()).add(node)
 
-    non_targets = [n for n in graph.nodes if n not in set(live)]
+    observation_regions = []
+    for signature in sorted(signature_nodes, key=lambda value:
+                            tuple(map(repr, sorted(value, key=repr)))):
+        region = frozenset(signature_nodes[signature])
+        representative = min(region, key=repr)
+        observation_regions.append(Candidate(
+            node=representative, is_observation=True,
+            associated_targets=set(signature),
+            observed_targets=set(signature), region_nodes=region))
+
     for target in unknown:
         distances = nx.single_source_dijkstra_path_length(
             graph, target, weight="distance")
@@ -88,7 +103,8 @@ def generate_candidates(graph: nx.Graph,
             item.associated_targets.add(target)
             item.capacity = config.staging_capacity
 
-    result = [by_node[node] for node in sorted(by_node, key=repr)]
+    result = ([by_node[node] for node in sorted(by_node, key=repr)]
+              + sorted(observation_regions, key=lambda item: item.key))
     if config.include_wait:
         result.append(Candidate(None, is_wait=True, capacity=None))
     if config.include_continue:

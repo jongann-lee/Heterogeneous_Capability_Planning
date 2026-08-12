@@ -1,0 +1,247 @@
+"""GPU-native observation construction from batched tensor episode state."""
+
+import torch
+
+from learning.observation import PlannerObservation, feature_dimensions
+
+
+class TensorObservationBuilder:
+    def __init__(self, world, num_target_types):
+        self.world = world
+        self.num_target_types = int(num_target_types)
+
+    def candidate_roles(self, state):
+        live = state.target_live
+        unknown = live & ~state.target_known
+        target_links = self.world.target_candidate_mask[None] & live[:, None]
+        observed_links = self.world.candidate_observed_mask[None] & unknown[:, None]
+        staging_links = self.world.candidate_staging_mask[None] & unknown[:, None]
+        is_target = target_links.any(dim=2)
+        is_observation = observed_links.any(dim=2)
+        is_staging = staging_links.any(dim=2)
+        active = (is_target | is_observation | is_staging |
+                  self.world.candidate_is_wait[None] |
+                  self.world.candidate_is_continue[None])
+        associated = target_links | observed_links | staging_links
+        return (is_target, is_observation, is_staging, active, associated,
+                observed_links, staging_links)
+
+    def _route_banks(self, state):
+        """One masked SSSP per source plus exact final-edge target recovery."""
+        batch, agents = state.positions.shape
+        targets = state.target_live.shape[1]
+        distances = torch.empty((batch, agents, len(self.world.nodes)),
+                                device=state.positions.device)
+        predecessors = torch.empty_like(distances, dtype=torch.long)
+        for b in range(batch):
+            live_mask = sum((1 << t) for t in range(targets)
+                            if bool(state.target_live[b, t].item()))
+            sources = state.positions[b]
+            standard = self.world.router.sssp(sources, live_mask)
+            distances[b] = standard.distances
+            predecessors[b] = standard.predecessors
+        incoming = self.world.target_incoming_nodes.clamp_min(0)
+        alternatives = (distances[..., incoming]
+                        + self.world.target_incoming_costs[None, None])
+        target_distances, entry_slots = alternatives.min(dim=3)
+        entry_nodes = incoming[None, None].expand(batch, agents, -1, -1).gather(
+            3, entry_slots[..., None]).squeeze(3)
+        direct = distances[..., self.world.target_nodes]
+        target_distances = torch.where(state.target_live[:, None],
+                                       target_distances, direct)
+        entry_nodes = torch.where(state.target_live[:, None], entry_nodes,
+                                  self.world.target_nodes[None, None])
+        at_goal = state.positions[..., None] == self.world.target_nodes
+        target_distances = torch.where(at_goal, torch.zeros_like(target_distances),
+                                       target_distances)
+        entry_nodes = torch.where(at_goal, state.positions[..., None], entry_nodes)
+        return distances, predecessors, target_distances, entry_nodes
+
+    def build(self, state):
+        world = self.world
+        device = state.positions.device
+        batch, agents = state.positions.shape
+        targets = len(world.targets)
+        actions = len(world.candidates)
+        fa, ft, fc, _fat, _fac, _fct = feature_dimensions(self.num_target_types)
+        (is_target, is_observation, is_staging, active, associated,
+         observed_links, staging_links) = self.candidate_roles(state)
+        route_distances, predecessors, target_route_distances, target_entries = (
+            self._route_banks(state))
+
+        agent_x = torch.zeros((batch, agents, fa), device=device)
+        agent_x[..., :2] = world.positions[state.positions]
+        agent_x[..., 2] = state.alive
+        agent_x[..., 3] = state.capabilities[..., 0]
+        agent_x[..., 4] = ~state.moving
+        agent_x[..., 5] = state.moving
+        destination = torch.where(state.moving, state.transit_to, state.goal_nodes)
+        agent_x[..., 6:8] = world.positions[destination]
+        remaining = (state.arrival_time - state.clock[:, None]).clamp_min(0)
+        remaining = torch.where(state.moving, remaining, torch.zeros_like(remaining))
+        agent_x[..., 8] = remaining / world.distance_scale
+        agent_x[..., 9:] = state.capabilities[..., 1:].float()
+
+        target_x = torch.zeros((batch, targets, ft), device=device)
+        target_x[..., :2] = world.positions[world.target_nodes][None]
+        target_x[..., 2] = state.target_live
+        target_x[..., 3] = ~state.target_live
+        target_x[..., 4] = state.target_known
+        target_x[..., 5] = ~state.target_known
+        capable_counts = state.capabilities[..., 1:].sum(dim=1).float() / agents
+        known_type_index = (state.target_types - 1).clamp_min(0)
+        target_x[..., 7] = capable_counts.gather(1, known_type_index) * state.target_known
+        onehot = torch.nn.functional.one_hot(
+            known_type_index, self.num_target_types).float()
+        target_x[..., 8:] = onehot * state.target_known[..., None]
+
+        action_x = torch.zeros((batch, actions, fc), device=device)
+        physical = world.candidate_nodes >= 0
+        region_nodes = world.candidate_region_nodes.clamp_min(0)
+        region_mask = world.candidate_region_mask
+        region_count = region_mask.sum(dim=1).clamp_min(1)
+        region_positions = (world.positions[region_nodes] *
+                            region_mask[..., None]).sum(dim=1) / region_count[:, None]
+        action_x[..., :2] = region_positions[None]
+        action_x[..., 2] = is_target
+        action_x[..., 3] = is_observation
+        action_x[..., 4] = is_staging
+        action_x[..., 5] = world.candidate_is_wait
+        action_x[..., 6] = world.candidate_is_continue
+        action_x[..., 7] = associated.sum(dim=2) / max(targets, 1)
+        action_x[..., 8] = observed_links.sum(dim=2) / max(targets, 1)
+        region_heights = (world.heights[region_nodes] * region_mask).sum(
+            dim=1) / region_count
+        action_x[..., 9] = region_heights[None]
+        action_x[..., 10] = world.candidate_capacity < 0
+        action_x[..., 11] = world.candidate_capacity.clamp_min(0)
+
+        # Agent-target paths unblock the goal target while avoiding every other
+        # live target, exactly like learning.observation._safe_path.
+        target_nodes = world.target_nodes
+        at_distance = target_route_distances
+        reachable_at = torch.isfinite(at_distance) & (at_distance < 1e30)
+        at_rel = torch.zeros((batch, agents, targets, 6), device=device)
+        normalized_at = torch.where(reachable_at, at_distance / world.distance_scale,
+                                    torch.zeros_like(at_distance))
+        at_rel[..., 0] = normalized_at
+        at_rel[..., 1] = normalized_at
+        at_rel[..., 2] = state.target_known[:, None]
+        at_rel[..., 3] = ~state.target_known[:, None]
+        target_capability = state.capabilities.gather(
+            2, state.target_types[:, None, :].expand(-1, agents, -1))
+        at_rel[..., 4] = target_capability & state.target_known[:, None]
+
+        # Standard routes block all live targets. Target-action columns select
+        # their corresponding goal-unblocked bank.
+        safe_nodes = world.candidate_nodes.clamp_min(0)
+        region_options = route_distances[..., region_nodes]
+        region_options = region_options.masked_fill(
+            ~region_mask[None, None], torch.inf)
+        ac_distance, candidate_entry_slots = region_options.min(dim=3)
+        candidate_entry_nodes = region_nodes[None, None].expand(
+            batch, agents, -1, -1).gather(
+                3, candidate_entry_slots[..., None]).squeeze(3)
+        for target in range(targets):
+            columns = world.target_candidate_mask[:, target]
+            ac_distance[..., columns] = target_route_distances[
+                :, :, target, None]
+            candidate_entry_nodes[..., columns] = target_entries[
+                :, :, target, None]
+        ac_distance[..., ~physical] = 0.0
+        reachable = torch.isfinite(ac_distance) & (ac_distance < 1e30)
+        ac_rel = torch.zeros((batch, agents, actions, 7), device=device)
+        normalized_ac = torch.where(reachable, ac_distance / world.distance_scale,
+                                    torch.zeros_like(ac_distance))
+        ac_rel[..., 0] = normalized_ac
+        ac_rel[..., 1] = normalized_ac
+        ac_rel[..., 2] = reachable
+        ac_rel[..., 4] = world.candidate_is_continue & state.moving[..., None]
+        category_ok = ~(is_observation[:, None] & ~is_target[:, None] &
+                        ~is_staging[:, None] &
+                        ~state.capabilities[..., 0, None])
+        compatible = torch.ones((batch, agents, actions), dtype=torch.bool,
+                                device=device)
+        for target in range(targets):
+            columns = world.target_candidate_mask[:, target]
+            type_index = state.target_types[:, target, None].expand(
+                -1, agents).unsqueeze(2)
+            has_capability = state.capabilities.gather(
+                2, type_index).squeeze(2)
+            compatible[..., columns] = (
+                ~state.target_known[:, None, target, None] |
+                has_capability[..., None])
+        ac_rel[..., 5] = category_ok
+        ac_rel[..., 6] = compatible
+        feasible = state.alive[..., None] & active[:, None] & reachable & category_ok & compatible
+        feasible = torch.where(state.moving[..., None],
+                               world.candidate_is_continue[None, None], feasible)
+        feasible &= ~(~state.moving[..., None] &
+                      world.candidate_is_continue[None, None])
+
+        ct_rel = torch.zeros((batch, actions, targets, 7), device=device)
+        ct_rel[..., 0] = world.target_candidate_mask
+        ct_rel[..., 1] = observed_links
+        ct_rel[..., 2] = staging_links
+        target_region_options = world.target_distances[:, region_nodes].permute(1, 0, 2)
+        target_region_options = target_region_options.masked_fill(
+            ~region_mask[:, None], torch.inf)
+        base_distance = target_region_options.min(dim=2).values
+        base_distance[~physical] = 0.0
+        ct_rel[..., 3] = base_distance[None] / world.distance_scale
+        ct_rel[..., 4] = state.target_live[:, None]
+        ct_rel[..., 5] = state.target_known[:, None]
+        ct_rel[..., 6] = ~state.target_known[:, None]
+
+        observation = PlannerObservation(
+            agent_x, target_x, action_x,
+            torch.ones((batch, agents), dtype=torch.bool, device=device),
+            torch.ones((batch, targets), dtype=torch.bool, device=device),
+            active, at_rel, ac_rel, ct_rel, feasible,
+            [world.candidates for _ in range(batch)], action_capacities=(
+                torch.where(
+                    world.candidate_capacity < 0,
+                    torch.full_like(world.candidate_capacity,
+                                    torch.iinfo(torch.long).max),
+                    world.candidate_capacity)[None].expand(batch, -1)))
+        return (observation, route_distances, predecessors,
+                target_route_distances, target_entries,
+                candidate_entry_nodes)
+
+    def next_hops(self, state, action_indices, route_distances, predecessors,
+                  target_route_distances, target_entries,
+                  candidate_entry_nodes):
+        """Resolve selected candidate goals to the next route node on CUDA."""
+        world = self.world
+        actions = torch.as_tensor(action_indices, dtype=torch.long,
+                                  device=state.positions.device)
+        batch, agents = actions.shape
+        rows = torch.arange(batch, device=actions.device)[:, None]
+        agent_rows = torch.arange(agents, device=actions.device)[None, :]
+        goals = world.candidate_nodes[actions]
+        physical = goals >= 0
+        target_links = world.target_candidate_mask[actions]
+        is_target = target_links.any(dim=2)
+        target_index = target_links.long().argmax(dim=2)
+        pred = predecessors
+        cursor = candidate_entry_nodes[rows, agent_rows, actions]
+        next_hop = state.positions.clone()
+        final_edge = is_target & (cursor == state.positions) & (goals != state.positions)
+        next_hop = torch.where(final_edge, goals, next_hop)
+        active = physical & (cursor != state.positions)
+        for _ in range(len(world.nodes)):
+            previous = pred.gather(2, cursor[..., None]).squeeze(2)
+            valid = active & (previous >= 0)
+            adjacent_to_source = valid & (previous == state.positions)
+            next_hop = torch.where(adjacent_to_source, cursor, next_hop)
+            active = valid & ~adjacent_to_source
+            cursor = torch.where(active, previous, cursor)
+            if not active.any():
+                break
+        ordinary_distance = route_distances[rows, agent_rows, cursor.clamp_min(0)]
+        selected_target_distance = target_route_distances[
+            rows, agent_rows, target_index]
+        selected_distance = torch.where(is_target, selected_target_distance,
+                                        ordinary_distance)
+        reachable = selected_distance < 1e30
+        return next_hop, physical & reachable

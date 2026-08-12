@@ -26,6 +26,7 @@ class PlannerObservation:
     candidates: list[list[Candidate]] | None = None
     agents: list[list[Any]] | None = None
     targets: list[list[Any]] | None = None
+    action_capacities: torch.Tensor | None = None
 
     def to(self, device):
         values = {}
@@ -73,6 +74,22 @@ def _path_distance(graph, path):
         return float("inf")
     return sum(float(graph.edges[u, v].get("distance", 1.0))
                for u, v in zip(path, path[1:]))
+
+
+def candidate_path(graph, source, candidate, live_targets):
+    """Return the scored route to a physical action or nearest region entry."""
+    goals = (candidate.region_nodes if candidate.is_observation and
+             candidate.region_nodes else {candidate.node})
+    best_path, best_key = None, None
+    for goal in goals:
+        path = _safe_path(graph, source, goal, live_targets,
+                          allow_goal=candidate.is_target)
+        if path is None:
+            continue
+        key = (_path_distance(graph, path), repr(goal))
+        if best_key is None or key < best_key:
+            best_path, best_key = path, key
+    return best_path
 
 
 def build_observation(graph: nx.Graph, agents, num_target_types: int,
@@ -140,11 +157,18 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
         ])
 
     for c, candidate in enumerate(candidates):
-        x, y = pos.get(candidate.node, (0.0, 0.0))
+        region = candidate.region_nodes or ({candidate.node}
+                                             if candidate.node is not None else set())
+        if region:
+            x = sum(pos[node][0] for node in region) / len(region)
+            y = sum(pos[node][1] for node in region) / len(region)
+        else:
+            x, y = 0.0, 0.0
         heights = [float(d.get("height", 0.0)) for _, d in graph.nodes(data=True)]
         hscale = max((abs(h) for h in heights), default=1.0) or 1.0
-        height = (float(graph.nodes[candidate.node].get("height", 0.0)) / hscale
-                  if candidate.node in graph else 0.0)
+        height = (sum(float(graph.nodes[node].get("height", 0.0))
+                      for node in region) / len(region) / hscale
+                  if region else 0.0)
         action_x[c] = torch.tensor([
             x, y, float(candidate.is_target), float(candidate.is_observation),
             float(candidate.is_staging), float(candidate.is_wait),
@@ -175,8 +199,7 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
             elif candidate.is_continue:
                 reachable, dist, crosses = travel is not None, 0.0, False
             else:
-                path = _safe_path(graph, agent.position, candidate.node, live,
-                                  allow_goal=candidate.is_target)
+                path = candidate_path(graph, agent.position, candidate, live)
                 reachable = path is not None
                 dist = _path_distance(graph, path)
                 crosses = bool(path and (set(path[1:-1]) & live))
@@ -204,14 +227,19 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
 
     for c, candidate in enumerate(candidates):
         for j, target in enumerate(targets):
-            if candidate.node is None:
+            region = candidate.region_nodes or ({candidate.node}
+                                                 if candidate.node is not None else set())
+            if not region:
                 dist = float("inf")
             else:
-                try:
-                    dist = nx.shortest_path_length(
-                        graph, candidate.node, target, weight="distance")
-                except (nx.NetworkXNoPath, nx.NodeNotFound):
-                    dist = float("inf")
+                distances = []
+                for node in region:
+                    try:
+                        distances.append(nx.shortest_path_length(
+                            graph, node, target, weight="distance"))
+                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                        pass
+                dist = min(distances, default=float("inf"))
             known = graph.nodes[target].get("rps_type", UNKNOWN_TYPE) != UNKNOWN_TYPE
             ct_rel[c, j] = torch.tensor([
                 float(candidate.node == target),
@@ -261,5 +289,6 @@ def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:
         kwargs[name] = torch.cat([pad(getattr(item, name), shape) for item in items])
     kwargs.update(candidates=sum((x.candidates or [] for x in items), []),
                   agents=sum((x.agents or [] for x in items), []),
-                  targets=sum((x.targets or [] for x in items), []))
+                  targets=sum((x.targets or [] for x in items), []),
+                  action_capacities=None)
     return PlannerObservation(**kwargs)

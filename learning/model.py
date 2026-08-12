@@ -60,11 +60,15 @@ class CentralizedPolicy(nn.Module):
         candidate_batches = candidates or observation.candidates
         if candidate_batches is None:
             raise ValueError("candidates are required for decoding capacities")
-        unlimited = torch.iinfo(torch.long).max
-        capacities = torch.zeros(logits.shape[0], logits.shape[2],
-                                 dtype=torch.long, device=logits.device)
-        for b, items in enumerate(candidate_batches):
-            for c, item in enumerate(items):
-                capacities[b, c] = unlimited if item.capacity is None else item.capacity
+        if observation.action_capacities is not None:
+            capacities = observation.action_capacities
+        else:
+            unlimited = torch.iinfo(torch.long).max
+            capacities = torch.zeros(logits.shape[0], logits.shape[2],
+                                     dtype=torch.long, device=logits.device)
+            for b, items in enumerate(candidate_batches):
+                for c, item in enumerate(items):
+                    capacities[b, c] = (unlimited if item.capacity is None
+                                        else item.capacity)
         return self.decoder(logits, observation.feasible_action_mask,
                             capacities, self.training if training is None else training)

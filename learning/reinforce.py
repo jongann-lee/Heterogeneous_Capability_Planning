@@ -32,3 +32,22 @@ def optimization_step(optimizer, rollout, baseline: EMABaseline,
         parameters, gradient_clip_norm)
     optimizer.step()
     return float(loss.detach()), float(gradient_norm)
+
+
+def batched_optimization_step(optimizer, rollout, baseline: EMABaseline,
+                              entropy_coefficient=0.01,
+                              gradient_clip_norm=1.0):
+    """REINFORCE update for a vector of parallel episode rollouts."""
+    optimizer.zero_grad(set_to_none=True)
+    mean_return = float(rollout.returns.mean().detach())
+    baseline_value = baseline.update(mean_return)
+    advantages = rollout.returns.detach() - baseline_value
+    loss = (-(advantages * rollout.log_probabilities)
+            - entropy_coefficient * rollout.entropies).mean()
+    loss.backward()
+    parameters = [p for group in optimizer.param_groups
+                  for p in group["params"]]
+    gradient_norm = torch.nn.utils.clip_grad_norm_(parameters,
+                                                   gradient_clip_norm)
+    optimizer.step()
+    return float(loss.detach()), float(gradient_norm)

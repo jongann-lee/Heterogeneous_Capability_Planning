@@ -22,6 +22,7 @@ reinforce:
 
 training:
   episodes: 100
+  batch_size: 1
   num_agents: 4
   seed: 0
   device: CUDA

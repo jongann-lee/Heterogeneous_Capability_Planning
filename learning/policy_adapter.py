@@ -5,7 +5,7 @@ import torch
 
 from learning.candidates import generate_candidates
 from learning.configuration import CandidateConfig, load_config
-from learning.observation import build_observation
+from learning.observation import build_observation, candidate_path
 
 
 class LearnedPolicyAdapter:
@@ -36,20 +36,9 @@ class LearnedPolicyAdapter:
 
     @staticmethod
     def _route(graph, source, candidate, live):
-        if candidate.node is None:
+        if candidate.node is None and not candidate.region_nodes:
             return [source]
-        avoid = set(live)
-        if candidate.is_target:
-            avoid.discard(candidate.node)
-        avoid.discard(source)
-        view = graph.copy() if avoid else graph
-        if avoid:
-            view.remove_nodes_from(avoid)
-        try:
-            return nx.shortest_path(view, source, candidate.node,
-                                    weight="distance")
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            return [source]
+        return candidate_path(graph, source, candidate, live) or [source]
 
     def __call__(self, env_map, at_node_agents, **_kwargs):
         all_agents = self._all_agents or list(at_node_agents)
