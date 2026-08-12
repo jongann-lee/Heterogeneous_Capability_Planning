@@ -9,11 +9,11 @@ model:
 candidates:
   staging_per_target: 2
   staging_capacity: 1
-  include_wait: true
-  include_continue: true
+  include_wait: True
+  include_continue: True
 
 reinforce:
-  learning_rate: 0.0003
+  learning_rate: 3.0E-4
   entropy_coefficient: 0.01
   baseline_decay: 0.95
   death_penalty: 100.0
@@ -23,7 +23,7 @@ reinforce:
 training:
   episodes: 100
   num_agents: 4
-  grid_size: 5
   seed: 0
-  device: auto
-  checkpoint: learning_policy.pt
+  device: CUDA
+  checkpoint: learning/checkpoints
+  wandb: true

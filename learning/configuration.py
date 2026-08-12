@@ -74,20 +74,20 @@ class ReinforceConfig:
 class TrainingConfig:
     episodes: int
     num_agents: int
-    grid_size: int
     seed: int
     device: str
     checkpoint: str
+    wandb: bool
 
     def __post_init__(self):
         if self.episodes < 1 or self.num_agents < 1:
             raise ValueError("episodes and num_agents must be positive")
-        if self.grid_size < 3:
-            raise ValueError("grid_size must be at least 3")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be one of: auto, cpu, cuda")
         if not self.checkpoint:
             raise ValueError("checkpoint must not be empty")
+        if not isinstance(self.wandb, bool):
+            raise ValueError("wandb must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -112,9 +112,12 @@ def load_config(path: str | Path | None = None) -> LearningConfig:
         payload = yaml.safe_load(stream)
     if not isinstance(payload, dict):
         raise ValueError("learning configuration must be a YAML mapping")
+    training = dict(_section(payload, "training"))
+    if isinstance(training.get("device"), str):
+        training["device"] = training["device"].lower()
     return LearningConfig(
         model=ModelConfig(**_section(payload, "model")),
         candidates=CandidateConfig(**_section(payload, "candidates")),
         reinforce=ReinforceConfig(**_section(payload, "reinforce")),
-        training=TrainingConfig(**_section(payload, "training")),
+        training=TrainingConfig(**training),
     )

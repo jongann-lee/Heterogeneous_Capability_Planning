@@ -15,13 +15,20 @@ only loads and validates that file. The attention stack uses PyTorch's
 `TransformerDecoderLayer` for self-attention, cross-attention, residuals,
 normalization, and feed-forward processing.
 
-Quick smoke training and greedy evaluation on the included fixed grid:
+Training and greedy evaluation use the clockwise-rotated 64x64 WV DEM:
 
 ```bash
-uv run python -m learning.train --episodes 100 --checkpoint learning_policy.pt
+uv run python -m learning.train --episodes 100
 uv run python -m learning.train --config learning/config.yaml
-uv run python -m learning.evaluate learning_policy.pt
+uv run python -m learning.evaluate learning/checkpoints/<run-timestamp>
 ```
+
+Each training run creates a timestamped directory beneath
+`learning/checkpoints/` containing separate `trained_weights.pt` and
+`config.yaml` files. Pass `--checkpoint-dir` to use a different parent
+directory. With `training.wandb: true`, the same resolved configuration and
+per-episode return, loss, makespan, and completion status are logged to
+the `heterogeneous-capability-planning` Weights & Biases project.
 
 For research runs, import `learning.train.train` and supply an
 `instance_factory(episode)` returning fresh `(env_map, ground_truth, agents)`

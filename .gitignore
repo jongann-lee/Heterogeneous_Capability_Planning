@@ -23,4 +23,7 @@ cache/
 # Simulation Results
 outputs/
 
+# Learned checkpoints
+learning/checkpoints/
+
 
