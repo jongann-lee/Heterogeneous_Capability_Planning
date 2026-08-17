@@ -126,12 +126,14 @@ def train(instance_factory, num_target_types, episodes=100,
     return model, history
 
 
-def train_gpu(env, truth, agents, episodes, batch_size, model_config,
+def train_gpu(env, truth, agents, episodes, simulation_batch_size,
+              reinforce_batch_size, model_config,
               candidate_config, reinforce_config, run_config, device,
-              checkpoint=None):
+              checkpoint=None, instance_factory=None):
     """Train with parallel CUDA tensor episodes on one immutable WV world."""
     from learning.gpu.observation import TensorObservationBuilder
-    from learning.gpu.rollout import collect_tensor_episodes
+    from learning.gpu.rollout import (collect_tensor_episodes,
+                                      replay_tensor_gradients)
     from learning.gpu.state import TensorEpisodeState
     from learning.gpu.world import TensorWorld
 
@@ -151,49 +153,149 @@ def train_gpu(env, truth, agents, episodes, batch_size, model_config,
             dir=str(run_directory) if run_directory is not None else None)
 
     world = TensorWorld.from_networkx(env, candidate_config, device=device)
+    terrain = world.terrain
     builder = TensorObservationBuilder(world, model_config.num_target_types)
     model = CentralizedPolicy(model_config).to(device)
     optimizer = torch.optim.Adam(model.parameters(),
                                  lr=reinforce_config.learning_rate)
     baseline = EMABaseline(reinforce_config.baseline_decay)
-    source = world.node_index[agents[0].position]
-    caps = torch.zeros((len(agents), model_config.num_target_types + 1),
-                       dtype=torch.bool, device=device)
-    for agent_index, agent in enumerate(agents):
-        for capability in agent.capabilities:
-            caps[agent_index, capability] = True
-    types = torch.tensor(
-        [truth.nodes[target]["rps_type"] for target in world.targets],
-        dtype=torch.long, device=device)
+    def encode_episode(episode_world, episode_truth, episode_agents):
+        episode_source = episode_world.node_index[episode_agents[0].position]
+        episode_caps = torch.zeros(
+            (len(episode_agents), model_config.num_target_types + 1),
+            dtype=torch.bool, device=device)
+        for agent_index, agent in enumerate(episode_agents):
+            for capability in agent.capabilities:
+                episode_caps[agent_index, capability] = True
+        episode_types = torch.tensor(
+            [episode_truth.nodes[target]["rps_type"]
+             for target in episode_world.targets],
+            dtype=torch.long, device=device)
+        return episode_source, episode_caps, episode_types
+
+    source, caps, types = encode_episode(world, truth, agents)
+    random_overlay = instance_factory is not None and any(
+        globals().get(name) is None for name in (
+            "SOURCE_POSITION", "TARGET_POSITIONS", "TARGET_TYPES",
+            "AGENT_CAPABILITIES"))
     history = []
     completed_episodes = 0
     try:
         while completed_episodes < episodes:
-            current_batch = min(batch_size, episodes - completed_episodes)
-            state = TensorEpisodeState.create(
-                world, torch.full((current_batch,), source, device=device),
-                caps[None].expand(current_batch, -1, -1).clone(),
-                types[None].expand(current_batch, -1).clone())
-            rollout = collect_tensor_episodes(
-                model, state, builder, reinforce_config.death_penalty,
-                reinforce_config.incomplete_penalty, training=True)
-            loss, _gradient_norm = batched_optimization_step(
-                optimizer, rollout, baseline,
-                reinforce_config.entropy_coefficient,
-                reinforce_config.gradient_clip_norm)
-            for item in range(current_batch):
-                episode = completed_episodes + item
-                metrics = {
-                    "episode": episode,
-                    "return": float(rollout.returns[item]),
-                    "loss": loss,
-                    "makespan": float(rollout.makespans[item]),
-                    "completed": bool(rollout.completed[item]),
-                }
+            update_size = min(reinforce_batch_size,
+                              episodes - completed_episodes)
+            optimizer.zero_grad(set_to_none=True)
+            # Keep the baseline fixed across all microbatches in this update.
+            # Zero is the conventional initial baseline and avoids retaining a
+            # first pass of trajectory graphs just to initialize the EMA.
+            baseline_value = 0.0 if baseline.value is None else baseline.value
+            update_return_sum = 0.0
+            update_records = []
+            update_rollouts = []
+            accumulated = 0
+            while accumulated < update_size:
+                current_batch = min(simulation_batch_size,
+                                    update_size - accumulated)
+                if random_overlay:
+                    episode_number = completed_episodes + accumulated
+                    batch_env, batch_truth, batch_agents = instance_factory(
+                        episode_number)
+                    world = TensorWorld.from_networkx(
+                        batch_env, candidate_config, device=device,
+                        terrain=terrain)
+                    builder = TensorObservationBuilder(
+                        world, model_config.num_target_types)
+                    source, caps, types = encode_episode(
+                        world, batch_truth, batch_agents)
+                state = TensorEpisodeState.create(
+                    world, torch.full((current_batch,), source, device=device),
+                    caps[None].expand(current_batch, -1, -1).clone(),
+                    types[None].expand(current_batch, -1).clone())
+                rollout = collect_tensor_episodes(
+                    model, state, builder, reinforce_config.death_penalty,
+                    reinforce_config.incomplete_penalty, training=True)
+                update_return_sum += float(rollout.returns.detach().sum())
+                update_rollouts.append(rollout)
+                accumulated += current_batch
+                del state
+                # Return PyTorch's freed activation blocks to CUDA so RAPIDS
+                # can service subsequent cuGraph allocations.
+                torch.cuda.empty_cache()
+
+            batch_returns = torch.cat(
+                [rollout.returns.detach() for rollout in update_rollouts])
+            raw_advantages = batch_returns - baseline_value
+            advantage_mean = raw_advantages.mean()
+            advantage_std = raw_advantages.std(unbiased=False)
+            normalized_advantages = (
+                (raw_advantages - advantage_mean)
+                / advantage_std.clamp_min(1.0e-8))
+
+            advantage_offset = 0
+            for rollout in update_rollouts:
+                current_batch = rollout.returns.numel()
+                rollout_advantages = normalized_advantages[
+                    advantage_offset:advantage_offset + current_batch]
+                detached_losses, decision_counts = replay_tensor_gradients(
+                    model, rollout, rollout_advantages,
+                    reinforce_config.entropy_coefficient, update_size, device)
+                for item in range(current_batch):
+                    update_records.append({
+                        "return": float(rollout.returns[item]),
+                        "loss": float(detached_losses[item]),
+                        "makespan": float(rollout.makespans[item]),
+                        "completed": bool(rollout.completed[item]),
+                        "deaths": int(rollout.deaths[item]),
+                        "remaining_targets": int(
+                            rollout.remaining_targets[item]),
+                        "stalled": bool(rollout.stalled[item]),
+                        "all_agents_dead": bool(
+                            rollout.all_agents_dead[item]),
+                        "decisions": int(decision_counts[item]),
+                    })
+                advantage_offset += current_batch
+                del rollout, detached_losses, decision_counts
+                torch.cuda.empty_cache()
+            del update_rollouts, batch_returns, raw_advantages
+            del normalized_advantages
+
+            parameters = [parameter for group in optimizer.param_groups
+                          for parameter in group["params"]]
+            torch.nn.utils.clip_grad_norm_(
+                parameters, reinforce_config.gradient_clip_norm)
+            optimizer.step()
+            baseline.update(update_return_sum / update_size)
+            for offset, metrics in enumerate(update_records):
+                episode = completed_episodes + offset
+                metrics["episode"] = episode
                 history.append(metrics)
-                if wandb_run is not None:
-                    wandb_run.log(metrics, step=episode)
-            completed_episodes += current_batch
+            if wandb_run is not None:
+                update_index = completed_episodes // reinforce_batch_size
+                wandb_run.log({
+                    "update": update_index,
+                    "episodes_seen": completed_episodes + update_size,
+                    "mean_return": sum(record["return"]
+                                       for record in update_records) / update_size,
+                    "mean_loss": sum(record["loss"]
+                                     for record in update_records) / update_size,
+                    "advantage_mean": float(advantage_mean),
+                    "advantage_std": float(advantage_std),
+                    "mean_makespan": sum(record["makespan"]
+                                         for record in update_records) / update_size,
+                    "completion_rate": sum(record["completed"]
+                                           for record in update_records) / update_size,
+                    "mean_deaths": sum(record["deaths"]
+                                       for record in update_records) / update_size,
+                    "mean_remaining_targets": sum(
+                        record["remaining_targets"]
+                        for record in update_records) / update_size,
+                    "stalled_rate": sum(record["stalled"]
+                                        for record in update_records) / update_size,
+                    "all_agents_dead_rate": sum(
+                        record["all_agents_dead"]
+                        for record in update_records) / update_size,
+                }, step=update_index)
+            completed_episodes += update_size
     finally:
         if wandb_run is not None:
             wandb_run.finish()
@@ -212,7 +314,8 @@ def main():
         description="Train the centralized policy on the 64x64 WV DEM")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--episodes", type=int)
-    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--simulation-batch-size", type=int)
+    parser.add_argument("--reinforce-batch-size", type=int)
     parser.add_argument("--num-target-types", type=int)
     parser.add_argument("--num-agents", type=int)
     parser.add_argument("--seed", type=int)
@@ -224,8 +327,14 @@ def main():
     config = load_config(args.config)
     training = config.training
     episodes = args.episodes if args.episodes is not None else training.episodes
-    batch_size = (args.batch_size if args.batch_size is not None
-                  else training.batch_size)
+    simulation_batch_size = (
+        args.simulation_batch_size
+        if args.simulation_batch_size is not None
+        else training.simulation_batch_size)
+    reinforce_batch_size = (
+        args.reinforce_batch_size
+        if args.reinforce_batch_size is not None
+        else training.reinforce_batch_size)
     num_target_types = (args.num_target_types if args.num_target_types is not None
                         else config.model.num_target_types)
     num_agents = args.num_agents if args.num_agents is not None else training.num_agents
@@ -236,7 +345,9 @@ def main():
     checkpoint = args.checkpoint or training.checkpoint
     model_config = replace(config.model, num_target_types=num_target_types)
     resolved_training = replace(
-        training, episodes=episodes, batch_size=batch_size,
+        training, episodes=episodes,
+        simulation_batch_size=simulation_batch_size,
+        reinforce_batch_size=reinforce_batch_size,
         num_agents=num_agents, seed=seed,
         device=requested_device, checkpoint=checkpoint)
     resolved_config = LearningConfig(
@@ -254,9 +365,10 @@ def main():
     if device == "cuda":
         env, truth, agents = factory(0)
         _model, history, _world, run_directory = train_gpu(
-            env, truth, agents, episodes, batch_size, model_config,
+            env, truth, agents, episodes, simulation_batch_size,
+            reinforce_batch_size, model_config,
             config.candidates, config.reinforce, resolved_config, device,
-            checkpoint=checkpoint)
+            checkpoint=checkpoint, instance_factory=factory)
         train.last_run_directory = run_directory
     else:
         _model, history = train(

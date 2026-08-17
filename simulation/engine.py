@@ -25,16 +25,16 @@ What this module adds on top of the base loop:
   4. **Continuous time (discrete-event simulation).** An edge of cost c takes
      time c to traverse; the loop jumps between agent-arrival *events* via a
      time-ordered heap instead of stepping fixed ticks, so traversal cost is
-     reflected directly in elapsed time and *waiting is no longer free*. The
-     objective is the **makespan** (clock time of the last elimination) plus a
-     death penalty. An agent commits to its current edge and is re-planned when
-     it reaches the next node; observation happens at node arrivals.
+     reflected directly in elapsed time. The objective is the **makespan**
+     (clock time of the last elimination) plus a death penalty. Agents commit
+     to complete planned paths and replan only when information changes or a
+     committed destination is reached. Observation happens at node arrivals.
 
 The assignment policy is pluggable: pass any ``policy(env_map, agents, ...)``
-that sets each agent's ``planned_path``. On each event the policy is called
-with the living, *at-a-node* agents only (in-transit agents are committed to
-their current edge until they arrive). ``naive_type_aware_replan`` below is a
-minimal SAFE placeholder so the loop runs; replace it with the real baseline.
+that sets each agent's ``planned_path``. When replanning is triggered, the
+policy receives the living, *at-a-node* agents only; in-transit agents finish
+their current edge first. ``naive_type_aware_replan`` below is a minimal SAFE
+placeholder so the loop runs; replace it with the real baseline.
 """
 
 import os
@@ -327,10 +327,10 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
 
     Discrete-event: traversing an edge of cost c takes time c. The loop pops the
     next agent-arrival from a time-ordered heap, advances the clock to it,
-    observes / resolves combat at that node, re-plans the living at-a-node agents
-    (in-transit agents are committed to their current edge and re-planned only
-    when they arrive), and re-schedules moves. Waiting therefore costs real time
-    and shows up in the makespan.
+    observes / resolves combat at that node, and continues the committed path.
+    Replanning occurs only after new information, an encounter, or arrival at
+    the committed destination. In-transit agents finish their current edge
+    before responding to shared information changes.
 
     Args:
         env_map: planner view (copied internally; targets carry UNKNOWN types).
@@ -357,10 +357,13 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
     n = len(agents)
     transit = [None] * n            # transit[i] = (u, v, depart_t, arrive_t) or None
     heap = []                       # entries: (arrive_t, agent_idx)
+    pending_replan = set()          # learned new truth while still in transit
     clock = 0.0
+    policy_calls = 0
     pos = nx.get_node_attributes(ground_truth, "pos")
 
     def do_replan():
+        nonlocal policy_calls
         # Only living, at-a-node agents are (re)planned; in-transit agents are
         # committed to their current edge until they arrive.
         planners = [a for i, a in enumerate(agents)
@@ -370,6 +373,7 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
         runtime_hook = getattr(policy, "set_runtime_state", None)
         if runtime_hook is not None:
             runtime_hook(agents, transit, clock)
+        policy_calls += 1
         policy(env_map, planners, reward_ratio=reward_ratio,
                obs_discount_factor=obs_discount_factor,
                sample_recursion=sample_recursion,
@@ -445,13 +449,30 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
 
         # Observe from the new node (scout reveals; attacker is blind), then
         # resolve an encounter if the node is a live target.
-        observe_and_reveal(env_map, ground_truth, [a], events, clock, verbose)
+        newly_blocked, revealed = observe_and_reveal(
+            env_map, ground_truth, [a], events, clock, verbose)
+        encounter = None
         if env_map.nodes[v].get("type") == "target_unreached":
-            resolve_combat_on_arrival(env_map, ground_truth, a, i, v,
-                                      events, clock, verbose)
+            encounter = resolve_combat_on_arrival(
+                env_map, ground_truth, a, i, v, events, clock, verbose)
 
-        # Re-plan the living at-a-node team and (re)schedule their next edges.
-        do_replan()
+        # Preserve the committed path across ordinary intermediate arrivals.
+        # The original Real_Life_Maps runners only replace a path when newly
+        # observed truth invalidates it.  This multi-agent extension also needs
+        # a decision after a reveal/encounter or when an agent finishes its
+        # current assigned path and needs another action.
+        information_changed = bool(newly_blocked) or revealed > 0 \
+            or encounter is not None
+        destination_reached = a.alive and len(a.planned_path) < 2
+        pending_due = i in pending_replan
+        pending_replan.discard(i)
+        if information_changed:
+            pending_replan.update(
+                j for j, other in enumerate(agents)
+                if other.alive and transit[j] is not None)
+        if targets_remain() and (information_changed or destination_reached
+                                 or pending_due):
+            do_replan()
         for j in range(n):
             schedule(j)
 
@@ -478,6 +499,7 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
         "per_agent_cost": [a.total_traversal_cost for a in agents],
         "agent_capabilities": [sorted(a.capabilities) for a in agents],
         "events": events,
+        "policy_calls": policy_calls,
     }
 
 

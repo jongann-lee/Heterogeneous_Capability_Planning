@@ -22,6 +22,10 @@ class TensorEpisodeState:
     traversal_cost: torch.Tensor  # [B, A]
     deaths: torch.Tensor          # [B]
     goal_nodes: torch.Tensor      # [B, A]
+    route_next: torch.Tensor      # [B, A, N], committed successors
+    route_active: torch.Tensor    # [B, A]
+    needs_replan: torch.Tensor    # [B, A]
+    stalled: torch.Tensor         # [B]
 
     @classmethod
     def create(cls, world, source_nodes, capabilities, target_types):
@@ -50,7 +54,12 @@ class TensorEpisodeState:
             torch.zeros(batch, device=device),
             torch.zeros(shape, device=device),
             torch.zeros(batch, dtype=torch.long, device=device),
-            positions.clone())
+            positions.clone(),
+            torch.full((batch, agents, len(world.positions)), -1,
+                       dtype=torch.long, device=device),
+            torch.zeros(shape, dtype=torch.bool, device=device),
+            torch.ones(shape, dtype=torch.bool, device=device),
+            torch.zeros(batch, dtype=torch.bool, device=device))
         state.observe(torch.ones_like(state.alive))
         return state
 
@@ -59,12 +68,13 @@ class TensorEpisodeState:
         return self.positions.shape[0]
 
     def observe(self, observer_mask):
-        """Reveal targets visible to selected living scouts."""
+        """Reveal targets and return only previously unknown revelations."""
         scouts = self.capabilities[:, :, 0] & self.alive & observer_mask
         visible = self.world.visible_targets[self.positions]
         revealed = (visible & scouts[:, :, None]).any(dim=1)
+        newly_revealed = revealed & self.target_live & ~self.target_known
         self.target_known |= revealed & self.target_live
-        return revealed
+        return newly_revealed
 
     def dispatch_next_hops(self, next_nodes, agent_mask):
         """Start one edge traversal for selected at-node agents."""
@@ -114,7 +124,7 @@ class TensorEpisodeState:
             chosen, torch.full_like(self.arrival_time, torch.inf),
             self.arrival_time)
 
-        self.observe(chosen)
+        newly_revealed = self.observe(chosen)
         at_target = self.positions[:, :, None] == self.world.target_nodes
         encounter = at_target & self.target_live[:, None, :] & chosen[:, :, None]
         target_hit = encounter.any(dim=1)
@@ -128,7 +138,8 @@ class TensorEpisodeState:
         died = loses.any(dim=2)
         self.alive &= ~died
         self.deaths += died.sum(dim=1)
-        return active, arriving_agent
+        information_changed = newly_revealed.any(dim=1) | target_hit.any(dim=1)
+        return active, arriving_agent, chosen, information_changed
 
     def completed(self):
         return ~self.target_live.any(dim=1)

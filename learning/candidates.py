@@ -37,6 +37,28 @@ class Candidate:
         return ("node", self.node)
 
 
+class CandidateTerrainCache:
+    """Target-independent visibility and lazy distance rankings."""
+
+    def __init__(self, graph):
+        self.nodes = tuple(graph.nodes)
+        self.visible = {
+            node: frozenset(_visible_nodes(graph, node))
+            for node in self.nodes
+        }
+        self._staging_rankings = {}
+
+    def staging_ranking(self, graph, target):
+        ranking = self._staging_rankings.get(target)
+        if ranking is None:
+            distances = nx.single_source_dijkstra_path_length(
+                graph, target, weight="distance")
+            ranking = tuple(sorted(
+                distances, key=lambda node: (distances[node], repr(node))))
+            self._staging_rankings[target] = ranking
+        return ranking
+
+
 def _visible_nodes(graph, node):
     explicit = graph.nodes[node].get("visible_nodes")
     if explicit is not None:
@@ -48,7 +70,9 @@ def _visible_nodes(graph, node):
 
 
 def generate_candidates(graph: nx.Graph,
-                        config: CandidateConfig) -> list[Candidate]:
+                        config: CandidateConfig,
+                        terrain_cache: CandidateTerrainCache | None = None,
+                        ) -> list[Candidate]:
     """Generate candidates without consulting a ground-truth graph.
 
     Each observation action represents every node (possibly disconnected)
@@ -71,11 +95,14 @@ def generate_candidates(graph: nx.Graph,
         item.associated_targets.add(target)
 
     live_set = set(live)
-    non_targets = [n for n in graph.nodes if n not in live_set]
+    all_nodes = terrain_cache.nodes if terrain_cache is not None else graph.nodes
+    non_targets = [n for n in all_nodes if n not in live_set]
     signature_nodes = {}
     unknown_set = set(unknown)
     for node in non_targets:
-        signature = frozenset(_visible_nodes(graph, node) & unknown_set)
+        visible = (terrain_cache.visible[node] if terrain_cache is not None
+                   else _visible_nodes(graph, node))
+        signature = frozenset(visible & unknown_set)
         if signature:
             signature_nodes.setdefault(signature, set()).add(node)
 
@@ -90,12 +117,17 @@ def generate_candidates(graph: nx.Graph,
             observed_targets=set(signature), region_nodes=region))
 
     for target in unknown:
-        distances = nx.single_source_dijkstra_path_length(
-            graph, target, weight="distance")
-        ranked = sorted(
-            (n for n in non_targets if n in distances),
-            key=lambda n: (distances[n], repr(n)),
-        )[:config.staging_per_target]
+        if terrain_cache is None:
+            distances = nx.single_source_dijkstra_path_length(
+                graph, target, weight="distance")
+            ranked = sorted(
+                (n for n in non_targets if n in distances),
+                key=lambda n: (distances[n], repr(n)),
+            )[:config.staging_per_target]
+        else:
+            ranked = [node for node in terrain_cache.staging_ranking(
+                graph, target) if node not in live_set][
+                    :config.staging_per_target]
         for node in ranked:
             item = at(node)
             item.is_staging = True

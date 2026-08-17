@@ -16,17 +16,24 @@ WV_DEM_PATH = Path(__file__).resolve().parents[1] / "Real_Life_Maps" / "WV_DEM.t
 WV_ROADS_PATH = Path(__file__).resolve().parents[1] / "Real_Life_Maps" / "WV_roads.pkl"
 
 
-@lru_cache(maxsize=8)
-def _wv_graph_template(source, targets, num_target_types):
-    """Build expensive visibility data once for each spatial configuration."""
-    from simulation.real_map_benchmark import build_graphs
+@lru_cache(maxsize=1)
+def _wv_terrain_template():
+    """Build target-independent WV terrain and visibility exactly once."""
+    from Real_Life_Maps.real_map_generation import RealTerrainGrid
+    from simulation.real_map_benchmark import _load_real_terrain, _load_roads
 
-    built = build_graphs(
-        str(WV_DEM_PATH), str(WV_ROADS_PATH), WV_GRID_SIZE, source, targets,
-        num_target_types=num_target_types, rng=random.Random(0))
-    if built is None:
-        raise ValueError("a target is unreachable on the WV DEM")
-    return built[0], built[1]
+    height_grid = _load_real_terrain(str(WV_DEM_PATH), WV_GRID_SIZE)
+    road_nodes, road_edges = _load_roads(str(WV_ROADS_PATH))
+    terrain = RealTerrainGrid(
+        height_grid, source=(0, 0), targets=[], k_up=1.0, k_down=2.0,
+        road_nodes=road_nodes, road_edges=road_edges)
+    terrain.compute_all_visibilities()
+    graph = terrain.get_graph().copy()
+    for node in graph:
+        graph.nodes[node]["type"] = "intermediate"
+    for _u, _v, data in graph.edges(data=True):
+        data.setdefault("num_used", 1.0)
+    return graph
 
 
 def make_wv_dem_instance(seed=0, num_target_types=3, num_agents=4,
@@ -48,9 +55,13 @@ def make_wv_dem_instance(seed=0, num_target_types=3, num_agents=4,
     if source in targets or any(target not in nodes for target in targets):
         raise ValueError("target positions must be on-grid and differ from source")
 
-    template_env, template_truth = _wv_graph_template(
-        source, tuple(targets), num_target_types)
-    env, truth = template_env.copy(), template_truth.copy()
+    terrain = _wv_terrain_template()
+    env, truth = terrain.copy(), terrain.copy()
+    env.nodes[source]["type"] = "source"
+    truth.nodes[source]["type"] = "source"
+    for target in targets:
+        env.nodes[target]["type"] = "target_unreached"
+        truth.nodes[target]["type"] = "target_unreached"
     if target_types is None:
         types = assign_target_types(targets, num_target_types, rng)
     else:

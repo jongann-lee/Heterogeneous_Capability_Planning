@@ -26,18 +26,25 @@ class TensorObservationBuilder:
         return (is_target, is_observation, is_staging, active, associated,
                 observed_links, staging_links)
 
-    def _route_banks(self, state):
+    def _route_banks(self, state, episode_mask=None):
         """One masked SSSP per source plus exact final-edge target recovery."""
         batch, agents = state.positions.shape
         targets = state.target_live.shape[1]
-        distances = torch.empty((batch, agents, len(self.world.nodes)),
-                                device=state.positions.device)
-        predecessors = torch.empty_like(distances, dtype=torch.long)
+        distances = torch.full(
+            (batch, agents, len(self.world.nodes)), torch.inf,
+            device=state.positions.device)
+        predecessors = torch.full_like(distances, -1, dtype=torch.long)
+        if episode_mask is None:
+            episode_mask = torch.ones(batch, dtype=torch.bool,
+                                      device=state.positions.device)
         for b in range(batch):
-            live_mask = sum((1 << t) for t in range(targets)
-                            if bool(state.target_live[b, t].item()))
+            if not bool(episode_mask[b].item()):
+                continue
+            blocked_nodes = self.world.target_nodes[
+                state.target_live[b]].tolist()
             sources = state.positions[b]
-            standard = self.world.router.sssp(sources, live_mask)
+            standard = self.world.router.sssp(
+                sources, blocked_nodes, self.world.required_route_nodes)
             distances[b] = standard.distances
             predecessors[b] = standard.predecessors
         incoming = self.world.target_incoming_nodes.clamp_min(0)
@@ -57,7 +64,7 @@ class TensorObservationBuilder:
         entry_nodes = torch.where(at_goal, state.positions[..., None], entry_nodes)
         return distances, predecessors, target_distances, entry_nodes
 
-    def build(self, state):
+    def build(self, state, planning_episode_mask=None):
         world = self.world
         device = state.positions.device
         batch, agents = state.positions.shape
@@ -67,7 +74,7 @@ class TensorObservationBuilder:
         (is_target, is_observation, is_staging, active, associated,
          observed_links, staging_links) = self.candidate_roles(state)
         route_distances, predecessors, target_route_distances, target_entries = (
-            self._route_banks(state))
+            self._route_banks(state, planning_episode_mask))
 
         agent_x = torch.zeros((batch, agents, fa), device=device)
         agent_x[..., :2] = world.positions[state.positions]
@@ -211,7 +218,7 @@ class TensorObservationBuilder:
     def next_hops(self, state, action_indices, route_distances, predecessors,
                   target_route_distances, target_entries,
                   candidate_entry_nodes):
-        """Resolve selected candidate goals to the next route node on CUDA."""
+        """Resolve and materialize selected routes once on CUDA."""
         world = self.world
         actions = torch.as_tensor(action_indices, dtype=torch.long,
                                   device=state.positions.device)
@@ -223,25 +230,42 @@ class TensorObservationBuilder:
         target_links = world.target_candidate_mask[actions]
         is_target = target_links.any(dim=2)
         target_index = target_links.long().argmax(dim=2)
-        pred = predecessors
         cursor = candidate_entry_nodes[rows, agent_rows, actions]
-        next_hop = state.positions.clone()
-        final_edge = is_target & (cursor == state.positions) & (goals != state.positions)
-        next_hop = torch.where(final_edge, goals, next_hop)
-        active = physical & (cursor != state.positions)
-        for _ in range(len(world.nodes)):
-            previous = pred.gather(2, cursor[..., None]).squeeze(2)
-            valid = active & (previous >= 0)
-            adjacent_to_source = valid & (previous == state.positions)
-            next_hop = torch.where(adjacent_to_source, cursor, next_hop)
-            active = valid & ~adjacent_to_source
-            cursor = torch.where(active, previous, cursor)
-            if not active.any():
-                break
-        ordinary_distance = route_distances[rows, agent_rows, cursor.clamp_min(0)]
+        ordinary_distance = route_distances[
+            rows, agent_rows, cursor.clamp_min(0)]
         selected_target_distance = target_route_distances[
             rows, agent_rows, target_index]
         selected_distance = torch.where(is_target, selected_target_distance,
                                         ordinary_distance)
-        reachable = selected_distance < 1e30
-        return next_hop, physical & reachable
+        reachable = physical & (selected_distance < 1e30)
+        destination = torch.where(is_target, goals, cursor)
+
+        route_next = torch.full(
+            (batch, agents, len(world.nodes)), -1, dtype=torch.long,
+            device=actions.device)
+        # Target routes stop at an incoming node in the standard SSSP bank;
+        # append the deliberately unblocked final target edge.
+        final_edge = reachable & is_target & (cursor != goals)
+        final_rows, final_agents = torch.where(final_edge)
+        if final_rows.numel():
+            route_next[final_rows, final_agents,
+                       cursor[final_rows, final_agents]] = goals[
+                           final_rows, final_agents]
+
+        active = reachable & (cursor != state.positions)
+        for _ in range(len(world.nodes)):
+            previous = predecessors.gather(2, cursor[..., None]).squeeze(2)
+            valid = active & (previous >= 0)
+            valid_rows, valid_agents = torch.where(valid)
+            if valid_rows.numel():
+                route_next[valid_rows, valid_agents,
+                           previous[valid_rows, valid_agents]] = cursor[
+                               valid_rows, valid_agents]
+            active = valid & (previous != state.positions)
+            cursor = torch.where(active, previous, cursor)
+            if not active.any():
+                break
+        next_hop = route_next[rows, agent_rows, state.positions]
+        at_destination = reachable & (destination == state.positions)
+        return (next_hop.clamp_min(0), reachable | at_destination,
+                route_next, destination)

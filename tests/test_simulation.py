@@ -196,6 +196,26 @@ def test_placeholder_clears_n_type_instance():
     assert all(agent.alive for agent in agents)
 
 
+def test_committed_path_does_not_replan_at_intermediate_nodes():
+    truth = _line(6)
+    env = _line(6)
+    _set_targets(truth, {5: 1})
+    _set_targets(env, {5: 1})
+    init_target_types(env, truth, {5: 1})
+    calls = []
+
+    def committed_policy(_env, active_agents, **_kwargs):
+        calls.append(tuple(agent.position for agent in active_agents))
+        for agent in active_agents:
+            agent.planned_path = list(range(agent.position, 6))
+
+    agent = Agent(0, capabilities={1})
+    result = run_simulation(env, truth, [agent], policy=committed_policy)
+    assert result["completed"]
+    assert result["policy_calls"] == 1
+    assert calls == [(0,)]
+
+
 def test_placeholder_leaves_unsupported_target_incomplete():
     target_types = {(0, 3): 4}
     truth = _grid(2, 4)

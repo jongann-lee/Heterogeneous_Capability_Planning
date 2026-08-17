@@ -73,7 +73,8 @@ class ReinforceConfig:
 @dataclass(frozen=True)
 class TrainingConfig:
     episodes: int
-    batch_size: int
+    simulation_batch_size: int
+    reinforce_batch_size: int
     num_agents: int
     seed: int
     device: str
@@ -81,8 +82,11 @@ class TrainingConfig:
     wandb: bool
 
     def __post_init__(self):
-        if self.episodes < 1 or self.batch_size < 1 or self.num_agents < 1:
-            raise ValueError("episodes, batch_size, and num_agents must be positive")
+        if (self.episodes < 1 or self.simulation_batch_size < 1 or
+                self.reinforce_batch_size < 1 or self.num_agents < 1):
+            raise ValueError(
+                "episodes, simulation_batch_size, reinforce_batch_size, and "
+                "num_agents must be positive")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be one of: auto, cpu, cuda")
         if not self.checkpoint:
@@ -114,6 +118,12 @@ def load_config(path: str | Path | None = None) -> LearningConfig:
     if not isinstance(payload, dict):
         raise ValueError("learning configuration must be a YAML mapping")
     training = dict(_section(payload, "training"))
+    # Read checkpoints/configs made before rollout and optimizer batching were
+    # separated. The old value controlled both behaviors.
+    legacy_batch_size = training.pop("batch_size", None)
+    if legacy_batch_size is not None:
+        training.setdefault("simulation_batch_size", legacy_batch_size)
+        training.setdefault("reinforce_batch_size", legacy_batch_size)
     if isinstance(training.get("device"), str):
         training["device"] = training["device"].lower()
     return LearningConfig(

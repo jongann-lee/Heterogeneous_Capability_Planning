@@ -59,3 +59,32 @@ class AssignmentDecoder:
         return DecoderOutput(assignments, flat_indices,
                              torch.stack(joint_logps),
                              torch.stack(joint_entropies))
+
+    def evaluate_selected(self, pair_logits, feasible_mask, capacities,
+                          selected_pair_indices):
+        """Evaluate recorded autoregressive choices without resampling."""
+        batch, num_agents, num_actions = pair_logits.shape
+        joint_logps, joint_entropies = [], []
+        for b in range(batch):
+            valid = feasible_mask[b].clone()
+            remaining = capacities[b].clone()
+            logp = pair_logits.new_zeros(())
+            entropy = pair_logits.new_zeros(())
+            for flat_index in selected_pair_indices[b]:
+                step_valid = valid & (remaining > 0).unsqueeze(0)
+                flat_logits = pair_logits[b].flatten().masked_fill(
+                    ~step_valid.flatten(), -torch.inf)
+                distribution = Categorical(logits=flat_logits)
+                selected = torch.as_tensor(flat_index, device=pair_logits.device)
+                logp = logp + distribution.log_prob(selected)
+                entropy = entropy + distribution.entropy()
+                agent = int(flat_index) // num_actions
+                action = int(flat_index) % num_actions
+                valid[agent, :] = False
+                if remaining[action] < torch.iinfo(remaining.dtype).max:
+                    remaining[action] -= 1
+                if remaining[action] <= 0:
+                    valid[:, action] = False
+            joint_logps.append(logp)
+            joint_entropies.append(entropy)
+        return torch.stack(joint_logps), torch.stack(joint_entropies)

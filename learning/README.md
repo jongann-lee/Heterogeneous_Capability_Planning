@@ -27,8 +27,11 @@ Each training run creates a timestamped directory beneath
 `learning/checkpoints/` containing separate `trained_weights.pt` and
 `config.yaml` files. Pass `--checkpoint-dir` to use a different parent
 directory. With `training.wandb: true`, the same resolved configuration and
-per-episode return, loss, makespan, and completion status are logged to
-the `heterogeneous-capability-planning` Weights & Biases project.
+one aggregate record per REINFORCE optimizer update are logged to the
+`heterogeneous-capability-planning` Weights & Biases project. Metrics include
+mean return, mean policy loss, mean makespan, and completion rate across the
+update's episode batch. Failure diagnostics include mean deaths, mean remaining
+targets, stalled rate, and all-agents-dead rate.
 
 For research runs, import `learning.train.train` and supply an
 `instance_factory(episode)` returning fresh `(env_map, ground_truth, agents)`

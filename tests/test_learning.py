@@ -2,12 +2,15 @@
 
 import copy
 from dataclasses import replace
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 
 import networkx as nx
 import torch
 
-from learning.candidates import Candidate, generate_candidates
+from learning.candidates import (Candidate, CandidateTerrainCache,
+                                 generate_candidates)
 from learning.configuration import load_config
 from learning.decoder import AssignmentDecoder, DecoderOutput
 from learning.gpu.routing import GridRouter
@@ -72,6 +75,44 @@ def test_tensor_router_matches_masked_networkx_shortest_paths():
     assert paths[0, :lengths[0]].tolist() == [0, 1, 2, 3, 4, 5]
 
 
+def test_legacy_batch_size_config_is_split():
+    payload = """
+model:
+  num_target_types: 1
+  model_dim: 8
+  num_heads: 1
+  num_world_blocks: 1
+  dropout: 0.0
+  relation_hidden_dim: 4
+candidates:
+  staging_per_target: 1
+  staging_capacity: 1
+  include_wait: true
+  include_continue: true
+reinforce:
+  learning_rate: 0.001
+  entropy_coefficient: 0.0
+  baseline_decay: 0.9
+  death_penalty: 1.0
+  incomplete_penalty: 1.0
+  gradient_clip_norm: 1.0
+training:
+  episodes: 2
+  batch_size: 3
+  num_agents: 1
+  seed: 0
+  device: cpu
+  checkpoint: checkpoints
+  wandb: false
+"""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "legacy.yaml"
+        path.write_text(payload)
+        config = load_config(path)
+    assert config.training.simulation_batch_size == 3
+    assert config.training.reinforce_batch_size == 3
+
+
 def test_tensor_episode_transition_matches_cpu_line_episode():
     graph, agents = _instance(False)
     agents[0].capabilities = frozenset({0, 1})
@@ -111,8 +152,20 @@ def test_yaml_configuration_loads_and_validates():
     assert config.model.model_dim % config.model.num_heads == 0
     assert config.candidates.include_wait
     assert config.candidates.include_continue
-    assert config.training.batch_size >= 1
+    assert config.training.simulation_batch_size >= 1
+    assert config.training.reinforce_batch_size >= 1
     assert config.training.device in {"auto", "cpu", "cuda"}
+
+
+def test_cached_candidate_generation_matches_uncached_generation():
+    graph, _agents = _instance(False)
+    config = load_config().candidates
+    uncached = generate_candidates(graph, config)
+    cached = generate_candidates(graph, config, CandidateTerrainCache(graph))
+    assert [candidate.key for candidate in cached] == [
+        candidate.key for candidate in uncached]
+    assert [candidate.staging_targets for candidate in cached] == [
+        candidate.staging_targets for candidate in uncached]
 
 
 def test_hidden_ground_truth_never_enters_observation():
@@ -215,6 +268,10 @@ def test_decoder_constraints_and_probabilities():
     assert len({a for a, _ in output.assignments[0]}) == 3
     assert sum(c == 0 for _, c in output.assignments[0]) == 1
     assert sum(c == 1 for _, c in output.assignments[0]) == 2
+    replay_logp, replay_entropy = AssignmentDecoder().evaluate_selected(
+        logits, valid, capacities, output.selected_pair_indices)
+    assert torch.allclose(replay_logp, output.log_probabilities)
+    assert torch.allclose(replay_entropy, output.entropies)
     masked = valid.clone()
     masked[:, :, 0] = False
     sampled = AssignmentDecoder()(logits, masked, capacities, training=True)

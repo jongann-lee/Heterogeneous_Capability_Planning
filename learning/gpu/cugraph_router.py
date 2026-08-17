@@ -1,6 +1,7 @@
 """cuGraph-backed routing for the fixed WV graph."""
 
 from dataclasses import dataclass
+from collections import OrderedDict
 
 import torch
 
@@ -14,13 +15,14 @@ class SSSPResult:
 class CuGraphRouter:
     """Cache GPU graph variants and run weighted SSSP from many sources.
 
-    Graph variants are keyed by a bit mask of blocked target nodes. The source
-    and optional goal are restored per query by selecting a compatible cached
-    variant; callers should omit a goal target from ``blocked_target_mask``.
+    Graph variants are keyed by the actual blocked node IDs, not positions in
+    one episode's target list. This keeps the terrain cache valid when target
+    locations and counts change between episodes.
     """
 
     def __init__(self, num_nodes, edge_sources, edge_destinations, edge_costs,
-                 target_nodes):
+                 target_nodes=(), max_cached_routes=512,
+                 max_cached_graphs=64):
         import cudf
 
         self.num_nodes = int(num_nodes)
@@ -30,29 +32,40 @@ class CuGraphRouter:
             "dst": edge_destinations,
             "weight": edge_costs,
         })
-        self._graphs = {}
-        self._sssp_cache = {}
+        self.max_cached_graphs = int(max_cached_graphs)
+        self._graphs = OrderedDict()
+        self.max_cached_routes = int(max_cached_routes)
+        self._sssp_cache = OrderedDict()
 
-    def graph(self, blocked_target_mask=0):
-        """Return a lazily-built directed graph for one target blockage mask."""
+    def _blocked_nodes(self, blocked):
+        """Normalize either node IDs or the legacy fixed-target bit mask."""
+        if isinstance(blocked, int):
+            return tuple(node for index, node in enumerate(self.target_nodes)
+                         if blocked & (1 << index))
+        return tuple(sorted({int(node) for node in blocked}))
+
+    def graph(self, blocked_nodes=()):
+        """Return a lazily-built graph for one sparse blocked-node set."""
         import cugraph
 
-        mask = int(blocked_target_mask)
-        graph = self._graphs.get(mask)
+        blocked = self._blocked_nodes(blocked_nodes)
+        graph = self._graphs.get(blocked)
         if graph is not None:
+            self._graphs.move_to_end(blocked)
             return graph
         keep = None
-        for index, node in enumerate(self.target_nodes):
-            if mask & (1 << index):
-                allowed = ((self._edges.src != node) &
-                           (self._edges.dst != node))
-                keep = allowed if keep is None else keep & allowed
+        for node in blocked:
+            allowed = ((self._edges.src != node) &
+                       (self._edges.dst != node))
+            keep = allowed if keep is None else keep & allowed
         edges = self._edges if keep is None else self._edges[keep]
         graph = cugraph.Graph(directed=True)
         graph.from_cudf_edgelist(
             edges, source="src", destination="dst", edge_attr="weight",
             renumber=False, vertices=list(range(self.num_nodes)))
-        self._graphs[mask] = graph
+        self._graphs[blocked] = graph
+        while len(self._graphs) > self.max_cached_graphs:
+            self._graphs.popitem(last=False)
         return graph
 
     @staticmethod
@@ -62,26 +75,74 @@ class CuGraphRouter:
         value = torch.utils.dlpack.from_dlpack(series.to_cupy())
         return value.to(dtype=dtype) if dtype is not None else value
 
-    def sssp(self, sources, blocked_target_mask=0) -> SSSPResult:
-        """Return dense CUDA distance/predecessor rows for each source."""
+    def _run_sssp(self, source, blocked):
         import cugraph
 
-        graph = self.graph(blocked_target_mask)
+        graph = self.graph(blocked)
+        frame = cugraph.sssp(graph, source=int(source)).sort_values("vertex")
+        vertices = self._series_to_torch(frame.vertex, torch.long)
+        if vertices.numel() != self.num_nodes or not torch.equal(
+                vertices, torch.arange(self.num_nodes,
+                                      device=vertices.device)):
+            raise RuntimeError("cuGraph SSSP did not return every world node")
+        return (self._series_to_torch(frame.distance, torch.float32),
+                self._series_to_torch(frame.predecessor, torch.long))
+
+    def _base_routes_are_safe(self, predecessor, source, blocked,
+                              required_nodes):
+        """Whether base-tree paths to every required node avoid blockers."""
+        if not blocked:
+            return True
+        device = predecessor.device
+        required = torch.as_tensor(required_nodes, dtype=torch.long,
+                                   device=device).flatten()
+        blocked_tensor = torch.as_tensor(blocked, dtype=torch.long,
+                                         device=device)
+        required = required[~torch.isin(required, blocked_tensor)]
+        cursor = required.clone()
+        active = (cursor >= 0) & (cursor != int(source))
+        for _ in range(self.num_nodes):
+            if torch.isin(cursor[active], blocked_tensor).any():
+                return False
+            if not active.any():
+                return True
+            previous = predecessor[cursor.clamp_min(0)]
+            active &= (previous >= 0) & (previous != int(source))
+            cursor = torch.where(active, previous, cursor)
+        return False
+
+    def sssp(self, sources, blocked_nodes=(), required_nodes=None) -> SSSPResult:
+        """Return exact SSSP rows, reusing safe target-independent rows.
+
+        When every required destination's base-tree path avoids the sparse
+        blocked-node set, the unblocked row is exact and no blocked cuGraph
+        variant is constructed. Otherwise this falls back to exact SSSP.
+        """
+        blocked = self._blocked_nodes(blocked_nodes)
         distance_rows, predecessor_rows = [], []
         for source in torch.as_tensor(sources).flatten().tolist():
-            key = (int(blocked_target_mask), int(source))
+            effective_blocked = tuple(node for node in blocked
+                                      if node != int(source))
+            key = (effective_blocked, int(source))
             cached = self._sssp_cache.get(key)
             if cached is None:
-                frame = cugraph.sssp(graph, source=int(source)).sort_values("vertex")
-                vertices = self._series_to_torch(frame.vertex, torch.long)
-                if vertices.numel() != self.num_nodes or not torch.equal(
-                        vertices, torch.arange(self.num_nodes,
-                                              device=vertices.device)):
-                    raise RuntimeError("cuGraph SSSP did not return every world node")
-                cached = (
-                    self._series_to_torch(frame.distance, torch.float32),
-                    self._series_to_torch(frame.predecessor, torch.long))
+                if effective_blocked and required_nodes is not None:
+                    base_key = ((), int(source))
+                    base = self._sssp_cache.get(base_key)
+                    if base is None:
+                        base = self._run_sssp(source, ())
+                        self._sssp_cache[base_key] = base
+                    if self._base_routes_are_safe(
+                            base[1], source, effective_blocked,
+                            required_nodes):
+                        cached = base
+                if cached is None:
+                    cached = self._run_sssp(source, effective_blocked)
                 self._sssp_cache[key] = cached
+                while len(self._sssp_cache) > self.max_cached_routes:
+                    self._sssp_cache.popitem(last=False)
+            else:
+                self._sssp_cache.move_to_end(key)
             distance_rows.append(cached[0])
             predecessor_rows.append(cached[1])
         return SSSPResult(torch.stack(distance_rows),

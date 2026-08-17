@@ -21,8 +21,9 @@ reinforce:
   gradient_clip_norm: 1.0
 
 training:
-  episodes: 100
-  batch_size: 1
+  episodes: 1600
+  simulation_batch_size: 16
+  reinforce_batch_size: 16
   num_agents: 4
   seed: 0
   device: CUDA
