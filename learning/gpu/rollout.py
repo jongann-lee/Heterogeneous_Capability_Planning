@@ -26,7 +26,8 @@ class TensorRollout:
 
 def collect_tensor_episodes(model, state, observation_builder,
                             death_penalty=100.0, incomplete_penalty=1000.0,
-                            max_events=100000, training=True):
+                            max_events=100000, training=True,
+                            state_callback=None):
     """Roll out a batch while retaining the differentiable policy trace."""
     decision_traces = []
     events = 0
@@ -86,6 +87,8 @@ def collect_tensor_episodes(model, state, observation_builder,
         dispatch = (state.route_active & ~state.moving & state.alive
                     & unfinished[:, None])
         state.dispatch_next_hops(committed_next, dispatch)
+        if state_callback is not None:
+            state_callback(state)
 
         # With no moving agent and no outstanding decision, an episode has
         # genuinely stalled (for example, every agent selected wait).
@@ -112,6 +115,9 @@ def collect_tensor_episodes(model, state, observation_builder,
         if not active.any():
             # The next loop either plans newly-idle agents or marks them stalled.
             continue
+
+    if state_callback is not None:
+        state_callback(state)
 
     remaining = state.target_live.sum(dim=1)
     completed = state.completed()

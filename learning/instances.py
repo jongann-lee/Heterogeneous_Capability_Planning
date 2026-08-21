@@ -38,7 +38,8 @@ def _wv_terrain_template():
 
 def make_wv_dem_instance(seed=0, num_target_types=3, num_agents=4,
                          source_position=None, target_positions=None,
-                         target_types=None, agent_capabilities=None):
+                         target_types=None, agent_capabilities=None,
+                         min_targets=7, max_targets=7):
     """Create one 64x64 episode on the clockwise-rotated WV DEM."""
     rng = random.Random(seed)
     nodes = [(row, col) for row in range(WV_GRID_SIZE)
@@ -47,7 +48,12 @@ def make_wv_dem_instance(seed=0, num_target_types=3, num_agents=4,
     if source not in nodes:
         raise ValueError(f"source position {source!r} is outside the WV grid")
     if target_positions is None:
-        targets = rng.sample([node for node in nodes if node != source], 7)
+        if min_targets < 1 or max_targets < min_targets:
+            raise ValueError("target count range must satisfy 1 <= min <= max")
+        available = [node for node in nodes if node != source]
+        if max_targets > len(available):
+            raise ValueError("max_targets exceeds the available WV grid nodes")
+        targets = rng.sample(available, rng.randint(min_targets, max_targets))
     else:
         targets = [tuple(position) for position in target_positions]
     if not targets or len(set(targets)) != len(targets):

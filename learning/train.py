@@ -1,4 +1,4 @@
-"""Training utilities and CLI for fixed-instance experiments."""
+"""Training utilities and CLI for WV-terrain experiments."""
 
 import argparse
 from dataclasses import asdict, replace
@@ -27,8 +27,8 @@ from learning.rollout import collect_episode
 # Fixed sanity-check setup. Set any value to None (or comment out its line) to
 # sample that component independently for every episode.
 SOURCE_POSITION = (0, 0)
-TARGET_POSITIONS = [(14,54), (1,29), (33,17), (34,35), (63,37), (37,5), (49,58)]
-TARGET_TYPES = [1, 2, 2, 1, 2, 3, 3]
+TARGET_POSITIONS = None
+TARGET_TYPES = None
 AGENT_CAPABILITIES = [{0}, {1}, {2}, {3}]
 
 
@@ -66,7 +66,8 @@ def train(instance_factory, num_target_types, episodes=100,
         training_config = replace(
             defaults.training, episodes=episodes, checkpoint=str(checkpoint))
         run_config = LearningConfig(
-            model_config, candidate_config, reinforce_config, training_config)
+            model_config, candidate_config, reinforce_config, training_config,
+            defaults.instances)
 
     wandb_run = None
     if run_config.training.wandb:
@@ -351,7 +352,8 @@ def main():
         num_agents=num_agents, seed=seed,
         device=requested_device, checkpoint=checkpoint)
     resolved_config = LearningConfig(
-        model_config, config.candidates, config.reinforce, resolved_training)
+        model_config, config.candidates, config.reinforce, resolved_training,
+        config.instances)
     torch.manual_seed(seed)
 
     def factory(episode):
@@ -360,7 +362,9 @@ def main():
             source_position=globals().get("SOURCE_POSITION"),
             target_positions=globals().get("TARGET_POSITIONS"),
             target_types=globals().get("TARGET_TYPES"),
-            agent_capabilities=globals().get("AGENT_CAPABILITIES"))
+            agent_capabilities=globals().get("AGENT_CAPABILITIES"),
+            min_targets=config.instances.min_targets,
+            max_targets=config.instances.max_targets)
 
     if device == "cuda":
         env, truth, agents = factory(0)

@@ -18,6 +18,7 @@ from learning.gpu.state import TensorEpisodeState
 from learning.model import CentralizedPolicy
 from learning.observation import batch_observations, build_observation
 from learning.policy_adapter import LearnedPolicyAdapter
+from learning.rollout import collect_episode
 from simulation.agent import Agent
 from simulation.domain import UNKNOWN_TYPE, init_target_types
 from simulation.engine import run_simulation
@@ -111,6 +112,8 @@ training:
         config = load_config(path)
     assert config.training.simulation_batch_size == 3
     assert config.training.reinforce_batch_size == 3
+    assert config.instances.min_targets == 7
+    assert config.instances.max_targets == 7
 
 
 def test_tensor_episode_transition_matches_cpu_line_episode():
@@ -152,6 +155,8 @@ def test_yaml_configuration_loads_and_validates():
     assert config.model.model_dim % config.model.num_heads == 0
     assert config.candidates.include_wait
     assert config.candidates.include_continue
+    assert config.instances.min_targets == 5
+    assert config.instances.max_targets == 9
     assert config.training.simulation_batch_size >= 1
     assert config.training.reinforce_batch_size >= 1
     assert config.training.device in {"auto", "cpu", "cuda"}
@@ -335,6 +340,22 @@ def test_complete_adapter_episode_runs_through_simulator():
     policy = LearnedPolicyAdapter(_TargetFirst(), 1)
     result = run_simulation(env, truth, agents, policy=policy)
     assert result["completed"]
+
+
+def test_learning_rollout_forwards_rendering():
+    truth = _line(3)
+    env = _line(3)
+    truth.nodes[2]["type"] = env.nodes[2]["type"] = "target_unreached"
+    init_target_types(env, truth, {2: 1})
+    env.nodes[2]["rps_type"] = 1
+    agents = [Agent(0, capabilities={1})]
+    policy = LearnedPolicyAdapter(_TargetFirst(), 1)
+    with tempfile.TemporaryDirectory() as directory:
+        rollout = collect_episode(
+            env, truth, agents, policy, render_dir=directory, render_dt=1.0)
+        frames = sorted(Path(directory).glob("frame_*.png"))
+    assert rollout.result["completed"]
+    assert len(frames) == 3
 
 
 def _main():

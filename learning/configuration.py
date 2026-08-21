@@ -71,6 +71,19 @@ class ReinforceConfig:
 
 
 @dataclass(frozen=True)
+class InstanceConfig:
+    min_targets: int = 7
+    max_targets: int = 7
+
+    def __post_init__(self):
+        if self.min_targets < 1:
+            raise ValueError("instances.min_targets must be positive")
+        if self.max_targets < self.min_targets:
+            raise ValueError(
+                "instances.max_targets must be at least instances.min_targets")
+
+
+@dataclass(frozen=True)
 class TrainingConfig:
     episodes: int
     simulation_batch_size: int
@@ -101,6 +114,7 @@ class LearningConfig:
     candidates: CandidateConfig
     reinforce: ReinforceConfig
     training: TrainingConfig
+    instances: InstanceConfig = InstanceConfig()
 
 
 def _section(payload: dict[str, Any], name: str) -> dict[str, Any]:
@@ -126,9 +140,13 @@ def load_config(path: str | Path | None = None) -> LearningConfig:
         training.setdefault("reinforce_batch_size", legacy_batch_size)
     if isinstance(training.get("device"), str):
         training["device"] = training["device"].lower()
+    instance_payload = payload.get("instances", {})
+    if not isinstance(instance_payload, dict):
+        raise ValueError("configuration section 'instances' must be a mapping")
     return LearningConfig(
         model=ModelConfig(**_section(payload, "model")),
         candidates=CandidateConfig(**_section(payload, "candidates")),
         reinforce=ReinforceConfig(**_section(payload, "reinforce")),
         training=TrainingConfig(**training),
+        instances=InstanceConfig(**instance_payload),
     )

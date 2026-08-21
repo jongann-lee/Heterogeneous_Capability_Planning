@@ -20,8 +20,19 @@ Training and greedy evaluation use the clockwise-rotated 64x64 WV DEM:
 ```bash
 uv run python -m learning.train --episodes 100
 uv run python -m learning.train --config learning/config.yaml
-uv run python -m learning.evaluate learning/checkpoints/<run-timestamp>
+uv run python -m learning.test learning/checkpoints/<run-timestamp> --device cuda
+uv run python -m learning.test learning/checkpoints/<run-timestamp> --device cuda --render
 ```
+
+The optional test renderer records the deterministic CUDA tensor rollout and
+draws its event trace afterward; it does not recompute the policy or routes on
+the CPU. Matching the non-learning benchmark defaults exactly, it writes
+interpolated frames to `outputs/my_policy_simulation/frames/`, creates
+`outputs/my_policy_simulation/render_result.mp4`, samples every 1.0 simulation
+time unit, and encodes at 4 FPS. Use
+`--render-dt` to control the simulation-time spacing between frames and
+`--mp4-fps` to control video playback speed. PNG drawing and video encoding
+remain CPU-side, but simulation and policy inference stay on CUDA.
 
 Each training run creates a timestamped directory beneath
 `learning/checkpoints/` containing separate `trained_weights.pt` and
