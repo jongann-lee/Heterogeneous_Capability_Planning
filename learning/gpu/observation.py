@@ -20,8 +20,7 @@ class TensorObservationBuilder:
         is_observation = observed_links.any(dim=2)
         is_staging = staging_links.any(dim=2)
         active = (is_target | is_observation | is_staging |
-                  self.world.candidate_is_wait[None] |
-                  self.world.candidate_is_continue[None])
+                  self.world.candidate_is_wait[None])
         associated = target_links | observed_links | staging_links
         return (is_target, is_observation, is_staging, active, associated,
                 observed_links, staging_links)
@@ -42,7 +41,10 @@ class TensorObservationBuilder:
                 continue
             blocked_nodes = self.world.target_nodes[
                 state.target_live[b]].tolist()
-            sources = state.positions[b]
+            # A moving agent cannot change its current edge, but a shared
+            # replan chooses its route beginning at that edge's arrival node.
+            sources = torch.where(
+                state.moving[b], state.transit_to[b], state.positions[b])
             standard = self.world.router.sssp(
                 sources, blocked_nodes, self.world.required_route_nodes)
             distances[b] = standard.distances
@@ -58,10 +60,13 @@ class TensorObservationBuilder:
                                        target_distances, direct)
         entry_nodes = torch.where(state.target_live[:, None], entry_nodes,
                                   self.world.target_nodes[None, None])
-        at_goal = state.positions[..., None] == self.world.target_nodes
+        planning_positions = torch.where(
+            state.moving, state.transit_to, state.positions)
+        at_goal = planning_positions[..., None] == self.world.target_nodes
         target_distances = torch.where(at_goal, torch.zeros_like(target_distances),
                                        target_distances)
-        entry_nodes = torch.where(at_goal, state.positions[..., None], entry_nodes)
+        entry_nodes = torch.where(
+            at_goal, planning_positions[..., None], entry_nodes)
         return distances, predecessors, target_distances, entry_nodes
 
     def build(self, state, planning_episode_mask=None):
@@ -114,14 +119,13 @@ class TensorObservationBuilder:
         action_x[..., 3] = is_observation
         action_x[..., 4] = is_staging
         action_x[..., 5] = world.candidate_is_wait
-        action_x[..., 6] = world.candidate_is_continue
-        action_x[..., 7] = associated.sum(dim=2) / max(targets, 1)
-        action_x[..., 8] = observed_links.sum(dim=2) / max(targets, 1)
+        action_x[..., 6] = associated.sum(dim=2) / max(targets, 1)
+        action_x[..., 7] = observed_links.sum(dim=2) / max(targets, 1)
         region_heights = (world.heights[region_nodes] * region_mask).sum(
             dim=1) / region_count
-        action_x[..., 9] = region_heights[None]
-        action_x[..., 10] = world.candidate_capacity < 0
-        action_x[..., 11] = world.candidate_capacity.clamp_min(0)
+        action_x[..., 8] = region_heights[None]
+        action_x[..., 9] = world.candidate_capacity < 0
+        action_x[..., 10] = world.candidate_capacity.clamp_min(0)
 
         # Agent-target paths unblock the goal target while avoiding every other
         # live target, exactly like learning.observation._safe_path.
@@ -157,13 +161,12 @@ class TensorObservationBuilder:
                 :, :, target, None]
         ac_distance[..., ~physical] = 0.0
         reachable = torch.isfinite(ac_distance) & (ac_distance < 1e30)
-        ac_rel = torch.zeros((batch, agents, actions, 7), device=device)
+        ac_rel = torch.zeros((batch, agents, actions, 6), device=device)
         normalized_ac = torch.where(reachable, ac_distance / world.distance_scale,
                                     torch.zeros_like(ac_distance))
         ac_rel[..., 0] = normalized_ac
         ac_rel[..., 1] = normalized_ac
         ac_rel[..., 2] = reachable
-        ac_rel[..., 4] = world.candidate_is_continue & state.moving[..., None]
         category_ok = ~(is_observation[:, None] & ~is_target[:, None] &
                         ~is_staging[:, None] &
                         ~state.capabilities[..., 0, None])
@@ -178,13 +181,9 @@ class TensorObservationBuilder:
             compatible[..., columns] = (
                 ~state.target_known[:, None, target, None] |
                 has_capability[..., None])
-        ac_rel[..., 5] = category_ok
-        ac_rel[..., 6] = compatible
+        ac_rel[..., 4] = category_ok
+        ac_rel[..., 5] = compatible
         feasible = state.alive[..., None] & active[:, None] & reachable & category_ok & compatible
-        feasible = torch.where(state.moving[..., None],
-                               world.candidate_is_continue[None, None], feasible)
-        feasible &= ~(~state.moving[..., None] &
-                      world.candidate_is_continue[None, None])
 
         ct_rel = torch.zeros((batch, actions, targets, 7), device=device)
         ct_rel[..., 0] = world.target_candidate_mask
@@ -252,7 +251,9 @@ class TensorObservationBuilder:
                        cursor[final_rows, final_agents]] = goals[
                            final_rows, final_agents]
 
-        active = reachable & (cursor != state.positions)
+        planning_positions = torch.where(
+            state.moving, state.transit_to, state.positions)
+        active = reachable & (cursor != planning_positions)
         for _ in range(len(world.nodes)):
             previous = predecessors.gather(2, cursor[..., None]).squeeze(2)
             valid = active & (previous >= 0)
@@ -261,11 +262,11 @@ class TensorObservationBuilder:
                 route_next[valid_rows, valid_agents,
                            previous[valid_rows, valid_agents]] = cursor[
                                valid_rows, valid_agents]
-            active = valid & (previous != state.positions)
+            active = valid & (previous != planning_positions)
             cursor = torch.where(active, previous, cursor)
             if not active.any():
                 break
-        next_hop = route_next[rows, agent_rows, state.positions]
-        at_destination = reachable & (destination == state.positions)
+        next_hop = route_next[rows, agent_rows, planning_positions]
+        at_destination = reachable & (destination == planning_positions)
         return (next_hop.clamp_min(0), reachable | at_destination,
                 route_next, destination)

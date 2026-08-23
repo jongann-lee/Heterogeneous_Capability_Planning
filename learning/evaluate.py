@@ -28,7 +28,7 @@ def load_policy(checkpoint, device="cpu"):
         config = ModelConfig(**payload["model_config"])
         state_dict = payload["model"]
         candidate_payload = dict(payload.get("candidate_config", {}))
-        candidate_payload.setdefault("include_continue", True)
+        candidate_payload.pop("include_continue", None)
         candidate_config = (CandidateConfig(**candidate_payload)
                             if candidate_payload else load_config().candidates)
     model = CentralizedPolicy(config).to(device)

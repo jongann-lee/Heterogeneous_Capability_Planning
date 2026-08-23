@@ -364,15 +364,17 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
 
     def do_replan():
         nonlocal policy_calls
-        # Only living, at-a-node agents are (re)planned; in-transit agents are
-        # committed to their current edge until they arrive.
-        planners = [a for i, a in enumerate(agents)
-                    if a.alive and transit[i] is None]
         # Learned centralized policies need the observable state of the whole
         # team.  The legacy callable interface remains unchanged for baselines.
         runtime_hook = getattr(policy, "set_runtime_state", None)
         if runtime_hook is not None:
             runtime_hook(agents, transit, clock)
+        future_routes = bool(getattr(policy, "replan_in_transit", False))
+        # Learned policies jointly assign every living agent. A moving agent's
+        # new route begins at its committed arrival node; legacy policies still
+        # receive only agents physically at nodes.
+        planners = [a for i, a in enumerate(agents)
+                    if a.alive and (future_routes or transit[i] is None)]
         policy_calls += 1
         policy(env_map, planners, reward_ratio=reward_ratio,
                obs_discount_factor=obs_discount_factor,
@@ -467,9 +469,10 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
         pending_due = i in pending_replan
         pending_replan.discard(i)
         if information_changed:
-            pending_replan.update(
-                j for j, other in enumerate(agents)
-                if other.alive and transit[j] is not None)
+            if not getattr(policy, "replan_in_transit", False):
+                pending_replan.update(
+                    j for j, other in enumerate(agents)
+                    if other.alive and transit[j] is not None)
         if targets_remain() and (information_changed or destination_reached
                                  or pending_due):
             do_replan()

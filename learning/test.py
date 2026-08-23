@@ -11,13 +11,14 @@ import torch
 from learning.configuration import DEFAULT_CONFIG_PATH, load_config
 from learning.instances import make_wv_dem_instance
 from learning.model import CentralizedPolicy
+from learning.orcale import parallel_tsp
 
 
 # Fixed sanity-check setup. Set a value to None to sample that component from
 # each episode seed. These intentionally mirror the editable globals in train.py.
 SOURCE_POSITION = (0, 0)
-TARGET_POSITIONS = None
-TARGET_TYPES = None
+TARGET_POSITIONS = [(14,54), (1,29), (33,17), (34,35), (63,37), (37,5), (49,58)]
+TARGET_TYPES = [1, 2, 2, 1, 2, 3, 3]
 AGENT_CAPABILITIES = [{0}, {1}, {2}, {3}]
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -92,16 +93,20 @@ def _gpu_episode(model, config, env, truth, agents, device, terrain=None,
         world, truth, agents, config.model.num_target_types, device)
     state = TensorEpisodeState.create(
         world, [source], capabilities, target_types)
+    oracle_makespan = parallel_tsp(truth, agents)
     rollout = collect_tensor_episodes(
         model, state,
         TensorObservationBuilder(world, config.model.num_target_types),
         config.reinforce.death_penalty,
         config.reinforce.incomplete_penalty,
         training=False,
-        state_callback=None if trace is None else _capture_state(trace))
+        state_callback=None if trace is None else _capture_state(trace),
+        oracle_makespans=oracle_makespan)
     record = {
         "return": float(rollout.returns[0]),
         "makespan": float(rollout.makespans[0]),
+        "oracle_makespan": float(rollout.oracle_makespans[0]),
+        "normalized_regret": float(rollout.normalized_regrets[0]),
         "completed": bool(rollout.completed[0]),
         "deaths": int(rollout.deaths[0]),
         "remaining_targets": int(rollout.remaining_targets[0]),
@@ -214,15 +219,19 @@ def _cpu_episode(model, config, env, truth, agents, device,
     adapter = LearnedPolicyAdapter(
         model, config.model.num_target_types, training=False,
         candidate_config=config.candidates, device=device)
+    oracle_makespan = parallel_tsp(truth, agents)
     rollout = collect_episode(
         env, truth, agents, adapter,
         config.reinforce.death_penalty,
         config.reinforce.incomplete_penalty,
-        render_dir=render_dir, render_dt=render_dt)
+        render_dir=render_dir, render_dt=render_dt,
+        oracle_makespan=oracle_makespan)
     result = rollout.result
     return {
         "return": float(rollout.episode_return),
         "makespan": float(result["makespan"]),
+        "oracle_makespan": float(oracle_makespan),
+        "normalized_regret": float(result["normalized_regret"]),
         "completed": bool(result["completed"]),
         "deaths": int(result["num_deaths"]),
         "remaining_targets": len(result["remaining_targets"]),
@@ -250,6 +259,9 @@ def summarize(records):
         "return_std": _std(records, "return"),
         "mean_makespan": _mean(records, "makespan"),
         "makespan_std": _std(records, "makespan"),
+        "mean_oracle_makespan": _mean(records, "oracle_makespan"),
+        "mean_normalized_regret": _mean(records, "normalized_regret"),
+        "normalized_regret_std": _std(records, "normalized_regret"),
         "mean_deaths": _mean(records, "deaths"),
         "death_std": _std(records, "deaths"),
         "mean_remaining_targets": _mean(records, "remaining_targets"),

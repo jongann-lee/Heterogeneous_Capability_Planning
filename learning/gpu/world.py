@@ -102,7 +102,6 @@ class TensorWorld:
     candidate_is_observation: torch.Tensor
     candidate_is_staging: torch.Tensor
     candidate_is_wait: torch.Tensor
-    candidate_is_continue: torch.Tensor
     candidate_capacity: torch.Tensor
     target_candidate_mask: torch.Tensor
     distance_scale: float
@@ -192,8 +191,6 @@ class TensorWorld:
             torch.tensor([item.is_staging for item in candidates],
                          dtype=torch.bool, device=device),
             torch.tensor([item.is_wait for item in candidates],
-                         dtype=torch.bool, device=device),
-            torch.tensor([item.is_continue for item in candidates],
                          dtype=torch.bool, device=device),
             torch.tensor([-1 if item.capacity is None else item.capacity
                           for item in candidates], dtype=torch.long,

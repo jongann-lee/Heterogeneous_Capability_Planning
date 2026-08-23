@@ -20,6 +20,8 @@ class TensorRollout:
     remaining_targets: torch.Tensor
     stalled: torch.Tensor
     all_agents_dead: torch.Tensor
+    oracle_makespans: torch.Tensor
+    normalized_regrets: torch.Tensor
     decision_traces: list[DecisionTrace]
     events: int
 
@@ -27,7 +29,7 @@ class TensorRollout:
 def collect_tensor_episodes(model, state, observation_builder,
                             death_penalty=100.0, incomplete_penalty=1000.0,
                             max_events=100000, training=True,
-                            state_callback=None):
+                            state_callback=None, oracle_makespans=None):
     """Roll out a batch while retaining the differentiable policy trace."""
     decision_traces = []
     events = 0
@@ -36,7 +38,7 @@ def collect_tensor_episodes(model, state, observation_builder,
         if not unfinished.any():
             break
 
-        planning_agents = (state.needs_replan & ~state.moving & state.alive
+        planning_agents = (state.needs_replan & state.alive
                            & unfinished[:, None])
         planning_episodes = planning_agents.any(dim=1)
         if planning_episodes.any():
@@ -66,12 +68,17 @@ def collect_tensor_episodes(model, state, observation_builder,
                  state, safe_actions, distances, predecessors,
                  target_distances, target_entries, candidate_entries)
             committed = planning_agents & assigned & physical & reachable
+            cleared_routes = torch.full_like(state.route_next, -1)
+            state.route_next = torch.where(
+                planning_agents[..., None], cleared_routes, state.route_next)
             state.route_next = torch.where(
                 committed[..., None], route_next, state.route_next)
             state.goal_nodes = torch.where(
                 committed, destinations, state.goal_nodes)
+            planning_positions = torch.where(
+                state.moving, state.transit_to, state.positions)
             has_next = route_next.gather(
-                2, state.positions[..., None]).squeeze(2) >= 0
+                2, planning_positions[..., None]).squeeze(2) >= 0
             state.route_active = torch.where(
                 planning_agents, committed & has_next, state.route_active)
             state.needs_replan &= ~planning_agents
@@ -103,12 +110,14 @@ def collect_tensor_episodes(model, state, observation_builder,
             rows, agents, state.positions] >= 0
         destination_reached = arrived & ~route_continues & state.alive
         state.route_active &= ~arrived | route_continues
-        state.needs_replan |= destination_reached
 
         # Reveals and encounters change the shared belief/task state. Agents
-        # finish an already-started edge, then receive a new plan at its end.
-        state.route_active &= ~information_changed[:, None]
-        state.needs_replan |= information_changed[:, None] & state.alive
+        # finish an already-started edge, but their replacement routes are
+        # planned immediately from those committed arrival nodes. Reaching any
+        # assigned destination also triggers a new joint team assignment.
+        joint_replan = information_changed | destination_reached.any(dim=1)
+        state.route_active &= ~joint_replan[:, None]
+        state.needs_replan |= joint_replan[:, None] & state.alive
         completed = state.completed()
         state.route_active &= ~completed[:, None] & state.alive
         state.needs_replan &= ~completed[:, None] & state.alive
@@ -124,12 +133,29 @@ def collect_tensor_episodes(model, state, observation_builder,
     all_agents_dead = ~state.alive.any(dim=1)
     stalled = state.stalled | (~completed & ~state.moving.any(dim=1)
                                & ~state.needs_replan.any(dim=1))
-    returns = (-state.clock
-               - death_penalty * state.deaths.float()
-               - incomplete_penalty * remaining.float())
+    if oracle_makespans is None:
+        oracle_makespans = torch.ones_like(state.clock)
+        normalized_regrets = state.clock
+        returns = (-state.clock
+                   - death_penalty * state.deaths.float()
+                   - incomplete_penalty * remaining.float())
+    else:
+        oracle_makespans = torch.as_tensor(
+            oracle_makespans, dtype=state.clock.dtype,
+            device=state.clock.device).flatten()
+        if oracle_makespans.numel() == 1:
+            oracle_makespans = oracle_makespans.expand_as(state.clock)
+        if oracle_makespans.shape != state.clock.shape:
+            raise ValueError("oracle_makespans must be scalar or batch-sized")
+        if (oracle_makespans <= 0).any():
+            raise ValueError("oracle_makespans must be positive")
+        normalized_regrets = state.clock / oracle_makespans - 1.0
+        returns = (-normalized_regrets
+                   - death_penalty * state.deaths.float()
+                   - incomplete_penalty * remaining.float())
     return TensorRollout(
         returns, state.clock, completed, state.deaths, remaining,
-        stalled, all_agents_dead,
+        stalled, all_agents_dead, oracle_makespans, normalized_regrets,
         decision_traces, events)
 
 

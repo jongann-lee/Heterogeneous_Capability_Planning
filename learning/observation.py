@@ -38,7 +38,7 @@ class PlannerObservation:
 
 def feature_dimensions(num_target_types: int) -> tuple[int, int, int, int, int, int]:
     """Return ``(Fa, Ft, Fc, Fat, Fac, Fct)``."""
-    return (9 + num_target_types, 8 + num_target_types, 12, 6, 7, 7)
+    return (9 + num_target_types, 8 + num_target_types, 11, 6, 6, 7)
 
 
 def _positions(graph):
@@ -97,6 +97,7 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
                       transit: list | None = None, clock: float = 0.0,
                       committed_targets: dict[Any, Any] | None = None,
                       candidate_config: CandidateConfig | None = None,
+                      replan_transit: bool = False,
                       ) -> PlannerObservation:
     """Build one observation using only ``graph`` (the planner's view)."""
     if candidates is None:
@@ -172,8 +173,7 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
         action_x[c] = torch.tensor([
             x, y, float(candidate.is_target), float(candidate.is_observation),
             float(candidate.is_staging), float(candidate.is_wait),
-            float(candidate.is_continue), len(candidate.associated_targets) /
-            max(len(targets), 1),
+            len(candidate.associated_targets) / max(len(targets), 1),
             len(candidate.observed_targets) /
             max(len(targets), 1), height,
             float(candidate.capacity is None),
@@ -181,8 +181,11 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
         ])
 
     for i, (agent, travel) in enumerate(zip(agents, transit)):
+        planning_position = (travel[1]
+                             if travel is not None and replan_transit
+                             else agent.position)
         for j, target in enumerate(targets):
-            path = _safe_path(graph, agent.position, target, live)
+            path = _safe_path(graph, planning_position, target, live)
             dist = _path_distance(graph, path)
             kind = int(graph.nodes[target].get("rps_type", UNKNOWN_TYPE))
             known = kind != UNKNOWN_TYPE
@@ -196,10 +199,9 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
         for c, candidate in enumerate(candidates):
             if candidate.is_wait:
                 reachable, dist, crosses = True, 0.0, False
-            elif candidate.is_continue:
-                reachable, dist, crosses = travel is not None, 0.0, False
             else:
-                path = candidate_path(graph, agent.position, candidate, live)
+                path = candidate_path(
+                    graph, planning_position, candidate, live)
                 reachable = path is not None
                 dist = _path_distance(graph, path)
                 crosses = bool(path and (set(path[1:-1]) & live))
@@ -212,16 +214,13 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
                 kind = int(graph.nodes[candidate.node].get("rps_type", UNKNOWN_TYPE))
                 compatible = kind == UNKNOWN_TYPE or agent.can_service(kind)
             valid = bool(agent.alive and reachable and category_ok and compatible)
-            if travel is not None:
-                valid = candidate.is_continue
-            elif candidate.is_continue:
+            if travel is not None and not replan_transit:
                 valid = False
             feasible[i, c] = valid
             ac_rel[i, c] = torch.tensor([
                 0.0 if dist == float("inf") else dist / distance_scale,
                 0.0 if dist == float("inf") else dist / distance_scale,
                 float(reachable), float(crosses),
-                float(candidate.is_continue and travel is not None),
                 float(category_ok), float(compatible),
             ])
 

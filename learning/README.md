@@ -5,15 +5,22 @@ This package implements the centralized learned planner described in
 planner-visible observations, agent/target/action attention, an explicit
 agent-action pointer head, and constrained autoregressive joint assignment.
 
-The simulator adapter observes the full living team but only changes routes for
-agents currently at nodes. Agents traversing an edge are restricted to the
-`CONTINUE_CURRENT_ROUTE` action. No ground-truth graph is accepted by the
-observation builder or policy.
+The simulator adapter observes and jointly replans the full living team. An
+agent traversing an edge must finish that edge, but its replacement route is
+chosen immediately from the committed arrival node and begins on arrival. No
+ground-truth graph is accepted by the observation builder or policy.
 
 Experiment settings live in `learning/config.yaml`; `learning/configuration.py`
 only loads and validates that file. The attention stack uses PyTorch's
 `TransformerDecoderLayer` for self-attention, cross-attention, residuals,
 normalization, and feed-forward processing.
+
+Training returns are normalized against `learning.orcale.parallel_tsp`, a
+full-information min-max open-TSP oracle over the terrain's shortest-path
+metric closure. The logged `normalized_regret` is
+`makespan / oracle_makespan - 1`; zero matches the oracle. Death and incomplete
+penalties are dimensionless and applied directly after makespan normalization,
+so an incomplete episode cannot exploit the oracle credit by stopping early.
 
 Training and greedy evaluation use the clockwise-rotated 64x64 WV DEM:
 

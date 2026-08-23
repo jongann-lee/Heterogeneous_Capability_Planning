@@ -18,6 +18,7 @@ from learning.configuration import (
 )
 from learning.model import CentralizedPolicy
 from learning.instances import make_wv_dem_instance
+from learning.orcale import parallel_tsp
 from learning.policy_adapter import LearnedPolicyAdapter
 from learning.reinforce import (EMABaseline, batched_optimization_step,
                                 optimization_step)
@@ -27,8 +28,8 @@ from learning.rollout import collect_episode
 # Fixed sanity-check setup. Set any value to None (or comment out its line) to
 # sample that component independently for every episode.
 SOURCE_POSITION = (0, 0)
-TARGET_POSITIONS = None
-TARGET_TYPES = None
+TARGET_POSITIONS = None # [(14,54), (1,29), (33,17), (34,35), (63,37), (37,5), (49,58)]
+TARGET_TYPES = None # [1, 2, 2, 1, 2, 3, 3]
 AGENT_CAPABILITIES = [{0}, {1}, {2}, {3}]
 
 
@@ -92,13 +93,15 @@ def train(instance_factory, num_target_types, episodes=100,
     try:
         for episode in range(episodes):
             env, truth, agents = instance_factory(episode)
+            oracle_makespan = parallel_tsp(truth, agents)
             adapter = LearnedPolicyAdapter(
                 model, num_target_types, training=True,
                 candidate_config=candidate_config, device=device)
             rollout = collect_episode(
                 env, truth, agents, adapter,
                 reinforce_config.death_penalty,
-                reinforce_config.incomplete_penalty)
+                reinforce_config.incomplete_penalty,
+                oracle_makespan=oracle_makespan)
             loss, _grad_norm = optimization_step(
                 optimizer, rollout, baseline,
                 reinforce_config.entropy_coefficient,
@@ -108,6 +111,8 @@ def train(instance_factory, num_target_types, episodes=100,
                 "return": rollout.episode_return,
                 "loss": loss,
                 "makespan": rollout.result["makespan"],
+                "oracle_makespan": oracle_makespan,
+                "normalized_regret": rollout.result["normalized_regret"],
                 "completed": rollout.result["completed"],
             }
             history.append(metrics)
@@ -175,6 +180,7 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
         return episode_source, episode_caps, episode_types
 
     source, caps, types = encode_episode(world, truth, agents)
+    oracle_makespan = parallel_tsp(truth, agents)
     random_overlay = instance_factory is not None and any(
         globals().get(name) is None for name in (
             "SOURCE_POSITION", "TARGET_POSITIONS", "TARGET_TYPES",
@@ -208,13 +214,16 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                         world, model_config.num_target_types)
                     source, caps, types = encode_episode(
                         world, batch_truth, batch_agents)
+                    oracle_makespan = parallel_tsp(
+                        batch_truth, batch_agents)
                 state = TensorEpisodeState.create(
                     world, torch.full((current_batch,), source, device=device),
                     caps[None].expand(current_batch, -1, -1).clone(),
                     types[None].expand(current_batch, -1).clone())
                 rollout = collect_tensor_episodes(
                     model, state, builder, reinforce_config.death_penalty,
-                    reinforce_config.incomplete_penalty, training=True)
+                    reinforce_config.incomplete_penalty, training=True,
+                    oracle_makespans=oracle_makespan)
                 update_return_sum += float(rollout.returns.detach().sum())
                 update_rollouts.append(rollout)
                 accumulated += current_batch
@@ -245,6 +254,10 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                         "return": float(rollout.returns[item]),
                         "loss": float(detached_losses[item]),
                         "makespan": float(rollout.makespans[item]),
+                        "oracle_makespan": float(
+                            rollout.oracle_makespans[item]),
+                        "normalized_regret": float(
+                            rollout.normalized_regrets[item]),
                         "completed": bool(rollout.completed[item]),
                         "deaths": int(rollout.deaths[item]),
                         "remaining_targets": int(
@@ -283,6 +296,12 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                     "advantage_std": float(advantage_std),
                     "mean_makespan": sum(record["makespan"]
                                          for record in update_records) / update_size,
+                    "mean_oracle_makespan": sum(
+                        record["oracle_makespan"]
+                        for record in update_records) / update_size,
+                    "mean_normalized_regret": sum(
+                        record["normalized_regret"]
+                        for record in update_records) / update_size,
                     "completion_rate": sum(record["completed"]
                                            for record in update_records) / update_size,
                     "mean_deaths": sum(record["deaths"]

@@ -39,7 +39,6 @@ class CandidateConfig:
     staging_per_target: int
     staging_capacity: int
     include_wait: bool
-    include_continue: bool
 
     def __post_init__(self):
         if self.staging_per_target < 0:
@@ -143,9 +142,13 @@ def load_config(path: str | Path | None = None) -> LearningConfig:
     instance_payload = payload.get("instances", {})
     if not isinstance(instance_payload, dict):
         raise ValueError("configuration section 'instances' must be a mapping")
+    candidate_payload = dict(_section(payload, "candidates"))
+    # Checkpoints created before joint in-transit replanning had a CONTINUE
+    # candidate. It no longer exists, but its saved config remains loadable.
+    candidate_payload.pop("include_continue", None)
     return LearningConfig(
         model=ModelConfig(**_section(payload, "model")),
-        candidates=CandidateConfig(**_section(payload, "candidates")),
+        candidates=CandidateConfig(**candidate_payload),
         reinforce=ReinforceConfig(**_section(payload, "reinforce")),
         training=TrainingConfig(**training),
         instances=InstanceConfig(**instance_payload),

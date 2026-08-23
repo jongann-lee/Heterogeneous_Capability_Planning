@@ -17,8 +17,9 @@ from learning.gpu.routing import GridRouter
 from learning.gpu.state import TensorEpisodeState
 from learning.model import CentralizedPolicy
 from learning.observation import batch_observations, build_observation
+from learning.orcale import parallel_tsp
 from learning.policy_adapter import LearnedPolicyAdapter
-from learning.rollout import collect_episode
+from learning.rollout import calculate_episode_return, collect_episode
 from simulation.agent import Agent
 from simulation.domain import UNKNOWN_TYPE, init_target_types
 from simulation.engine import run_simulation
@@ -116,6 +117,42 @@ training:
     assert config.instances.max_targets == 7
 
 
+def test_parallel_tsp_partitions_targets_to_minimize_makespan():
+    graph = nx.DiGraph()
+    for node in ("s", "a", "b"):
+        graph.add_node(node, type="intermediate")
+    graph.nodes["a"].update(type="target_unreached", rps_type=1)
+    graph.nodes["b"].update(type="target_unreached", rps_type=1)
+    for u, v, cost in (("s", "a", 2), ("a", "s", 2),
+                       ("s", "b", 3), ("b", "s", 3),
+                       ("a", "b", 5), ("b", "a", 5)):
+        graph.add_edge(u, v, distance=cost)
+    agents = [Agent("s", capabilities={1}), Agent("s", capabilities={1})]
+    assert parallel_tsp(graph, agents) == 3.0
+
+
+def test_oracle_normalized_return_applies_dimensionless_failure_penalties():
+    result = {
+        "makespan": 120.0, "num_deaths": 1,
+        "remaining_targets": ["target"],
+    }
+    value = calculate_episode_return(
+        result, death_penalty=20.0, incomplete_penalty=60.0,
+        oracle_makespan=100.0)
+    assert abs(value - -80.2) < 1e-9
+
+
+def test_oracle_reward_makes_immediate_stall_strictly_bad():
+    stalled = {
+        "makespan": 0.0, "num_deaths": 0,
+        "remaining_targets": list(range(7)),
+    }
+    value = calculate_episode_return(
+        stalled, death_penalty=1.0, incomplete_penalty=10.0,
+        oracle_makespan=146.475743)
+    assert abs(value - -69.0) < 1e-9
+
+
 def test_tensor_episode_transition_matches_cpu_line_episode():
     graph, agents = _instance(False)
     agents[0].capabilities = frozenset({0, 1})
@@ -154,7 +191,6 @@ def test_yaml_configuration_loads_and_validates():
     config = load_config()
     assert config.model.model_dim % config.model.num_heads == 0
     assert config.candidates.include_wait
-    assert config.candidates.include_continue
     assert config.instances.min_targets == 5
     assert config.instances.max_targets == 9
     assert config.training.simulation_batch_size >= 1
@@ -253,9 +289,20 @@ def test_masks_enforce_dead_transit_scout_and_compatibility_rules():
     live_agent = Agent(0, capabilities={2})
     transit = [(0, 1, 0.0, 1.0)]
     moving = build_observation(graph, [live_agent], 2, candidates, transit, 0.5)
-    continue_index = next(i for i, c in enumerate(candidates) if c.is_continue)
-    assert moving.feasible_action_mask.sum() == 1
-    assert moving.feasible_action_mask[0, 0, continue_index]
+    assert not moving.feasible_action_mask.any()
+
+    future = build_observation(
+        graph, [Agent(0, capabilities={1})], 2, candidates, transit, 0.5,
+        replan_transit=True)
+    target_index = next(i for i, item in enumerate(candidates)
+                        if item.is_target)
+    assert future.feasible_action_mask[0, 0, target_index]
+    # The future route begins at committed arrival node 1, three edges from
+    # target 4, rather than being scored from the current edge's source 0.
+    distance_scale = sum(
+        float(data["distance"]) for _u, _v, data in graph.edges(data=True))
+    assert abs(float(future.agent_action_relations[0, 0, target_index, 0])
+               - 3.0 / distance_scale) < 1e-6
 
     graph.nodes[4]["rps_type"] = UNKNOWN_TYPE
     pure_observe = [Candidate(2, is_observation=True, observed_targets={4}),

@@ -10,7 +10,6 @@ candidates:
   staging_per_target: 2
   staging_capacity: 1
   include_wait: True
-  include_continue: True
 
 instances:
   min_targets: 5
@@ -20,12 +19,12 @@ reinforce:
   learning_rate: 3.0E-4
   entropy_coefficient: 0.01
   baseline_decay: 0.95
-  death_penalty: 100.0
-  incomplete_penalty: 1000.0
+  death_penalty: 1.0
+  incomplete_penalty: 10.0
   gradient_clip_norm: 1.0
 
 training:
-  episodes: 6400
+  episodes: 12800
   simulation_batch_size: 8
   reinforce_batch_size: 32
   num_agents: 4

@@ -16,16 +16,27 @@ class Rollout:
 
 
 def calculate_episode_return(result, death_penalty=100.0,
-                             incomplete_penalty=1000.0):
-    return (-float(result["makespan"])
-            - death_penalty * int(result["num_deaths"])
-            - incomplete_penalty * len(result["remaining_targets"]))
+                             incomplete_penalty=1000.0,
+                             oracle_makespan=None):
+    makespan = float(result["makespan"])
+    deaths = int(result["num_deaths"])
+    remaining = len(result["remaining_targets"])
+    if oracle_makespan is None:
+        return (-makespan - death_penalty * deaths
+                - incomplete_penalty * remaining)
+    oracle = float(oracle_makespan)
+    if oracle <= 0:
+        raise ValueError("oracle_makespan must be positive")
+    normalized_regret = makespan / oracle - 1.0
+    return (-normalized_regret - death_penalty * deaths
+            - incomplete_penalty * remaining)
 
 
 def collect_episode(env_map, ground_truth, agents, adapter,
                     death_penalty=100.0, incomplete_penalty=1000.0,
                     max_events=100000, verbose=False,
-                    render_dir=None, render_dt=1.0):
+                    render_dir=None, render_dt=1.0,
+                    oracle_makespan=None):
     """Run one episode and retain the policy's differentiable trace."""
     adapter.reset_trace()
     result = run_simulation(
@@ -39,5 +50,9 @@ def collect_episode(env_map, ground_truth, agents, adapter,
     entropy = torch.stack(adapter.decision_entropies).sum() \
         if adapter.decision_entropies else zero
     episode_return = calculate_episode_return(
-        result, death_penalty, incomplete_penalty)
+        result, death_penalty, incomplete_penalty, oracle_makespan)
+    result["oracle_makespan"] = oracle_makespan
+    result["normalized_regret"] = (
+        None if oracle_makespan is None else
+        float(result["makespan"]) / float(oracle_makespan) - 1.0)
     return Rollout(result, episode_return, logp, entropy)

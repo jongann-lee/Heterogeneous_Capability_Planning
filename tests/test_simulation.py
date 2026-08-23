@@ -216,6 +216,47 @@ def test_committed_path_does_not_replan_at_intermediate_nodes():
     assert calls == [(0,)]
 
 
+def test_learned_style_policy_replans_transit_from_committed_next_node():
+    env = _line(4)
+    truth = _line(4)
+    _set_targets(env, {3: 1})
+    _set_targets(truth, {3: 1})
+    init_target_types(env, truth, {3: 1})
+    # A scout reaching node 1 reveals the target while agent 1 is still on
+    # its equal-time 0->1 edge (agent-index heap ordering processes scout 0).
+    env.nodes[1]["visible_edges"] = [(2, 3)]
+    truth.nodes[1]["visible_edges"] = [(2, 3)]
+    agents = [Agent(0, capabilities={0}), Agent(0, capabilities={1})]
+
+    class FutureRoutePolicy:
+        replan_in_transit = True
+
+        def __init__(self):
+            self.transit = None
+            self.calls = 0
+            self.saw_moving_attacker = False
+
+        def set_runtime_state(self, _agents, transit, _clock):
+            self.transit = list(transit)
+
+        def __call__(self, _env, active, **_kwargs):
+            if self.calls == 0:
+                active[0].planned_path = [0, 1]
+                active[1].planned_path = [0, 1, 2, 3]
+            else:
+                if self.transit[1] is not None:
+                    self.saw_moving_attacker = active[1] is agents[1]
+                    active[1].planned_path = [self.transit[1][1], 2, 3]
+                active[0].planned_path = [active[0].position]
+            self.calls += 1
+
+    policy = FutureRoutePolicy()
+    result = run_simulation(env, truth, agents, policy=policy)
+    assert policy.saw_moving_attacker
+    assert result["completed"]
+    assert agents[1].trajectory == [0, 1, 2, 3]
+
+
 def test_placeholder_leaves_unsupported_target_incomplete():
     target_types = {(0, 3): 4}
     truth = _grid(2, 4)

@@ -18,7 +18,6 @@ class Candidate:
     is_observation: bool = False
     is_staging: bool = False
     is_wait: bool = False
-    is_continue: bool = False
     associated_targets: set = field(default_factory=set)
     observed_targets: set = field(default_factory=set)
     staging_targets: set = field(default_factory=set)
@@ -29,8 +28,6 @@ class Candidate:
     def key(self):
         if self.is_wait:
             return ("special", "wait")
-        if self.is_continue:
-            return ("special", "continue")
         if self.is_observation and self.region_nodes:
             return ("observation_region", tuple(sorted(self.region_nodes,
                                                         key=repr)))
@@ -139,6 +136,4 @@ def generate_candidates(graph: nx.Graph,
               + sorted(observation_regions, key=lambda item: item.key))
     if config.include_wait:
         result.append(Candidate(None, is_wait=True, capacity=None))
-    if config.include_continue:
-        result.append(Candidate(None, is_continue=True, capacity=None))
     return result
