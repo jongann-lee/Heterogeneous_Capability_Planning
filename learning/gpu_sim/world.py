@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 import torch
 
-from learning.candidates import CandidateTerrainCache, generate_candidates
-from learning.gpu.cugraph_router import CuGraphRouter
+from learning.policy.candidates import CandidateTerrainCache, generate_candidates
+from learning.gpu_sim.cugraph_router import CuGraphRouter
 
 
 @dataclass

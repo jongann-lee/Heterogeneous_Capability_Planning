@@ -1,4 +1,4 @@
-"""Small fixed-map instance factory for smoke tests and CLI experiments."""
+"""Fixed-map simulation instance factory for training and evaluation."""
 
 import random
 from functools import lru_cache
@@ -12,8 +12,9 @@ from simulation.domain import (assign_agent_capabilities, assign_target_types,
 
 
 WV_GRID_SIZE = 64
-WV_DEM_PATH = Path(__file__).resolve().parents[1] / "Real_Life_Maps" / "WV_DEM.tif"
-WV_ROADS_PATH = Path(__file__).resolve().parents[1] / "Real_Life_Maps" / "WV_roads.pkl"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+WV_DEM_PATH = PROJECT_ROOT / "Real_Life_Maps" / "WV_DEM.tif"
+WV_ROADS_PATH = PROJECT_ROOT / "Real_Life_Maps" / "WV_roads.pkl"
 
 
 @lru_cache(maxsize=1)

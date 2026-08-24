@@ -8,10 +8,10 @@ from pathlib import Path
 
 import torch
 
-from learning.configuration import DEFAULT_CONFIG_PATH, load_config
-from learning.instances import make_wv_dem_instance
-from learning.model import CentralizedPolicy
-from learning.orcale import parallel_tsp
+from learning.policy.configuration import DEFAULT_CONFIG_PATH, load_config
+from learning.gpu_sim.instances import make_wv_dem_instance
+from learning.policy.model import VanillaTransformerPolicy
+from learning.policy.oracle import parallel_tsp
 
 
 # Fixed sanity-check setup. Set a value to None to sample that component from
@@ -82,10 +82,10 @@ def _capture_state(trace):
 
 def _gpu_episode(model, config, env, truth, agents, device, terrain=None,
                  trace=None):
-    from learning.gpu.observation import TensorObservationBuilder
-    from learning.gpu.rollout import collect_tensor_episodes
-    from learning.gpu.state import TensorEpisodeState
-    from learning.gpu.world import TensorWorld
+    from learning.gpu_sim.observation_gpu import TensorObservationBuilder
+    from learning.gpu_sim.rollout_gpu import collect_tensor_episodes
+    from learning.gpu_sim.state import TensorEpisodeState
+    from learning.gpu_sim.world import TensorWorld
 
     world = TensorWorld.from_networkx(
         env, config.candidates, device=device, terrain=terrain)
@@ -213,8 +213,8 @@ def _render_gpu_trace(trace, env, truth, source_agents, world, frames_dir,
 
 def _cpu_episode(model, config, env, truth, agents, device,
                  render_dir=None, render_dt=1.0):
-    from learning.policy_adapter import LearnedPolicyAdapter
-    from learning.rollout import collect_episode
+    from learning.policy.adapter import LearnedPolicyAdapter
+    from learning.gpu_sim.rollout_cpu import collect_episode
 
     adapter = LearnedPolicyAdapter(
         model, config.model.num_target_types, training=False,
@@ -293,7 +293,7 @@ def evaluate(checkpoint, config_path=None, episodes=1, seed=None,
     if resolved_device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA evaluation requested but CUDA is unavailable")
 
-    model = CentralizedPolicy(config.model).to(resolved_device)
+    model = VanillaTransformerPolicy(config.model).to(resolved_device)
     state_dict = torch.load(weights_path, map_location=resolved_device,
                             weights_only=True)
     model.load_state_dict(state_dict)

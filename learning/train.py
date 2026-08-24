@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 import yaml
 
-from learning.configuration import (
+from learning.policy.configuration import (
     DEFAULT_CONFIG_PATH,
     CandidateConfig,
     LearningConfig,
@@ -16,13 +16,13 @@ from learning.configuration import (
     ReinforceConfig,
     load_config,
 )
-from learning.model import CentralizedPolicy
-from learning.instances import make_wv_dem_instance
-from learning.orcale import parallel_tsp
-from learning.policy_adapter import LearnedPolicyAdapter
-from learning.reinforce import (EMABaseline, batched_optimization_step,
-                                optimization_step)
-from learning.rollout import collect_episode
+from learning.policy.model import VanillaTransformerPolicy
+from learning.gpu_sim.instances import make_wv_dem_instance
+from learning.policy.oracle import parallel_tsp
+from learning.policy.adapter import LearnedPolicyAdapter
+from learning.policy.reinforce import (EMABaseline, batched_optimization_step,
+                                       optimization_step)
+from learning.gpu_sim.rollout_cpu import collect_episode
 
 
 # Fixed sanity-check setup. Set any value to None (or comment out its line) to
@@ -86,7 +86,7 @@ def train(instance_factory, num_target_types, episodes=100,
             dir=str(run_directory) if run_directory is not None else None,
         )
 
-    model = CentralizedPolicy(model_config).to(device)
+    model = VanillaTransformerPolicy(model_config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=reinforce_config.learning_rate)
     baseline = EMABaseline(reinforce_config.baseline_decay)
     history = []
@@ -137,11 +137,11 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
               candidate_config, reinforce_config, run_config, device,
               checkpoint=None, instance_factory=None):
     """Train with parallel CUDA tensor episodes on one immutable WV world."""
-    from learning.gpu.observation import TensorObservationBuilder
-    from learning.gpu.rollout import (collect_tensor_episodes,
-                                      replay_tensor_gradients)
-    from learning.gpu.state import TensorEpisodeState
-    from learning.gpu.world import TensorWorld
+    from learning.gpu_sim.observation_gpu import TensorObservationBuilder
+    from learning.gpu_sim.rollout_gpu import (collect_tensor_episodes,
+                                              replay_tensor_gradients)
+    from learning.gpu_sim.state import TensorEpisodeState
+    from learning.gpu_sim.world import TensorWorld
 
     timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S_%f")
     run_directory = Path(checkpoint) / timestamp if checkpoint else None
@@ -161,7 +161,7 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
     world = TensorWorld.from_networkx(env, candidate_config, device=device)
     terrain = world.terrain
     builder = TensorObservationBuilder(world, model_config.num_target_types)
-    model = CentralizedPolicy(model_config).to(device)
+    model = VanillaTransformerPolicy(model_config).to(device)
     optimizer = torch.optim.Adam(model.parameters(),
                                  lr=reinforce_config.learning_rate)
     baseline = EMABaseline(reinforce_config.baseline_decay)
@@ -331,7 +331,7 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train the centralized policy on the 64x64 WV DEM")
+        description="Train the vanilla Transformer policy on the 64x64 WV DEM")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--episodes", type=int)
     parser.add_argument("--simulation-batch-size", type=int)

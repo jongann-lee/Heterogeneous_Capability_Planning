@@ -1,6 +1,6 @@
 """Centralized neural planning for heterogeneous-capability teams."""
 
-from learning.configuration import (
+from learning.policy.configuration import (
     CandidateConfig,
     LearningConfig,
     ModelConfig,
@@ -8,9 +8,10 @@ from learning.configuration import (
     TrainingConfig,
     load_config,
 )
-from learning.model import CentralizedPolicy
-from learning.observation import PlannerObservation, build_observation
+from learning.policy.model import VanillaTransformerPolicy
+from learning.gpu_sim.observation_cpu import PlannerObservation, build_observation
 
-__all__ = ["CandidateConfig", "CentralizedPolicy", "LearningConfig",
+__all__ = ["CandidateConfig", "LearningConfig",
            "ModelConfig", "PlannerObservation", "ReinforceConfig",
-           "TrainingConfig", "build_observation", "load_config"]
+           "TrainingConfig", "VanillaTransformerPolicy", "build_observation",
+           "load_config"]

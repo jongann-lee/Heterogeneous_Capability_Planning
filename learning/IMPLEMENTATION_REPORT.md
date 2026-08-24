@@ -26,13 +26,13 @@ smoke checks were performed. Full experiment execution remains with the user.
 
 - `learning/config.yaml`
   - Stores model, candidate-generation, REINFORCE, and smoke-training settings.
-- `learning/configuration.py`
+- `learning/policy/configuration.py`
   - Loads YAML into typed immutable objects and validates architectural and
     numerical constraints.
 
 ### Candidate generation
 
-- `learning/candidates.py`
+- `learning/policy/candidates.py`
   - Defines the `Candidate` representation.
   - Generates live-target, observation, and staging candidates
     deterministically from the planner's graph.
@@ -46,7 +46,7 @@ smoke checks were performed. Full experiment execution remains with the user.
 
 ### Planner observations
 
-- `learning/observation.py`
+- `learning/gpu_sim/observation_cpu.py`
   - Defines `PlannerObservation` with the tensor layout requested in the plan:
     agent, target, and action features; entity masks; three relation tensors;
     and the agent-action feasibility mask.
@@ -67,11 +67,11 @@ smoke checks were performed. Full experiment execution remains with the user.
 
 ### Neural architecture
 
-- `learning/encoders.py`
+- `learning/modules/encoders.py`
   - Provides small MLP entity encoders for agent, target, and action feature
     vectors.
 
-- `learning/attention.py`
+- `learning/modules/attention.py`
   - Uses PyTorch `TransformerDecoderLayer` rather than custom residual
     attention machinery.
   - Each block performs built-in self-attention, cross-attention, residual,
@@ -79,8 +79,8 @@ smoke checks were performed. Full experiment execution remains with the user.
   - Implements bidirectional agent-target blocks and action-target
     contextualization without positional encoding, preserving set symmetry.
 
-- `learning/model.py`
-  - Implements the complete `CentralizedPolicy` network.
+- `learning/policy/model.py`
+  - Implements the initial 0811 `VanillaTransformerPolicy` network.
   - Contextualizes agents and targets through configurable world blocks.
   - Contextualizes actions through action self-attention, aggregated
     action-target relation embeddings, and action-to-target cross-attention.
@@ -92,7 +92,7 @@ smoke checks were performed. Full experiment execution remains with the user.
 
 ### Coordinated decoder
 
-- `learning/decoder.py`
+- `learning/modules/decoder.py`
   - Implements sequential centralized assignment over flattened
     `(agent, action)` pairs.
   - Samples from a masked categorical distribution in training mode and uses
@@ -108,7 +108,7 @@ smoke checks were performed. Full experiment execution remains with the user.
 
 ### Simulator integration
 
-- `learning/policy_adapter.py`
+- `learning/policy/adapter.py`
   - Adapts neural assignments to the existing simulator policy interface.
   - Builds candidates and planner observations at every replanning event.
   - Converts physical-node actions into graph routes and writes them directly
@@ -130,7 +130,7 @@ smoke checks were performed. Full experiment execution remains with the user.
 
 ### Rollouts and REINFORCE
 
-- `learning/rollout.py`
+- `learning/gpu_sim/rollout_cpu.py`
   - Runs complete episodes through the existing simulation engine.
   - Computes the configurable initial return:
 
@@ -143,7 +143,7 @@ smoke checks were performed. Full experiment execution remains with the user.
   - Aggregates all replanning-event log probabilities and entropies into an
     episodic trace.
 
-- `learning/reinforce.py`
+- `learning/policy/reinforce.py`
   - Implements an exponential-moving-average return baseline.
   - Implements the episodic REINFORCE loss with an entropy bonus.
   - Includes optimizer stepping and gradient clipping.
@@ -155,13 +155,13 @@ smoke checks were performed. Full experiment execution remains with the user.
   - Provides a command-line smoke-training entry point using the included
     fixed-grid instance generator.
 
-- `learning/evaluate.py`
+- `learning/policy/evaluation.py`
   - Loads model configuration and weights from a checkpoint.
   - Evaluates with greedy autoregressive decoding.
   - Provides both a reusable Python function and a fixed-grid command-line
     entry point.
 
-- `learning/instances.py`
+- `learning/gpu_sim/instances.py`
   - Provides a small blockage-free fixed-grid instance generator for smoke
     training and evaluation.
   - Creates planner and ground-truth graph copies, locally visible terrain,
@@ -331,7 +331,7 @@ available. A device can be selected explicitly with `--device cpu` or
 ### Greedy checkpoint evaluation
 
 ```bash
-uv run python -m learning.evaluate learning_policy.pt \
+uv run python -m learning.policy.evaluation learning_policy.pt \
   --seed 10000 \
   --grid-size 5 \
   --num-agents 4

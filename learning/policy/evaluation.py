@@ -6,10 +6,10 @@ from pathlib import Path
 import torch
 import yaml
 
-from learning.configuration import CandidateConfig, ModelConfig, load_config
-from learning.model import CentralizedPolicy
-from learning.instances import make_wv_dem_instance
-from learning.policy_adapter import LearnedPolicyAdapter
+from learning.policy.configuration import CandidateConfig, ModelConfig, load_config
+from learning.policy.model import VanillaTransformerPolicy
+from learning.gpu_sim.instances import make_wv_dem_instance
+from learning.policy.adapter import LearnedPolicyAdapter
 from simulation.engine import run_simulation
 
 
@@ -31,7 +31,7 @@ def load_policy(checkpoint, device="cpu"):
         candidate_payload.pop("include_continue", None)
         candidate_config = (CandidateConfig(**candidate_payload)
                             if candidate_payload else load_config().candidates)
-    model = CentralizedPolicy(config).to(device)
+    model = VanillaTransformerPolicy(config).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     return model, LearnedPolicyAdapter(

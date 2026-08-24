@@ -5,7 +5,7 @@ from typing import Any
 
 import networkx as nx
 
-from learning.configuration import CandidateConfig
+from learning.policy.configuration import CandidateConfig
 from simulation.domain import UNKNOWN_TYPE
 
 

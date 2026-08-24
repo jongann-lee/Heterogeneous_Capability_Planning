@@ -1,4 +1,4 @@
-"""Entity feature encoders."""
+"""Reusable entity feature encoders."""
 
 from torch import nn
 

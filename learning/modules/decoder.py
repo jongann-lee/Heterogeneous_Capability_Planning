@@ -1,4 +1,4 @@
-"""Autoregressive constrained centralized assignment decoder."""
+"""Autoregressive constrained assignment decoder."""
 
 from dataclasses import dataclass
 

@@ -7,7 +7,7 @@ from typing import Any
 import yaml
 
 
-DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
+DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
 
 
 @dataclass(frozen=True)

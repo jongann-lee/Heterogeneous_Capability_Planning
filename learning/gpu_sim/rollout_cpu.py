@@ -1,4 +1,4 @@
-"""Complete episodic rollout collection."""
+"""CPU simulator episodic rollout collection."""
 
 from dataclasses import dataclass
 

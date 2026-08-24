@@ -1,4 +1,4 @@
-"""Batched tensorized episodic rollout on CUDA."""
+"""Batched tensorized GPU episodic rollout."""
 
 from dataclasses import dataclass
 

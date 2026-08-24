@@ -1,4 +1,4 @@
-"""PyTorch Transformer blocks used by the centralized learned policy."""
+"""PyTorch Transformer blocks used by learned policies."""
 
 from torch import nn
 

@@ -10,12 +10,12 @@ agent traversing an edge must finish that edge, but its replacement route is
 chosen immediately from the committed arrival node and begins on arrival. No
 ground-truth graph is accepted by the observation builder or policy.
 
-Experiment settings live in `learning/config.yaml`; `learning/configuration.py`
+Experiment settings live in `learning/config.yaml`; `learning/policy/configuration.py`
 only loads and validates that file. The attention stack uses PyTorch's
 `TransformerDecoderLayer` for self-attention, cross-attention, residuals,
 normalization, and feed-forward processing.
 
-Training returns are normalized against `learning.orcale.parallel_tsp`, a
+Training returns are normalized against `learning.policy.oracle.parallel_tsp`, a
 full-information min-max open-TSP oracle over the terrain's shortest-path
 metric closure. The logged `normalized_regret` is
 `makespan / oracle_makespan - 1`; zero matches the oracle. Death and incomplete

@@ -3,9 +3,9 @@
 import networkx as nx
 import torch
 
-from learning.candidates import generate_candidates
-from learning.configuration import CandidateConfig, load_config
-from learning.observation import build_observation, candidate_path
+from learning.policy.candidates import generate_candidates
+from learning.policy.configuration import CandidateConfig, load_config
+from learning.gpu_sim.observation_cpu import build_observation, candidate_path
 
 
 class LearnedPolicyAdapter:

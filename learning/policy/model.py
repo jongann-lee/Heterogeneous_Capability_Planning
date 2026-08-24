@@ -1,18 +1,19 @@
-"""Centralized attention policy and explicit agent-action pointer head."""
+"""Initial vanilla Transformer policy developed around August 11 (0811)."""
 
 import math
 
 import torch
 from torch import nn
 
-from learning.attention import CrossTransformerBlock, WorldBlock
-from learning.configuration import ModelConfig
-from learning.decoder import AssignmentDecoder
-from learning.encoders import EntityEncoder
-from learning.observation import feature_dimensions
+from learning.modules import (AssignmentDecoder, CrossTransformerBlock,
+                              EntityEncoder, WorldBlock)
+from learning.gpu_sim.observation_cpu import feature_dimensions
+from learning.policy.configuration import ModelConfig
 
 
-class CentralizedPolicy(nn.Module):
+class VanillaTransformerPolicy(nn.Module):
+    """The initial 0811 centralized Transformer policy implementation."""
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config

@@ -2,7 +2,7 @@
 
 import torch
 
-from learning.observation import PlannerObservation, feature_dimensions
+from learning.gpu_sim.observation_cpu import PlannerObservation, feature_dimensions
 
 
 class TensorObservationBuilder:
@@ -128,7 +128,7 @@ class TensorObservationBuilder:
         action_x[..., 10] = world.candidate_capacity.clamp_min(0)
 
         # Agent-target paths unblock the goal target while avoiding every other
-        # live target, exactly like learning.observation._safe_path.
+        # live target, exactly like observation_cpu._safe_path.
         target_nodes = world.target_nodes
         at_distance = target_route_distances
         reachable_at = torch.isfinite(at_distance) & (at_distance < 1e30)

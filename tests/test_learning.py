@@ -9,17 +9,17 @@ from types import SimpleNamespace
 import networkx as nx
 import torch
 
-from learning.candidates import (Candidate, CandidateTerrainCache,
-                                 generate_candidates)
-from learning.configuration import load_config
-from learning.decoder import AssignmentDecoder, DecoderOutput
-from learning.gpu.routing import GridRouter
-from learning.gpu.state import TensorEpisodeState
-from learning.model import CentralizedPolicy
-from learning.observation import batch_observations, build_observation
-from learning.orcale import parallel_tsp
-from learning.policy_adapter import LearnedPolicyAdapter
-from learning.rollout import calculate_episode_return, collect_episode
+from learning.policy.candidates import (Candidate, CandidateTerrainCache,
+                                        generate_candidates)
+from learning.policy.configuration import load_config
+from learning.gpu_sim.routing import GridRouter
+from learning.gpu_sim.state import TensorEpisodeState
+from learning.policy.model import VanillaTransformerPolicy
+from learning.modules import AssignmentDecoder, DecoderOutput
+from learning.gpu_sim.observation_cpu import batch_observations, build_observation
+from learning.policy.oracle import parallel_tsp
+from learning.policy.adapter import LearnedPolicyAdapter
+from learning.gpu_sim.rollout_cpu import calculate_episode_return, collect_episode
 from simulation.agent import Agent
 from simulation.domain import UNKNOWN_TYPE, init_target_types
 from simulation.engine import run_simulation
@@ -55,7 +55,7 @@ def _model():
         num_heads=4,
         num_world_blocks=1,
     )
-    model = CentralizedPolicy(config)
+    model = VanillaTransformerPolicy(config)
     model.eval()
     return model
 

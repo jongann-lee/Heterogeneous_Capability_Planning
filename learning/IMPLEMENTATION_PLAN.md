@@ -338,19 +338,29 @@ intervals.
 
 ```text
 learning/
-    observation.py        # PlannerObservation and tensor batching
-    candidates.py         # deterministic candidate generation
-    encoders.py           # initial entity encoders
-    attention.py          # self/cross-attention blocks
-    model.py              # complete policy network
-    decoder.py            # autoregressive pair assignment
-    policy_adapter.py     # simulation integration
-    rollout.py            # episode collection
-    reinforce.py          # loss and optimizer logic
+    gpu_sim/
+        observation_cpu.py # NetworkX observation construction and batching
+        observation_gpu.py # batched tensor observation construction
+        rollout_cpu.py     # simulator episode collection
+        rollout_gpu.py     # batched GPU episode collection
+        instances.py       # fixed-map instance construction
+    policy/
+        __init__.py       # public policy exports
+        candidates.py     # deterministic candidate generation
+        configuration.py  # YAML loading and validation
+        model.py          # complete policy network
+        oracle.py         # full-information makespan oracle
+        adapter.py        # simulator integration
+        evaluation.py     # checkpoint evaluation helpers
+        reinforce.py      # optimization logic
+    modules/
+        __init__.py       # public building-block exports
+        encoders.py       # initial entity encoders
+        attention.py      # self/cross-attention blocks
+        decoder.py        # autoregressive pair assignment
     train.py              # training CLI
     evaluate.py           # greedy benchmark evaluation
     config.yaml           # experiment and model settings
-    configuration.py      # YAML loading and validation
 
 tests/
     test_learning_observation.py

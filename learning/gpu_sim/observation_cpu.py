@@ -1,4 +1,4 @@
-"""Planner-visible tensor observations and padding utilities."""
+"""CPU/NetworkX planner observations and padding utilities."""
 
 from dataclasses import dataclass, fields
 from typing import Any
@@ -6,8 +6,8 @@ from typing import Any
 import networkx as nx
 import torch
 
-from learning.candidates import Candidate, generate_candidates
-from learning.configuration import CandidateConfig, load_config
+from learning.policy.candidates import Candidate, generate_candidates
+from learning.policy.configuration import CandidateConfig, load_config
 from simulation.domain import UNKNOWN_TYPE
 
 
