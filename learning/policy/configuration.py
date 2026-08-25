@@ -18,6 +18,10 @@ class ModelConfig:
     num_world_blocks: int
     dropout: float
     relation_hidden_dim: int
+    architecture: str = "transformer"
+    message_passing_blocks: int = 3
+    distance_embedding_dim: int = 32
+    critic_hidden_dim: int = 128
 
     def __post_init__(self):
         if self.num_target_types < 1:
@@ -32,6 +36,15 @@ class ModelConfig:
             raise ValueError("dropout must lie in [0, 1)")
         if self.relation_hidden_dim <= 0:
             raise ValueError("relation_hidden_dim must be positive")
+        if self.architecture not in {"transformer", "task_graph"}:
+            raise ValueError(
+                "model.architecture must be 'transformer' or 'task_graph'")
+        if self.message_passing_blocks < 1:
+            raise ValueError("message_passing_blocks must be positive")
+        if self.distance_embedding_dim < 1:
+            raise ValueError("distance_embedding_dim must be positive")
+        if self.critic_hidden_dim < 1:
+            raise ValueError("critic_hidden_dim must be positive")
 
 
 @dataclass(frozen=True)
@@ -55,6 +68,7 @@ class ReinforceConfig:
     death_penalty: float
     incomplete_penalty: float
     gradient_clip_norm: float
+    critic_coefficient: float = 0.5
 
     def __post_init__(self):
         if self.learning_rate <= 0:
@@ -67,6 +81,8 @@ class ReinforceConfig:
             raise ValueError("penalties must be non-negative")
         if self.gradient_clip_norm <= 0:
             raise ValueError("gradient_clip_norm must be positive")
+        if self.critic_coefficient < 0:
+            raise ValueError("critic_coefficient must be non-negative")
 
 
 @dataclass(frozen=True)

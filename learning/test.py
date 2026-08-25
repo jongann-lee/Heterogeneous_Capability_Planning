@@ -10,7 +10,7 @@ import torch
 
 from learning.policy.configuration import DEFAULT_CONFIG_PATH, load_config
 from learning.gpu_sim.instances import make_wv_dem_instance
-from learning.policy.model import VanillaTransformerPolicy
+from learning.policy.model import build_policy
 from learning.policy.oracle import parallel_tsp
 
 
@@ -96,7 +96,9 @@ def _gpu_episode(model, config, env, truth, agents, device, terrain=None,
     oracle_makespan = parallel_tsp(truth, agents)
     rollout = collect_tensor_episodes(
         model, state,
-        TensorObservationBuilder(world, config.model.num_target_types),
+        TensorObservationBuilder(
+            world, config.model.num_target_types,
+            task_graph=config.model.architecture == "task_graph"),
         config.reinforce.death_penalty,
         config.reinforce.incomplete_penalty,
         training=False,
@@ -293,7 +295,7 @@ def evaluate(checkpoint, config_path=None, episodes=1, seed=None,
     if resolved_device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA evaluation requested but CUDA is unavailable")
 
-    model = VanillaTransformerPolicy(config.model).to(resolved_device)
+    model = build_policy(config.model).to(resolved_device)
     state_dict = torch.load(weights_path, map_location=resolved_device,
                             weights_only=True)
     model.load_state_dict(state_dict)

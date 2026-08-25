@@ -2,13 +2,18 @@
 
 import torch
 
-from learning.gpu_sim.observation_cpu import PlannerObservation, feature_dimensions
+from learning.gpu_sim.observation_cpu import (
+    PlannerObservation,
+    attach_task_graph_fields,
+    feature_dimensions,
+)
 
 
 class TensorObservationBuilder:
-    def __init__(self, world, num_target_types):
+    def __init__(self, world, num_target_types, task_graph=True):
         self.world = world
         self.num_target_types = int(num_target_types)
+        self.task_graph = bool(task_graph)
 
     def candidate_roles(self, state):
         live = state.target_live
@@ -68,6 +73,47 @@ class TensorObservationBuilder:
         entry_nodes = torch.where(
             at_goal, planning_positions[..., None], entry_nodes)
         return distances, predecessors, target_distances, entry_nodes
+
+    def _action_target_distances(self, state, episode_mask):
+        """Safe directed region-to-target distances for graph relations.
+
+        All other live targets are blocked. The destination target is recovered
+        through its incoming edges, matching the agent-target routing contract.
+        This is intentionally planner-visible and never reads target truth.
+        """
+        world = self.world
+        device = state.positions.device
+        batch = state.batch_size
+        actions = len(world.candidates)
+        targets = len(world.targets)
+        output = torch.full(
+            (batch, actions, targets), torch.inf, device=device)
+        if episode_mask is None:
+            episode_mask = torch.ones(
+                batch, dtype=torch.bool, device=device)
+        if not world.candidate_region_mask.any():
+            return output
+
+        for episode in range(batch):
+            if not bool(episode_mask[episode].item()):
+                continue
+            blocked = world.target_nodes[state.target_live[episode]].tolist()
+            for action in range(actions):
+                region = world.candidate_region_nodes[action][
+                    world.candidate_region_mask[action]]
+                if region.numel() == 0:
+                    continue
+                # A live target used as the action origin has been serviced by
+                # the time this relation applies, so it is no longer a blocker.
+                region_set = set(region.tolist())
+                effective_blocked = [node for node in blocked
+                                     if node not in region_set]
+                # SSSP from every target on the reversed graph yields directed
+                # original-graph distances from this action region to targets.
+                routes = world.reverse_router.sssp(
+                    world.target_nodes, effective_blocked, region).distances
+                output[episode, action] = routes[:, region].amin(dim=1)
+        return output
 
     def build(self, state, planning_episode_mask=None):
         world = self.world
@@ -189,12 +235,22 @@ class TensorObservationBuilder:
         ct_rel[..., 0] = world.target_candidate_mask
         ct_rel[..., 1] = observed_links
         ct_rel[..., 2] = staging_links
-        target_region_options = world.target_distances[:, region_nodes].permute(1, 0, 2)
-        target_region_options = target_region_options.masked_fill(
-            ~region_mask[:, None], torch.inf)
-        base_distance = target_region_options.min(dim=2).values
-        base_distance[~physical] = 0.0
-        ct_rel[..., 3] = base_distance[None] / world.distance_scale
+        if self.task_graph:
+            base_distance = self._action_target_distances(
+                state, planning_episode_mask)
+        else:
+            # Preserve the original Transformer's static relation tensor and
+            # avoid constructing reverse cuGraph route banks it never consumes.
+            target_region_options = world.target_distances[
+                :, region_nodes].permute(1, 0, 2)
+            target_region_options = target_region_options.masked_fill(
+                ~region_mask[:, None], torch.inf)
+            static_distance = target_region_options.amin(dim=2)
+            base_distance = static_distance[None].expand(batch, -1, -1)
+        ct_rel[..., 3] = torch.where(
+            torch.isfinite(base_distance),
+            base_distance / world.distance_scale,
+            torch.zeros_like(base_distance))
         ct_rel[..., 4] = state.target_live[:, None]
         ct_rel[..., 5] = state.target_known[:, None]
         ct_rel[..., 6] = ~state.target_known[:, None]
@@ -210,6 +266,11 @@ class TensorObservationBuilder:
                     torch.full_like(world.candidate_capacity,
                                     torch.iinfo(torch.long).max),
                     world.candidate_capacity)[None].expand(batch, -1)))
+        ct_reachable = (
+            torch.isfinite(base_distance) & (base_distance < 1e30)
+            & physical[None, :, None]
+        )
+        attach_task_graph_fields(observation, reachable_at, ct_reachable)
         return (observation, route_distances, predecessors,
                 target_route_distances, target_entries,
                 candidate_entry_nodes)

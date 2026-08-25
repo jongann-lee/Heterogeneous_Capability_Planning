@@ -10,7 +10,11 @@ from learning.policy.configuration import (
     TrainingConfig,
     load_config,
 )
-from learning.policy.model import VanillaTransformerPolicy
+from learning.policy.model import (
+    HeterogeneousGraphPolicy,
+    VanillaTransformerPolicy,
+    build_policy,
+)
 from learning.policy.oracle import parallel_tsp
 
 __all__ = [
@@ -22,7 +26,9 @@ __all__ = [
     "ModelConfig",
     "ReinforceConfig",
     "TrainingConfig",
+    "HeterogeneousGraphPolicy",
     "VanillaTransformerPolicy",
+    "build_policy",
     "generate_candidates",
     "load_config",
     "parallel_tsp",

@@ -21,16 +21,38 @@ def reinforce_loss(rollout, baseline, entropy_coefficient=0.01):
 
 
 def optimization_step(optimizer, rollout, baseline: EMABaseline,
-                      entropy_coefficient=0.01, gradient_clip_norm=1.0):
+                      entropy_coefficient=0.01, gradient_clip_norm=1.0,
+                      critic_coefficient=0.5):
     optimizer.zero_grad(set_to_none=True)
-    baseline_value = baseline.update(rollout.episode_return)
-    loss = reinforce_loss(rollout, baseline_value, entropy_coefficient)
+    if rollout.state_values.numel():
+        targets = torch.full_like(
+            rollout.state_values, float(rollout.episode_return))
+        advantages = targets - rollout.state_values.detach()
+        actor_loss = -(advantages * rollout.decision_log_probabilities).mean()
+        entropy = rollout.decision_entropies.mean()
+        critic_loss = torch.nn.functional.mse_loss(
+            rollout.state_values, targets)
+        loss = (actor_loss - entropy_coefficient * entropy
+                + critic_coefficient * critic_loss)
+        baseline_value = None
+    else:
+        baseline_value = baseline.update(rollout.episode_return)
+        loss = reinforce_loss(rollout, baseline_value, entropy_coefficient)
+        actor_loss = loss + entropy_coefficient * rollout.entropy
+        critic_loss = loss.new_zeros(())
+        entropy = rollout.entropy
     loss.backward()
     parameters = [p for group in optimizer.param_groups
                   for p in group["params"]]
     gradient_norm = torch.nn.utils.clip_grad_norm_(
         parameters, gradient_clip_norm)
     optimizer.step()
+    optimization_step.last_metrics = {
+        "actor_loss": float(actor_loss.detach()),
+        "critic_loss": float(critic_loss.detach()),
+        "entropy": float(entropy.detach()),
+        "baseline": baseline_value,
+    }
     return float(loss.detach()), float(gradient_norm)
 
 

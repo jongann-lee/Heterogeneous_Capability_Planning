@@ -1,19 +1,29 @@
 # Learning package
 
-This package implements the centralized learned planner described in
-`IMPLEMENTATION_PLAN.md`. It uses deterministic candidate generation, padded
-planner-visible observations, agent/target/action attention, an explicit
-agent-action pointer head, and constrained autoregressive joint assignment.
+This package provides two centralized learned planners over the same
+deterministic candidates, planner-visible routes, and constrained
+autoregressive joint assignment:
+
+- `task_graph` (the default in `learning/config.yaml`) is a typed,
+  edge-conditioned heterogeneous GNN over agent, target, and action nodes. It
+  uses a shared sum-pooled graph critic and actor-critic training.
+- `transformer` is the original set-attention control architecture. Its
+  preserved configuration is `learning/config_transformer.yaml`; it retains
+  the scalar EMA REINFORCE baseline for checkpoint compatibility.
+
+Set `model.architecture` in a configuration file to select the implementation.
+The task graph is not the terrain graph: routing, visibility, candidate
+generation, and partial-observability updates remain outside the network.
 
 The simulator adapter observes and jointly replans the full living team. An
 agent traversing an edge must finish that edge, but its replacement route is
 chosen immediately from the committed arrival node and begins on arrival. No
 ground-truth graph is accepted by the observation builder or policy.
 
-Experiment settings live in `learning/config.yaml`; `learning/policy/configuration.py`
-only loads and validates that file. The attention stack uses PyTorch's
-`TransformerDecoderLayer` for self-attention, cross-attention, residuals,
-normalization, and feed-forward processing.
+`learning/policy/configuration.py` loads and validates experiment settings. The
+task-graph policy consumes only capabilities, completion/type beliefs, action
+categories, normalized safe-route distances, and typed action-target semantic
+relations. It receives no absolute coordinates, heights, or ground truth.
 
 Training returns are normalized against `learning.policy.oracle.parallel_tsp`, a
 full-information min-max open-TSP oracle over the terrain's shortest-path
@@ -27,6 +37,7 @@ Training and greedy evaluation use the clockwise-rotated 64x64 WV DEM:
 ```bash
 uv run python -m learning.train --episodes 100
 uv run python -m learning.train --config learning/config.yaml
+uv run python -m learning.train --config learning/config_transformer.yaml
 uv run python -m learning.test learning/checkpoints/<run-timestamp> --device cuda
 uv run python -m learning.test learning/checkpoints/<run-timestamp> --device cuda --render
 ```
@@ -45,7 +56,7 @@ Each training run creates a timestamped directory beneath
 `learning/checkpoints/` containing separate `trained_weights.pt` and
 `config.yaml` files. Pass `--checkpoint-dir` to use a different parent
 directory. With `training.wandb: true`, the same resolved configuration and
-one aggregate record per REINFORCE optimizer update are logged to the
+one aggregate record per optimizer update are logged to the
 `heterogeneous-capability-planning` Weights & Biases project. Metrics include
 mean return, mean policy loss, mean makespan, and completion rate across the
 update's episode batch. Failure diagnostics include mean deaths, mean remaining
@@ -53,8 +64,9 @@ targets, stalled rate, and all-agents-dead rate.
 
 For research runs, import `learning.train.train` and supply an
 `instance_factory(episode)` returning fresh `(env_map, ground_truth, agents)`
-objects. The code uses complete episodic REINFORCE with an EMA baseline and has
-no Gym or RL-framework dependency.
+objects. The Transformer uses complete episodic REINFORCE with an EMA baseline;
+the task graph uses its shared state-conditioned critic. Neither path depends
+on Gym or another RL framework.
 
 Fast checks:
 

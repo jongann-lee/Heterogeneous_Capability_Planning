@@ -22,6 +22,7 @@ class TensorTerrain:
     neighbors: torch.Tensor
     distance_scale: float
     router: CuGraphRouter
+    reverse_router: CuGraphRouter
     candidate_cache: CandidateTerrainCache
 
     @classmethod
@@ -71,11 +72,15 @@ class TensorTerrain:
             len(nodes), [node_index[u] for u, _v, _w in edges],
             [node_index[v] for _u, v, _w in edges],
             [float(w) for _u, _v, w in edges])
+        reverse_router = CuGraphRouter(
+            len(nodes), [node_index[v] for _u, v, _w in edges],
+            [node_index[u] for u, _v, _w in edges],
+            [float(w) for _u, _v, w in edges])
         distance_scale = max(sum(
             float(data.get("distance", 1.0))
             for _u, _v, data in graph.edges(data=True)), 1.0)
         return cls(graph, nodes, node_index, positions, heights, visibility,
-                   edge_cost, neighbors, distance_scale, router,
+                   edge_cost, neighbors, distance_scale, router, reverse_router,
                    CandidateTerrainCache(graph))
 
 
@@ -109,6 +114,7 @@ class TensorWorld:
     target_incoming_nodes: torch.Tensor
     target_incoming_costs: torch.Tensor
     router: CuGraphRouter
+    reverse_router: CuGraphRouter
 
     @classmethod
     def from_networkx(cls, graph, candidate_config, device="cuda",
@@ -163,6 +169,7 @@ class TensorWorld:
         edge_cost = terrain.edge_cost
         neighbors = terrain.neighbors
         router = terrain.router
+        reverse_router = terrain.reverse_router
         target_candidate_mask = (
             candidate_nodes[:, None] == target_nodes_tensor[None, :])
         distance_scale = terrain.distance_scale
@@ -196,7 +203,7 @@ class TensorWorld:
                           for item in candidates], dtype=torch.long,
             device=device), target_candidate_mask, distance_scale,
             target_sssp.distances, target_incoming_nodes,
-            target_incoming_costs, router)
+            target_incoming_costs, router, reverse_router)
         world.neighbors = neighbors
         world.required_route_nodes = torch.unique(torch.cat((
             candidate_region_nodes[candidate_region_mask],

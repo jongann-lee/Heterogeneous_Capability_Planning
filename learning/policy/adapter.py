@@ -22,6 +22,7 @@ class LearnedPolicyAdapter:
         self.device = device or next(model.parameters()).device
         self.decision_log_probs = []
         self.decision_entropies = []
+        self.decision_values = []
         self._all_agents = None
         self._transit = None
         self._clock = 0.0
@@ -35,6 +36,7 @@ class LearnedPolicyAdapter:
     def reset_trace(self):
         self.decision_log_probs.clear()
         self.decision_entropies.clear()
+        self.decision_values.clear()
 
     @staticmethod
     def _route(graph, source, candidate, live):
@@ -52,10 +54,20 @@ class LearnedPolicyAdapter:
             replan_transit=True).to(self.device)
         self.model.train(self.training)
         with torch.set_grad_enabled(self.training):
-            decoded = self.model.decode(
-                observation, candidates=[candidates], training=self.training)
+            if hasattr(self.model, "decode_with_value"):
+                decoded, values = self.model.decode_with_value(
+                    observation, candidates=[candidates], training=self.training)
+            else:
+                # Preserve the small decoder-only models used by tests and
+                # downstream policy experiments.
+                decoded = self.model.decode(
+                    observation, candidates=[candidates],
+                    training=self.training)
+                values = None
         self.decision_log_probs.append(decoded.log_probabilities[0])
         self.decision_entropies.append(decoded.entropies[0])
+        if values is not None:
+            self.decision_values.append(values[0])
 
         active_ids = {id(agent) for agent in at_node_agents}
         live = {n for n, d in env_map.nodes(data=True)

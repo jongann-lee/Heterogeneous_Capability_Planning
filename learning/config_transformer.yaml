@@ -1,12 +1,8 @@
 model:
-  architecture: task_graph
   num_target_types: 3
   model_dim: 128
   num_heads: 4
   num_world_blocks: 2
-  message_passing_blocks: 3
-  distance_embedding_dim: 32
-  critic_hidden_dim: 128
   dropout: 0.0
   relation_hidden_dim: 64
 
@@ -26,10 +22,9 @@ reinforce:
   death_penalty: 1.0
   incomplete_penalty: 10.0
   gradient_clip_norm: 1.0
-  critic_coefficient: 0.5
 
 training:
-  episodes: 3200
+  episodes: 12800
   simulation_batch_size: 8
   reinforce_batch_size: 32
   num_agents: 4

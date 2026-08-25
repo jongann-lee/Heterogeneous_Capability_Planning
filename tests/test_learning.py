@@ -14,12 +14,17 @@ from learning.policy.candidates import (Candidate, CandidateTerrainCache,
 from learning.policy.configuration import load_config
 from learning.gpu_sim.routing import GridRouter
 from learning.gpu_sim.state import TensorEpisodeState
-from learning.policy.model import VanillaTransformerPolicy
+from learning.policy.model import (
+    HeterogeneousGraphPolicy,
+    VanillaTransformerPolicy,
+    build_policy,
+)
 from learning.modules import AssignmentDecoder, DecoderOutput
 from learning.gpu_sim.observation_cpu import batch_observations, build_observation
 from learning.policy.oracle import parallel_tsp
 from learning.policy.adapter import LearnedPolicyAdapter
 from learning.gpu_sim.rollout_cpu import calculate_episode_return, collect_episode
+from learning.gpu_sim.rollout_gpu import DecisionTrace, replay_tensor_gradients
 from simulation.agent import Agent
 from simulation.domain import UNKNOWN_TYPE, init_target_types
 from simulation.engine import run_simulation
@@ -56,6 +61,23 @@ def _model():
         num_world_blocks=1,
     )
     model = VanillaTransformerPolicy(config)
+    model.eval()
+    return model
+
+
+def _graph_model(num_target_types=2):
+    torch.manual_seed(11)
+    config = replace(
+        load_config().model,
+        architecture="task_graph",
+        num_target_types=num_target_types,
+        model_dim=32,
+        num_heads=4,
+        message_passing_blocks=2,
+        distance_embedding_dim=8,
+        critic_hidden_dim=16,
+    )
+    model = HeterogeneousGraphPolicy(config)
     model.eval()
     return model
 
@@ -196,6 +218,164 @@ def test_yaml_configuration_loads_and_validates():
     assert config.training.simulation_batch_size >= 1
     assert config.training.reinforce_batch_size >= 1
     assert config.training.device in {"auto", "cpu", "cuda"}
+
+
+def test_graph_and_transformer_configs_select_separate_policies():
+    graph_config = load_config()
+    transformer_path = Path(__file__).parents[1] / "learning" / "config_transformer.yaml"
+    transformer_config = load_config(transformer_path)
+    assert graph_config.model.architecture == "task_graph"
+    assert transformer_config.model.architecture == "transformer"
+    assert isinstance(build_policy(graph_config.model), HeterogeneousGraphPolicy)
+    assert isinstance(build_policy(transformer_config.model),
+                      VanillaTransformerPolicy)
+
+
+def test_task_graph_schema_uses_beliefs_semantics_and_effective_distances():
+    graph = _line()
+    graph.nodes[4].update(type="target_unreached", rps_type=UNKNOWN_TYPE)
+    graph.nodes[2]["visible_edges"] = [(3, 4)]
+    agent = Agent(0, capabilities={0, 1})
+    observation = build_observation(
+        graph, [agent], 2,
+        transit=[(0, 1, 0.0, 1.0)], clock=0.25,
+        replan_transit=True)
+
+    assert observation.task_agent_features.shape[-1] == 5
+    assert observation.task_target_features.shape[-1] == 3
+    assert observation.task_action_features.shape[-1] == 4
+    # Unknown types use a uniform planner belief, never truth or all-zero.
+    assert torch.allclose(
+        observation.task_target_features[0, 0, 1:],
+        torch.tensor([0.5, 0.5]))
+
+    target_action = next(
+        i for i, item in enumerate(observation.candidates[0])
+        if item.is_target)
+    wait_action = next(
+        i for i, item in enumerate(observation.candidates[0])
+        if item.is_wait)
+    observation_action = next(
+        i for i, item in enumerate(observation.candidates[0])
+        if item.is_observation)
+    target_index = 0
+    distance_scale = sum(float(data["distance"])
+                         for _u, _v, data in graph.edges(data=True))
+    expected = (0.75 + 3.0) / distance_scale
+    assert abs(float(observation.agent_action_distances[
+        0, 0, target_action, 0]) - expected) < 1e-6
+    assert observation.serves_mask[0, target_action, target_index]
+    assert observation.reveals_mask[0, observation_action, target_index]
+    assert not observation.action_target_distance_mask[
+        0, wait_action, target_index]
+
+
+def test_task_graph_policy_is_permutation_equivariant_and_has_finite_critic():
+    graph, agents = _instance()
+    graph.nodes[3].update(type="target_unreached", rps_type=2)
+    observation = build_observation(graph, agents, 2)
+    model = _graph_model()
+    base_logits, base_value = model.actor_critic(observation)
+    assert torch.isfinite(base_logits[observation.feasible_action_mask]).all()
+    assert torch.isfinite(base_value).all()
+
+    swapped_agents = copy.copy(observation)
+    order_a = torch.tensor([1, 0])
+    for name in ("agent_features", "agent_mask", "task_agent_features"):
+        setattr(swapped_agents, name, getattr(observation, name)[:, order_a])
+    for name in ("agent_target_relations", "agent_action_relations",
+                 "feasible_action_mask", "agent_target_distances",
+                 "agent_action_distances", "agent_target_distance_mask",
+                 "agent_action_distance_mask"):
+        setattr(swapped_agents, name, getattr(observation, name)[:, order_a])
+    swapped_logits, swapped_value = model.actor_critic(swapped_agents)
+    assert torch.allclose(swapped_logits, base_logits[:, order_a], atol=1e-5,
+                          equal_nan=True)
+    assert torch.allclose(swapped_value, base_value, atol=1e-5)
+
+    swapped_actions = copy.copy(observation)
+    order_c = torch.arange(observation.action_features.shape[1] - 1, -1, -1)
+    for name in ("action_features", "action_mask", "task_action_features"):
+        setattr(swapped_actions, name, getattr(observation, name)[:, order_c])
+    for name in ("action_target_relations", "action_target_distances",
+                 "action_target_distance_mask", "serves_mask", "reveals_mask",
+                 "stages_for_mask"):
+        setattr(swapped_actions, name, getattr(observation, name)[:, order_c])
+    for name in ("agent_action_relations", "feasible_action_mask",
+                 "agent_action_distances", "agent_action_distance_mask"):
+        setattr(swapped_actions, name, getattr(observation, name)[:, :, order_c])
+    swapped_logits, swapped_value = model.actor_critic(swapped_actions)
+    assert torch.allclose(swapped_logits, base_logits[:, :, order_c], atol=1e-5,
+                          equal_nan=True)
+    assert torch.allclose(swapped_value, base_value, atol=1e-5)
+
+    swapped_targets = copy.copy(observation)
+    order_t = torch.tensor([1, 0])
+    for name in ("target_features", "target_mask", "task_target_features"):
+        setattr(swapped_targets, name, getattr(observation, name)[:, order_t])
+    for name in ("agent_target_relations", "agent_target_distances",
+                 "agent_target_distance_mask"):
+        setattr(swapped_targets, name,
+                getattr(observation, name)[:, :, order_t])
+    for name in ("action_target_relations", "action_target_distances",
+                 "action_target_distance_mask", "serves_mask", "reveals_mask",
+                 "stages_for_mask"):
+        setattr(swapped_targets, name,
+                getattr(observation, name)[:, :, order_t])
+    swapped_logits, swapped_value = model.actor_critic(swapped_targets)
+    assert torch.allclose(swapped_logits, base_logits, atol=1e-5,
+                          equal_nan=True)
+    assert torch.allclose(swapped_value, base_value, atol=1e-5)
+
+    loss = (base_logits[observation.feasible_action_mask].mean()
+            + base_value.mean())
+    model.train()
+    loss.backward()
+    assert all(torch.isfinite(parameter.grad).all()
+               for parameter in model.parameters()
+               if parameter.grad is not None)
+
+
+def test_task_graph_policy_is_padding_invariant():
+    graph, agents = _instance()
+    small = build_observation(graph, agents[:1], 2)
+    large = build_observation(graph, agents, 2)
+    batch = batch_observations([small, large])
+    model = _graph_model()
+    alone_logits, alone_value = model.actor_critic(small)
+    batch_logits, batch_values = model.actor_critic(batch)
+    actions = small.action_features.shape[1]
+    assert torch.allclose(
+        alone_logits[0, 0, :actions], batch_logits[0, 0, :actions], atol=1e-5)
+    assert torch.allclose(alone_value[0], batch_values[0], atol=1e-5)
+
+
+def test_task_graph_tensor_replay_trains_actor_and_critic():
+    graph, agents = _instance()
+    observation = build_observation(graph, agents, 2)
+    unlimited = torch.iinfo(torch.long).max
+    observation.action_capacities = torch.tensor([[
+        unlimited if item.capacity is None else item.capacity
+        for item in observation.candidates[0]
+    ]], dtype=torch.long)
+    model = _graph_model()
+    model.train()
+    with torch.no_grad():
+        decoded = model.decode(observation, training=False)
+    rollout = SimpleNamespace(decision_traces=[DecisionTrace(
+        observation, decoded.selected_pair_indices)])
+    outputs = replay_tensor_gradients(
+        model, rollout, torch.tensor([-2.0]),
+        entropy_coefficient=0.01, update_size=1, device="cpu",
+        critic_coefficient=0.5)
+    losses, counts, critic_losses, entropies, values = outputs
+    assert counts.item() == 1
+    assert torch.isfinite(losses).all()
+    assert torch.isfinite(critic_losses).all()
+    assert torch.isfinite(entropies).all()
+    assert torch.isfinite(values).all()
+    assert any(parameter.grad is not None
+               for parameter in model.critic.parameters())
 
 
 def test_cached_candidate_generation_matches_uncached_generation():

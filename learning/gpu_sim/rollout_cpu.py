@@ -13,6 +13,9 @@ class Rollout:
     episode_return: float
     log_probability: torch.Tensor
     entropy: torch.Tensor
+    decision_log_probabilities: torch.Tensor
+    decision_entropies: torch.Tensor
+    state_values: torch.Tensor
 
 
 def calculate_episode_return(result, death_penalty=100.0,
@@ -49,10 +52,21 @@ def collect_episode(env_map, ground_truth, agents, adapter,
         if adapter.decision_log_probs else zero
     entropy = torch.stack(adapter.decision_entropies).sum() \
         if adapter.decision_entropies else zero
+    decision_log_probabilities = (
+        torch.stack(adapter.decision_log_probs)
+        if adapter.decision_log_probs else zero.new_empty((0,)))
+    decision_entropies = (
+        torch.stack(adapter.decision_entropies)
+        if adapter.decision_entropies else zero.new_empty((0,)))
+    state_values = (
+        torch.stack(adapter.decision_values)
+        if adapter.decision_values else zero.new_empty((0,)))
     episode_return = calculate_episode_return(
         result, death_penalty, incomplete_penalty, oracle_makespan)
     result["oracle_makespan"] = oracle_makespan
     result["normalized_regret"] = (
         None if oracle_makespan is None else
         float(result["makespan"]) / float(oracle_makespan) - 1.0)
-    return Rollout(result, episode_return, logp, entropy)
+    return Rollout(
+        result, episode_return, logp, entropy,
+        decision_log_probabilities, decision_entropies, state_values)

@@ -27,6 +27,18 @@ class PlannerObservation:
     agents: list[list[Any]] | None = None
     targets: list[list[Any]] | None = None
     action_capacities: torch.Tensor | None = None
+    task_agent_features: torch.Tensor | None = None
+    task_target_features: torch.Tensor | None = None
+    task_action_features: torch.Tensor | None = None
+    agent_target_distances: torch.Tensor | None = None
+    agent_action_distances: torch.Tensor | None = None
+    action_target_distances: torch.Tensor | None = None
+    agent_target_distance_mask: torch.Tensor | None = None
+    agent_action_distance_mask: torch.Tensor | None = None
+    action_target_distance_mask: torch.Tensor | None = None
+    serves_mask: torch.Tensor | None = None
+    reveals_mask: torch.Tensor | None = None
+    stages_for_mask: torch.Tensor | None = None
 
     def to(self, device):
         values = {}
@@ -39,6 +51,65 @@ class PlannerObservation:
 def feature_dimensions(num_target_types: int) -> tuple[int, int, int, int, int, int]:
     """Return ``(Fa, Ft, Fc, Fat, Fac, Fct)``."""
     return (9 + num_target_types, 8 + num_target_types, 11, 6, 6, 7)
+
+
+def attach_task_graph_fields(observation: PlannerObservation,
+                             agent_target_reachable: torch.Tensor,
+                             action_target_reachable: torch.Tensor,
+                             action_target_distances: torch.Tensor | None = None,
+                             ) -> PlannerObservation:
+    """Attach the geometry-free heterogeneous task-graph view in-place.
+
+    The legacy observation remains intact for the Transformer control policy.
+    Graph distances reuse its normalization, with remaining committed-edge time
+    added to agent-origin relations. Explicit masks distinguish an unreachable
+    pair from a genuine zero-distance pair.
+    """
+    agent = observation.agent_features
+    target = observation.target_features
+    action = observation.action_features
+    num_target_types = agent.shape[-1] - 9
+
+    # alive, normalized remaining transit time, scout capability, then every
+    # positive service capability.
+    observation.task_agent_features = torch.cat(
+        (agent[..., 2:3], agent[..., 8:9], agent[..., 3:4], agent[..., 9:]),
+        dim=-1)
+
+    known = target[..., 4:5]
+    unknown = target[..., 5:6]
+    prior = unknown.expand(*unknown.shape[:-1], num_target_types) \
+        / float(num_target_types)
+    belief = target[..., 8:] * known + prior
+    observation.task_target_features = torch.cat(
+        (target[..., 3:4], belief), dim=-1)
+    observation.task_action_features = action[..., 2:6]
+
+    remaining = agent[..., 8:9].unsqueeze(2)
+    observation.agent_target_distances = (
+        observation.agent_target_relations[..., 0:1] + remaining)
+    observation.agent_action_distances = (
+        observation.agent_action_relations[..., 0:1] + remaining)
+    observation.action_target_distances = (
+        observation.action_target_relations[..., 3:4]
+        if action_target_distances is None else action_target_distances)
+
+    at_nodes = observation.agent_mask[:, :, None] & observation.target_mask[:, None]
+    aa_nodes = observation.agent_mask[:, :, None] & observation.action_mask[:, None]
+    ct_nodes = observation.action_mask[:, :, None] & observation.target_mask[:, None]
+    observation.agent_target_distance_mask = (
+        agent_target_reachable.bool() & at_nodes)
+    observation.agent_action_distance_mask = (
+        observation.agent_action_relations[..., 2].bool() & aa_nodes)
+    observation.action_target_distance_mask = (
+        action_target_reachable.bool() & ct_nodes)
+    observation.serves_mask = (
+        observation.action_target_relations[..., 0].bool() & ct_nodes)
+    observation.reveals_mask = (
+        observation.action_target_relations[..., 1].bool() & ct_nodes)
+    observation.stages_for_mask = (
+        observation.action_target_relations[..., 2].bool() & ct_nodes)
+    return observation
 
 
 def _positions(graph):
@@ -123,6 +194,10 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
     ac_rel = torch.zeros((len(agents), len(candidates), fac), dtype=torch.float32)
     ct_rel = torch.zeros((len(candidates), len(targets), fct), dtype=torch.float32)
     feasible = torch.zeros((len(agents), len(candidates)), dtype=torch.bool)
+    at_reachable = torch.zeros((len(agents), len(targets)), dtype=torch.bool)
+    ct_reachable = torch.zeros((len(candidates), len(targets)), dtype=torch.bool)
+    task_ct_distance = torch.zeros(
+        (len(candidates), len(targets), 1), dtype=torch.float32)
 
     for i, (agent, travel) in enumerate(zip(agents, transit)):
         x, y = pos.get(agent.position, (0.0, 0.0))
@@ -187,6 +262,7 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
         for j, target in enumerate(targets):
             path = _safe_path(graph, planning_position, target, live)
             dist = _path_distance(graph, path)
+            at_reachable[i, j] = path is not None
             kind = int(graph.nodes[target].get("rps_type", UNKNOWN_TYPE))
             known = kind != UNKNOWN_TYPE
             at_rel[i, j] = torch.tensor([
@@ -229,16 +305,20 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
             region = candidate.region_nodes or ({candidate.node}
                                                  if candidate.node is not None else set())
             if not region:
-                dist = float("inf")
+                dist = task_dist = float("inf")
             else:
-                distances = []
+                distances, task_distances = [], []
                 for node in region:
                     try:
                         distances.append(nx.shortest_path_length(
                             graph, node, target, weight="distance"))
                     except (nx.NetworkXNoPath, nx.NodeNotFound):
                         pass
+                    path = _safe_path(graph, node, target, live)
+                    if path is not None:
+                        task_distances.append(_path_distance(graph, path))
                 dist = min(distances, default=float("inf"))
+                task_dist = min(task_distances, default=float("inf"))
             known = graph.nodes[target].get("rps_type", UNKNOWN_TYPE) != UNKNOWN_TYPE
             ct_rel[c, j] = torch.tensor([
                 float(candidate.node == target),
@@ -247,8 +327,12 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
                 0.0 if dist == float("inf") else dist / distance_scale,
                 float(target in live), float(known), float(not known),
             ])
+            ct_reachable[c, j] = bool(
+                region and task_dist != float("inf"))
+            if task_dist != float("inf"):
+                task_ct_distance[c, j, 0] = task_dist / distance_scale
 
-    return PlannerObservation(
+    observation = PlannerObservation(
         agent_x.unsqueeze(0), target_x.unsqueeze(0), action_x.unsqueeze(0),
         torch.ones((1, len(agents)), dtype=torch.bool),
         torch.ones((1, len(targets)), dtype=torch.bool),
@@ -256,6 +340,9 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
         at_rel.unsqueeze(0), ac_rel.unsqueeze(0), ct_rel.unsqueeze(0),
         feasible.unsqueeze(0), [candidates], [agents], [targets],
     )
+    return attach_task_graph_fields(
+        observation, at_reachable.unsqueeze(0), ct_reachable.unsqueeze(0),
+        task_ct_distance.unsqueeze(0))
 
 
 def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:
@@ -283,6 +370,18 @@ def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:
         "agent_action_relations": (1, a, c, items[0].agent_action_relations.shape[-1]),
         "action_target_relations": (1, c, t, items[0].action_target_relations.shape[-1]),
         "feasible_action_mask": (1, a, c),
+        "task_agent_features": (1, a, items[0].task_agent_features.shape[-1]),
+        "task_target_features": (1, t, items[0].task_target_features.shape[-1]),
+        "task_action_features": (1, c, items[0].task_action_features.shape[-1]),
+        "agent_target_distances": (1, a, t, 1),
+        "agent_action_distances": (1, a, c, 1),
+        "action_target_distances": (1, c, t, 1),
+        "agent_target_distance_mask": (1, a, t),
+        "agent_action_distance_mask": (1, a, c),
+        "action_target_distance_mask": (1, c, t),
+        "serves_mask": (1, c, t),
+        "reveals_mask": (1, c, t),
+        "stages_for_mask": (1, c, t),
     }
     for name, shape in specs.items():
         kwargs[name] = torch.cat([pad(getattr(item, name), shape) for item in items])

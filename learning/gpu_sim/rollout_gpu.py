@@ -22,6 +22,7 @@ class TensorRollout:
     all_agents_dead: torch.Tensor
     oracle_makespans: torch.Tensor
     normalized_regrets: torch.Tensor
+    target_counts: torch.Tensor
     decision_traces: list[DecisionTrace]
     events: int
 
@@ -156,34 +157,55 @@ def collect_tensor_episodes(model, state, observation_builder,
     return TensorRollout(
         returns, state.clock, completed, state.deaths, remaining,
         stalled, all_agents_dead, oracle_makespans, normalized_regrets,
+        torch.full_like(remaining, state.target_live.shape[1]),
         decision_traces, events)
 
 
-def replay_tensor_gradients(model, rollout, advantages, entropy_coefficient,
-                            update_size, device):
-    """Replay decisions using normalized, full-update advantages.
+def replay_tensor_gradients(model, rollout, episode_signals,
+                            entropy_coefficient, update_size, device,
+                            critic_coefficient=0.5):
+    """Replay decisions using EMA advantages or graph-critic residuals.
 
     Each episode is averaged over the number of times the policy was queried.
     Makespan therefore affects the return, but a long trajectory does not also
     receive an incidental multiplier merely because it contains more events.
     """
-    advantages = advantages.detach().to(device)
-    decision_counts = torch.zeros_like(advantages)
+    episode_signals = episode_signals.detach().to(device)
+    decision_counts = torch.zeros_like(episode_signals)
     for trace in rollout.decision_traces:
         decision_counts += torch.tensor(
             [bool(selected) for selected in trace.selected_pair_indices],
-            dtype=advantages.dtype, device=device)
+            dtype=episode_signals.dtype, device=device)
     loss_divisors = decision_counts.clamp_min(1.0)
-    totals = torch.zeros_like(advantages)
+    totals = torch.zeros_like(episode_signals)
+    critic_totals = torch.zeros_like(episode_signals)
+    entropy_totals = torch.zeros_like(episode_signals)
+    value_totals = torch.zeros_like(episode_signals)
     for trace in rollout.decision_traces:
         observation = trace.observation.to(device)
-        logits = model(observation)
+        logits, values = model.actor_critic(observation)
         logp, entropy = model.decoder.evaluate_selected(
             logits, observation.feasible_action_mask,
             observation.action_capacities, trace.selected_pair_indices)
-        losses = (-(advantages * logp) - entropy_coefficient * entropy) \
+        active = torch.tensor(
+            [bool(selected) for selected in trace.selected_pair_indices],
+            dtype=episode_signals.dtype, device=device)
+        if values is None:
+            advantages = episode_signals
+            critic_losses = torch.zeros_like(episode_signals)
+        else:
+            advantages = episode_signals - values.detach()
+            critic_losses = (values - episode_signals).square() * active
+            value_totals += values.detach() * active / loss_divisors
+        actor_losses = (-(advantages * logp)
+                        - entropy_coefficient * entropy) * active
+        losses = (actor_losses + critic_coefficient * critic_losses) \
             / loss_divisors
-        (losses.sum() / update_size).backward()
+        if active.any():
+            (losses.sum() / update_size).backward()
         totals += losses.detach()
+        critic_totals += critic_losses.detach() / loss_divisors
+        entropy_totals += entropy.detach() * active / loss_divisors
         del observation, logits, logp, entropy, losses
-    return totals, decision_counts
+    return (totals, decision_counts, critic_totals,
+            entropy_totals, value_totals)

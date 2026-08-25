@@ -16,7 +16,7 @@ from learning.policy.configuration import (
     ReinforceConfig,
     load_config,
 )
-from learning.policy.model import VanillaTransformerPolicy
+from learning.policy.model import build_policy
 from learning.gpu_sim.instances import make_wv_dem_instance
 from learning.policy.oracle import parallel_tsp
 from learning.policy.adapter import LearnedPolicyAdapter
@@ -28,8 +28,8 @@ from learning.gpu_sim.rollout_cpu import collect_episode
 # Fixed sanity-check setup. Set any value to None (or comment out its line) to
 # sample that component independently for every episode.
 SOURCE_POSITION = (0, 0)
-TARGET_POSITIONS = None # [(14,54), (1,29), (33,17), (34,35), (63,37), (37,5), (49,58)]
-TARGET_TYPES = None # [1, 2, 2, 1, 2, 3, 3]
+TARGET_POSITIONS = [(14,54), (1,29), (33,17), (34,35), (63,37), (37,5), (49,58)]
+TARGET_TYPES = [1, 2, 2, 1, 2, 3, 3]
 AGENT_CAPABILITIES = [{0}, {1}, {2}, {3}]
 
 
@@ -86,7 +86,7 @@ def train(instance_factory, num_target_types, episodes=100,
             dir=str(run_directory) if run_directory is not None else None,
         )
 
-    model = VanillaTransformerPolicy(model_config).to(device)
+    model = build_policy(model_config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=reinforce_config.learning_rate)
     baseline = EMABaseline(reinforce_config.baseline_decay)
     history = []
@@ -102,10 +102,12 @@ def train(instance_factory, num_target_types, episodes=100,
                 reinforce_config.death_penalty,
                 reinforce_config.incomplete_penalty,
                 oracle_makespan=oracle_makespan)
-            loss, _grad_norm = optimization_step(
+            loss, grad_norm = optimization_step(
                 optimizer, rollout, baseline,
                 reinforce_config.entropy_coefficient,
-                reinforce_config.gradient_clip_norm)
+                reinforce_config.gradient_clip_norm,
+                reinforce_config.critic_coefficient)
+            loss_metrics = optimization_step.last_metrics
             metrics = {
                 "episode": episode,
                 "return": rollout.episode_return,
@@ -114,6 +116,15 @@ def train(instance_factory, num_target_types, episodes=100,
                 "oracle_makespan": oracle_makespan,
                 "normalized_regret": rollout.result["normalized_regret"],
                 "completed": rollout.result["completed"],
+                "actor_loss": loss_metrics["actor_loss"],
+                "critic_loss": loss_metrics["critic_loss"],
+                "entropy": loss_metrics["entropy"],
+                "gradient_norm": grad_norm,
+                "decisions": int(rollout.decision_log_probabilities.numel()),
+                "state_value": (float(rollout.state_values.mean().detach())
+                                if rollout.state_values.numel() else 0.0),
+                "target_count": (len(rollout.result["eliminated_targets"])
+                                 + len(rollout.result["remaining_targets"])),
             }
             history.append(metrics)
             if wandb_run is not None:
@@ -160,8 +171,10 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
 
     world = TensorWorld.from_networkx(env, candidate_config, device=device)
     terrain = world.terrain
-    builder = TensorObservationBuilder(world, model_config.num_target_types)
-    model = VanillaTransformerPolicy(model_config).to(device)
+    builder = TensorObservationBuilder(
+        world, model_config.num_target_types,
+        task_graph=model_config.architecture == "task_graph")
+    model = build_policy(model_config).to(device)
     optimizer = torch.optim.Adam(model.parameters(),
                                  lr=reinforce_config.learning_rate)
     baseline = EMABaseline(reinforce_config.baseline_decay)
@@ -211,7 +224,8 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                         batch_env, candidate_config, device=device,
                         terrain=terrain)
                     builder = TensorObservationBuilder(
-                        world, model_config.num_target_types)
+                        world, model_config.num_target_types,
+                        task_graph=model_config.architecture == "task_graph")
                     source, caps, types = encode_episode(
                         world, batch_truth, batch_agents)
                     oracle_makespan = parallel_tsp(
@@ -234,21 +248,25 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
 
             batch_returns = torch.cat(
                 [rollout.returns.detach() for rollout in update_rollouts])
-            raw_advantages = batch_returns - baseline_value
+            raw_advantages = (batch_returns if model.has_critic
+                              else batch_returns - baseline_value)
             advantage_mean = raw_advantages.mean()
             advantage_std = raw_advantages.std(unbiased=False)
-            normalized_advantages = (
+            episode_signals = (
+                batch_returns if model.has_critic else
                 (raw_advantages - advantage_mean)
                 / advantage_std.clamp_min(1.0e-8))
 
             advantage_offset = 0
             for rollout in update_rollouts:
                 current_batch = rollout.returns.numel()
-                rollout_advantages = normalized_advantages[
+                rollout_signals = episode_signals[
                     advantage_offset:advantage_offset + current_batch]
-                detached_losses, decision_counts = replay_tensor_gradients(
-                    model, rollout, rollout_advantages,
-                    reinforce_config.entropy_coefficient, update_size, device)
+                (detached_losses, decision_counts, critic_losses,
+                 entropies, state_values) = replay_tensor_gradients(
+                    model, rollout, rollout_signals,
+                    reinforce_config.entropy_coefficient, update_size, device,
+                    reinforce_config.critic_coefficient)
                 for item in range(current_batch):
                     update_records.append({
                         "return": float(rollout.returns[item]),
@@ -266,32 +284,62 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                         "all_agents_dead": bool(
                             rollout.all_agents_dead[item]),
                         "decisions": int(decision_counts[item]),
+                        "critic_loss": float(critic_losses[item]),
+                        "entropy": float(entropies[item]),
+                        "state_value": float(state_values[item]),
+                        "target_count": int(rollout.target_counts[item]),
                     })
                 advantage_offset += current_batch
-                del rollout, detached_losses, decision_counts
+                del rollout, detached_losses, decision_counts, critic_losses
+                del entropies, state_values
                 torch.cuda.empty_cache()
             del update_rollouts, batch_returns, raw_advantages
-            del normalized_advantages
+            del episode_signals
 
             parameters = [parameter for group in optimizer.param_groups
                           for parameter in group["params"]]
-            torch.nn.utils.clip_grad_norm_(
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
                 parameters, reinforce_config.gradient_clip_norm)
             optimizer.step()
-            baseline.update(update_return_sum / update_size)
+            if not model.has_critic:
+                baseline.update(update_return_sum / update_size)
             for offset, metrics in enumerate(update_records):
                 episode = completed_episodes + offset
                 metrics["episode"] = episode
                 history.append(metrics)
             if wandb_run is not None:
                 update_index = completed_episodes // reinforce_batch_size
-                wandb_run.log({
+                completed_regrets = [
+                    record["normalized_regret"] for record in update_records
+                    if record["completed"]]
+                return_tensor = torch.tensor(
+                    [record["return"] for record in update_records])
+                value_tensor = torch.tensor(
+                    [record["state_value"] for record in update_records])
+                return_variance = return_tensor.var(unbiased=False)
+                explained_variance = (
+                    1.0 - (return_tensor - value_tensor).var(unbiased=False)
+                    / return_variance
+                    if model.has_critic and return_variance > 1e-12 else
+                    torch.tensor(0.0))
+                logged_metrics = {
                     "update": update_index,
                     "episodes_seen": completed_episodes + update_size,
                     "mean_return": sum(record["return"]
                                        for record in update_records) / update_size,
                     "mean_loss": sum(record["loss"]
                                      for record in update_records) / update_size,
+                    "mean_critic_loss": sum(record["critic_loss"]
+                                             for record in update_records) / update_size,
+                    "mean_policy_entropy": sum(record["entropy"]
+                                                for record in update_records) / update_size,
+                    "gradient_norm": float(gradient_norm),
+                    "mean_decision_count": sum(record["decisions"]
+                                                for record in update_records) / update_size,
+                    "critic_explained_variance": float(explained_variance),
+                    "completed_only_normalized_regret": (
+                        sum(completed_regrets) / len(completed_regrets)
+                        if completed_regrets else float("nan")),
                     "advantage_mean": float(advantage_mean),
                     "advantage_std": float(advantage_std),
                     "mean_makespan": sum(record["makespan"]
@@ -314,7 +362,16 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                     "all_agents_dead_rate": sum(
                         record["all_agents_dead"]
                         for record in update_records) / update_size,
-                }, step=update_index)
+                }
+                target_counts = sorted({
+                    record["target_count"] for record in update_records})
+                for target_count in target_counts:
+                    group = [record for record in update_records
+                             if record["target_count"] == target_count]
+                    logged_metrics[
+                        f"completion_rate/targets_{target_count}"] = sum(
+                            record["completed"] for record in group) / len(group)
+                wandb_run.log(logged_metrics, step=update_index)
             completed_episodes += update_size
     finally:
         if wandb_run is not None:
@@ -331,7 +388,7 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train the vanilla Transformer policy on the 64x64 WV DEM")
+        description="Train the configured learned policy on the 64x64 WV DEM")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--episodes", type=int)
     parser.add_argument("--simulation-batch-size", type=int)

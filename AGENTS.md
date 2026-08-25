@@ -1,127 +1,183 @@
 # AGENTS.md
 
-Project guide for Codex working in this repo. Created from an earlier
-session's accumulated context. **This repo has several diverging git branches
-that each explore a different extension — verify the actual code on the current
-branch before trusting any branch-specific claim below.**
+Repository guide for coding agents. This describes the code currently on
+`main`; verify the branch and implementation after a branch switch.
 
-## What this is
+## Project
 
-A multi-agent extension of the paper *"Navigating Uncertain Environments with
-Heterogeneous Visibility"* (arXiv 2603.03495). The PDF is at the repo root
-(`Navigating_Uncertain_Environments_with_Heterogeneous_Visibility(anonymous).pdf`).
+This repository studies centralized planning for heterogeneous agents on an
+uncertain, weighted terrain graph. Target locations are known but their
+positive integer types are initially hidden. Agent capabilities are integers:
 
-The single-agent algorithm from the paper is already implemented; the active
-work is lifting it to multiple cooperating agents and exploring variants
-(lock-and-key constraints, moving targets, etc.). The `pyproject.toml` name
-`uncertain-edge-tsp` is legacy single-agent naming.
+- `0` permits scouting (edge/blockage sensing and target-type revelation);
+- positive `k` permits servicing target type `k`;
+- contacting an unsupported live target kills the agent and leaves the target
+  active.
 
-**Core problem.** Agents traverse a weighted graph and must collectively visit
-every target (TSP-like), but the planner has imperfect knowledge of the
-environment and learns by *observing* as agents move. Path reward trades off
-visibility/observation gain against traversal distance.
+The simulator objective is mission makespan plus a configurable death penalty.
+The learning objective normalizes makespan by a full-information parallel
+open-TSP oracle and adds dimensionless death and incompletion penalties.
 
-## Branches (each is a different research direction — they diverge!)
+The package is `heterogeneous-capability-planning`, requires Python 3.12 or
+3.13, and has a working root `main.py` for the real-map benchmark.
 
-- **`main`** — base multi-agent version. Single `reward_ratio`, `Agent` has a
-  `cost_multiplier`, no locks/keys, no policy dispatch.
-- **`fixed_key`** — lock-and-key model with *fixed* agent↔key pairs. Targets
-  carry a `lock`; agents carry `possessed_keys`; a target unlocks only with the
-  matching key. Reward split into `edge_reward_ratio` + `target_reward_ratio`;
-  `cost_multiplier == 1 + len(possessed_keys)`; partial-observability locks via
-  sentinel `UNKNOWN_LOCK = -1`; `--policy` dispatch with `baseline1_shortest_path`.
-- **`moving_targets`** — explores targets that move (branched from the 0527
-  base). Uses `reward_ratio` / `cost_multiplier` like `main`; has leftover
-  `baseline1_all_key.py` / `baseline2_greedy_single_key.py` files but no policy
-  dispatch.
+## Source map
 
-Because abstractions are renamed across branches (`reward_ratio` vs
-`edge_reward_ratio`+`target_reward_ratio`; `cost_multiplier` vs
-`possessed_keys`; locks present only on `fixed_key`), **always grep the current
-branch rather than assuming.**
+- `simulation/`
+  - `agent.py`: mutable per-episode `Agent` state. Prefer `capabilities`;
+    singleton `agent_type` exists only for legacy compatibility.
+  - `domain.py`: capability validation/generation, target-type initialization,
+    and encounters. `rps_type`, `ROCK`, and `beats` are compatibility remnants;
+    the active model is direct capability matching, not cyclic RPS.
+  - `engine.py`: map-independent continuous-time discrete-event simulator and
+    safe placeholder policy.
+  - `real_map_benchmark.py`: builds the WV DEM instance, selects a baseline,
+    runs it, and optionally writes JSON, CSV, PNG, and MP4 output.
+  - `rendering.py`: visualization and ffmpeg integration, kept outside the core
+    engine import path.
+- `planning/`
+  - `policies/baseline1.py`: independent distance routing. Service agents
+    prefer supported, unknown, then unsupported targets; pure scouts move to
+    the tallest safe node.
+  - `policies/baseline2.py` / `scout_wrp.py`: assigns the least
+    service-capable scout a Watchman Route Problem covering walk, then uses the
+    baseline-1 attacker layer. Exact A* is used through 12 scoutable unknown
+    targets, with weighted A* above that threshold.
+  - `finite_horizon.py`: older reward-driven Hungarian and sequential-greedy
+    comparison planners; these are not benchmark defaults.
+  - `legacy/`: retained comparison code, not an active entry point.
+- `learning/`
+  - `config.yaml`: task-graph actor-critic defaults. The original Transformer
+    defaults are preserved in `config_transformer.yaml`.
+    `policy/configuration.py` loads and validates both; CLI flags override
+    common training fields.
+  - `modules/` and `policy/model.py`: selectable Transformer or typed
+    heterogeneous graph actor, graph critic, and constrained joint decoder.
+  - `policy/candidates.py`: deterministic target, staging, and wait candidates.
+  - `gpu_sim/observation_cpu.py`: canonical planner-visible feature builder and
+    CPU batching despite the historical module path.
+  - `policy/adapter.py` and `gpu_sim/rollout_cpu.py`: simulator-backed policy
+    and CPU rollout/training path.
+  - `gpu_sim/world.py`, `state.py`, `observation_gpu.py`, `rollout_gpu.py`, and
+    `cugraph_router.py`: batched CUDA simulation and cuGraph routing path.
+  - `policy/oracle.py`: full-information min-max open-TSP normalization oracle.
+  - `train.py`: CPU/CUDA REINFORCE training. Timestamped checkpoints contain
+    `trained_weights.pt` and the resolved `config.yaml`.
+  - `test.py`: deterministic checkpoint evaluation and optional post-rollout
+    rendering. `policy/evaluation.py` is a smaller legacy interface.
+- `Graph_Generation/`: visibility, blockage, target-graph, and stochastic
+  diverse-path helpers used by older planners.
+- `Real_Life_Maps/`: bundled `WV_DEM.tif`, `WV_roads.pkl`, terrain builder, and
+  retained older benchmark scripts.
+- `Single_Agent/`: original reward-driven implementation and TSP solver,
+  retained as dependencies/comparisons.
+- `tests/`: executable synthetic regressions for simulation and learning.
+- `outputs/` and `learning/checkpoints/`: ignored generated artifacts. Never
+  delete or overwrite them without checking with the user.
 
-## Repo layout
+`NEW_REPOSITORY_HANDOFF.md`, `learning/IMPLEMENTATION_PLAN.md`, and
+`learning/IMPLEMENTATION_REPORT.md` are design/history documents. They are
+useful context but are not authoritative when they disagree with code or tests.
+The root notebook and older `Real_Life_Maps/` scripts are also exploratory or
+legacy.
 
-- `Single_Agent/` — baseline. `repeated_topk.py` is the main algorithm class
-  `RepeatedTopK` (builds a target graph, reweights edges by path reward, solves
-  a TSP via `lin_kernighan_tsp.py`). `reward_functions.py` defines the
-  per-node visibility reward. `calculate_path_reward` (in `repeated_topk.py`)
-  is the shared reward function used by both single- and multi-agent code.
-- `simulation/` — execution and environment-facing interfaces.
-  - `agent.py` — mutable `Agent` episode state.
-  - `domain.py` — target types, capabilities, encounters, and random assignment.
-  - `engine.py` — map-agnostic continuous-time discrete-event simulator.
-  - `real_map_benchmark.py` — real-DEM CLI entry point.
-  - `rendering.py` — PNG/MP4 rendering, kept out of the core engine import path.
-- `planning/` — hand-written planning algorithms.
-  - `policies/baseline1.py` — independent capability-aware routing.
-  - `policies/baseline2.py` + `policies/scout_wrp.py` — WRP scout baseline.
-  - `finite_horizon.py` — older Hungarian and sequential-greedy assignments.
-  - `legacy/` — retained comparison algorithms, not active entry points.
-- `learning/` — PyTorch centralized attention planner, YAML configuration,
-  candidate generation, constrained decoding, and REINFORCE training tools.
-- `tests/` — fast synthetic regression tests for the generalized simulator.
-- `outputs/` — ignored run artifacts moved intact from `Multi_Agent/`.
-- `Graph_Generation/` — environment construction. `target_graph.py` has
-  `stochastic_accumulated_blockage_path` (the diverse-path sampler used
-  everywhere) and `create_fully_connected_target_graph`. Also `visibility.py`,
-  `height_graph_generation.py`, `edge_block_generation.py`.
-- `Real_Life_Maps/` — real DEM (`WV_DEM.tif`) + OSM roads (`WV_roads.pkl`)
-  benchmark. `real_map_generation.py` builds `RealTerrainGrid`.
-- `Automatic_Generated_Maps/` — synthetic-map benchmark suite.
-- `main.py` is a stub, not a real entry point. Root `*.ipynb` are exploratory.
+## Non-negotiable simulation contracts
 
-## Core abstractions (durable across branches)
+### Partial observability uses two graphs
 
-- **Two-graph partial observability.** The simulation holds two graphs:
-  `env_graph`/`env_map` = the planner's (optimistic) view, and
-  `blocked_env_graph` = ground truth (with obstacles applied). Agents reveal
-  truth only by observing from their position; the planner replans when reality
-  contradicts its plan. Never let the planner read ground truth directly.
-- **Node visibility attributes.** Nodes carry `visible_edges` (and on some
-  branches `visible_nodes`) listing what's observable from that node. Edges
-  carry `distance`, `observed_edge`, `num_used`.
-- **Reward.** Roughly `reward_ratio * (visibility of newly-observed edges) −
-  distance`, optionally discounted per step. On `fixed_key` this is split into
-  an edge-visibility term and a target-observation term.
-- **Assignment.** `sequential_greedy_assignment` picks one (agent, target) pair
-  at a time, commits the best, and replays its path on the shared state so its
-  observations propagate to the remaining candidates (respects submodularity).
+`env_map` is the planner's optimistic, partially observed graph;
+`ground_truth` contains true target types and traversable edges. Types start as
+`UNKNOWN_TYPE` (`-1`) in `env_map`. Only sensing and contact may copy facts from
+`ground_truth` into `env_map`. Never pass ground truth to a policy, candidate
+generator, or observation builder.
 
-## IMPORTANT gotcha: follow the *scored* path, not a fresh shortest path
+Active graph conventions:
 
-When routing an agent to its assigned target, send it down the
-**reward-maximizing path that the assignment scored**, NOT a recomputed
-`nx.shortest_path`. The scorer evaluates diverse candidate paths and the best
-one is generally NOT the shortest; recomputing a shortest path here silently
-discards the planning. The assignment functions return `(target, path)` tuples
-for this reason, and `_replan` / `replan` must consume `path` directly. (This
-was a real bug that was fixed on `main` and `fixed_key`; `moving_targets`
-already has the fix.) If you touch the replan/assignment code, preserve this.
+- node `type` includes `source`, `intermediate`, `target_unreached`, and
+  `target_reached`;
+- target types use the legacy `rps_type` attribute;
+- nodes expose `visible_edges`; a scout sees their true endpoints plus itself;
+- directed edges carry `distance` and commonly `observed_edge`; grid instances
+  usually contain both orientations, and uphill/downhill costs may differ.
 
-## Running it
+### Time, policies, and routes
 
-Dependencies (scipy, networkx, rasterio, osmnx, matplotlib) live in the project
-venv — **system `python` lacks them.** Use `uv run python ...` (pyproject is
-present on `main`/`fixed_key`); the `.venv` is untracked so it persists across
-branch switches, so `.venv/bin/python` also works.
+`run_simulation` is event-driven. Edge `distance` is traversal time. Agents
+observe and interact on node arrival, and an agent already traversing an edge
+must reach its committed next node. Normal policies receive living agents at
+nodes. A learned-style policy may set `replan_in_transit = True` and implement
+`set_runtime_state(...)`; a moving agent's replacement route must begin at its
+committed arrival node.
 
-Generalized simulation on the real DEM map:
-```
-uv run python -m simulation.real_map_benchmark --help
-uv run python -m simulation.real_map_benchmark --policy baseline1
-uv run python -m simulation.real_map_benchmark --policy baseline2 --render
+A policy has the shape `policy(env_map, agents, reward_ratio=...,
+obs_discount_factor=..., sample_recursion=..., sample_num_obstacle=...,
+sample_obstacle_hop=..., verbose=...)` and mutates each supplied agent's
+`planned_path`. Paths include their start node. Preserve the route selected or
+scored by a planner: do not replace it later with a fresh `nx.shortest_path`.
+This matters especially for diverse-path routines in `finite_horizon.py`.
+
+Use `simulation.domain` helpers rather than reimplementing encounters.
+Capability sets may be empty, pure-scout, pure-service, or hybrid. When adding
+randomness, seed Python `random`, NumPy, and PyTorch as applicable, and prefer a
+passed RNG where the API supports one.
+
+## Learning invariants
+
+- Observations contain only belief-state information; the builder intentionally
+  accepts no truth graph.
+- Agent, target, and candidate counts vary. Masks/padding must remain correct
+  and permutation equivariant.
+- Constrained decoding enforces feasibility and candidate capacity.
+- Incomplete episodes need an explicit penalty so stopping early cannot beat
+  completion.
+- Keep CPU and tensor/CUDA transition semantics aligned. The CUDA path batches
+  world state, routing, rollout, and gradient replay, not just inference.
+- `simulation_batch_size` controls simultaneous tensor episodes;
+  `reinforce_batch_size` controls optimizer accumulation. Legacy configs with
+  `batch_size` map it to both fields.
+- Evaluation accepts a checkpoint run directory or weights path and normally
+  uses the configuration saved beside the weights.
+
+## Environment and commands
+
+Use `uv`; system Python is not expected to have the dependencies. The lockfile
+includes PyTorch 2.12 and CUDA 13 cuGraph. CUDA training needs a compatible
+NVIDIA/RAPIDS environment, while the CPU simulator and synthetic checks do not
+need to run the CUDA backend.
+
+```bash
+uv sync
+
+# Fast regression suites
 uv run python -m tests.test_simulation
+uv run python -m tests.test_learning
+
+# Real-map benchmark (equivalent root entry: uv run python main.py)
+uv run python -m simulation.real_map_benchmark --help
+uv run python -m simulation.real_map_benchmark --policy baseline1 --seed 0
+uv run python -m simulation.real_map_benchmark --policy baseline2 --render
+
+# Learned policy
+uv run python -m learning.train --config learning/config.yaml --episodes 100 --device cpu
+uv run python -m learning.test learning/checkpoints/<run-directory> --device cuda
+uv run python -m learning.test learning/checkpoints/<run-directory> --device cuda --render
 ```
-Outputs land in `outputs/my_policy_simulation/`. MP4 export needs `ffmpeg`.
 
-## Conventions / things that bite
+The default learning config currently uses 3 target types, 5-9 targets, 4
+agents, CUDA, and Weights & Biases logging. For local smoke runs, override
+`--episodes` and `--device`; disable `training.wandb` in a temporary config when
+external logging is not intended. MP4 creation requires `ffmpeg`.
 
-- **Seeds:** set `random.seed(...)` and `np.random.seed(...)` once in `main()`;
-  the diverse-path sampler and any lock/target randomization derive from there.
-- **Verify before deleting/overwriting** generated frames/CSVs in `outputs/` —
-  they are run artifacts.
-- Some older benchmark scripts (`benchmark.py`, `Real_Life_Maps/*benchmark*.py`,
-  `Automatic_Generated_Maps/run_benchmark.py`) call `RepeatedTopK` with an
-  out-of-date signature and may be stale on some branches — check before relying
-  on them.
+## Working conventions
+
+- Use module entry points (`python -m ...`) so imports resolve consistently.
+- Run both test modules after shared simulation/domain changes; run at least
+  `tests.test_learning` after model, decoder, observation, config, routing,
+  return, or checkpoint changes.
+- Preserve outputs/checkpoints; do not commit caches, frames, videos, or
+  weights.
+- Check signatures before reviving old benchmarks/notebooks; retained scripts
+  may predate the generalized capability API.
+- Keep rendering optional and outside the core simulation import path.
+- Test directed/asymmetric costs and unreachable routes when graph semantics
+  change; do not assume an undirected connected grid.
