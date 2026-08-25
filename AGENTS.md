@@ -47,12 +47,14 @@ The package is `heterogeneous-capability-planning`, requires Python 3.12 or
     comparison planners; these are not benchmark defaults.
   - `legacy/`: retained comparison code, not an active entry point.
 - `learning/`
-  - `config.yaml`: task-graph actor-critic defaults. The original Transformer
-    defaults are preserved in `config_transformer.yaml`.
+  - `config.yaml`: task-graph defaults with the optional critic currently
+    disabled. The original Transformer defaults are preserved in
+    `config_transformer.yaml`.
     `policy/configuration.py` loads and validates both; CLI flags override
     common training fields.
   - `modules/` and `policy/model.py`: selectable Transformer or typed
-    heterogeneous graph actor, graph critic, and constrained joint decoder.
+    heterogeneous graph actor, optional graph critic, and constrained joint
+    decoder.
   - `policy/candidates.py`: deterministic target, staging, and wait candidates.
   - `gpu_sim/observation_cpu.py`: canonical planner-visible feature builder and
     CPU batching despite the historical module path.

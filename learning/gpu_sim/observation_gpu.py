@@ -270,7 +270,18 @@ class TensorObservationBuilder:
             torch.isfinite(base_distance) & (base_distance < 1e30)
             & physical[None, :, None]
         )
-        attach_task_graph_fields(observation, reachable_at, ct_reachable)
+        task_at_distance = torch.where(
+            reachable_at, at_distance + remaining[..., None],
+            torch.zeros_like(at_distance))[..., None]
+        task_ac_distance = torch.where(
+            reachable, ac_distance + remaining[..., None],
+            torch.zeros_like(ac_distance))[..., None]
+        task_ct_distance = torch.where(
+            ct_reachable, base_distance,
+            torch.zeros_like(base_distance))[..., None]
+        attach_task_graph_fields(
+            observation, reachable_at, ct_reachable,
+            task_at_distance, task_ac_distance, task_ct_distance)
         return (observation, route_distances, predecessors,
                 target_route_distances, target_entries,
                 candidate_entry_nodes)

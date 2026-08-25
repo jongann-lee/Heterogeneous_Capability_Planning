@@ -22,6 +22,7 @@ class ModelConfig:
     message_passing_blocks: int = 3
     distance_embedding_dim: int = 32
     critic_hidden_dim: int = 128
+    use_critic: bool = True
 
     def __post_init__(self):
         if self.num_target_types < 1:
@@ -45,6 +46,8 @@ class ModelConfig:
             raise ValueError("distance_embedding_dim must be positive")
         if self.critic_hidden_dim < 1:
             raise ValueError("critic_hidden_dim must be positive")
+        if not isinstance(self.use_critic, bool):
+            raise ValueError("use_critic must be a boolean")
 
 
 @dataclass(frozen=True)

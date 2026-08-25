@@ -65,7 +65,7 @@ def _model():
     return model
 
 
-def _graph_model(num_target_types=2):
+def _graph_model(num_target_types=2, use_critic=True):
     torch.manual_seed(11)
     config = replace(
         load_config().model,
@@ -76,6 +76,7 @@ def _graph_model(num_target_types=2):
         message_passing_blocks=2,
         distance_embedding_dim=8,
         critic_hidden_dim=16,
+        use_critic=use_critic,
     )
     model = HeterogeneousGraphPolicy(config)
     model.eval()
@@ -225,8 +226,11 @@ def test_graph_and_transformer_configs_select_separate_policies():
     transformer_path = Path(__file__).parents[1] / "learning" / "config_transformer.yaml"
     transformer_config = load_config(transformer_path)
     assert graph_config.model.architecture == "task_graph"
+    assert not graph_config.model.use_critic
     assert transformer_config.model.architecture == "transformer"
-    assert isinstance(build_policy(graph_config.model), HeterogeneousGraphPolicy)
+    graph_policy = build_policy(graph_config.model)
+    assert isinstance(graph_policy, HeterogeneousGraphPolicy)
+    assert not graph_policy.has_critic
     assert isinstance(build_policy(transformer_config.model),
                       VanillaTransformerPolicy)
 
@@ -261,9 +265,13 @@ def test_task_graph_schema_uses_beliefs_semantics_and_effective_distances():
     target_index = 0
     distance_scale = sum(float(data["distance"])
                          for _u, _v, data in graph.edges(data=True))
-    expected = (0.75 + 3.0) / distance_scale
+    expected = 0.75 + 3.0
     assert abs(float(observation.agent_action_distances[
         0, 0, target_action, 0]) - expected) < 1e-6
+    # The preserved Transformer relation still uses its original normalized
+    # route feature; only task-graph edge inputs were rolled back to raw time.
+    assert abs(float(observation.agent_action_relations[
+        0, 0, target_action, 0]) - 3.0 / distance_scale) < 1e-6
     assert observation.serves_mask[0, target_action, target_index]
     assert observation.reveals_mask[0, observation_action, target_index]
     assert not observation.action_target_distance_mask[
@@ -376,6 +384,37 @@ def test_task_graph_tensor_replay_trains_actor_and_critic():
     assert torch.isfinite(values).all()
     assert any(parameter.grad is not None
                for parameter in model.critic.parameters())
+
+
+def test_task_graph_without_critic_replays_actor_only():
+    graph, agents = _instance()
+    observation = build_observation(graph, agents, 2)
+    unlimited = torch.iinfo(torch.long).max
+    observation.action_capacities = torch.tensor([[
+        unlimited if item.capacity is None else item.capacity
+        for item in observation.candidates[0]
+    ]], dtype=torch.long)
+    model = _graph_model(use_critic=False)
+    model.train()
+    logits, value = model.actor_critic(observation)
+    assert value is None
+    with torch.no_grad():
+        decoded = model.decoder(
+            logits, observation.feasible_action_mask,
+            observation.action_capacities, training=False)
+    rollout = SimpleNamespace(decision_traces=[DecisionTrace(
+        observation, decoded.selected_pair_indices)])
+    outputs = replay_tensor_gradients(
+        model, rollout, torch.tensor([1.0]),
+        entropy_coefficient=0.01, update_size=1, device="cpu",
+        critic_coefficient=0.5)
+    _losses, _counts, critic_losses, _entropies, values = outputs
+    assert torch.equal(critic_losses, torch.zeros_like(critic_losses))
+    assert torch.equal(values, torch.zeros_like(values))
+    assert all(parameter.grad is None
+               for parameter in model.critic.parameters())
+    assert any(parameter.grad is not None
+               for parameter in model.actor.parameters())
 
 
 def test_cached_candidate_generation_matches_uncached_generation():

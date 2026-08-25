@@ -56,14 +56,18 @@ def feature_dimensions(num_target_types: int) -> tuple[int, int, int, int, int, 
 def attach_task_graph_fields(observation: PlannerObservation,
                              agent_target_reachable: torch.Tensor,
                              action_target_reachable: torch.Tensor,
+                             agent_target_distances: torch.Tensor | None = None,
+                             agent_action_distances: torch.Tensor | None = None,
                              action_target_distances: torch.Tensor | None = None,
                              ) -> PlannerObservation:
     """Attach the geometry-free heterogeneous task-graph view in-place.
 
     The legacy observation remains intact for the Transformer control policy.
-    Graph distances reuse its normalization, with remaining committed-edge time
-    added to agent-origin relations. Explicit masks distinguish an unreachable
-    pair from a genuine zero-distance pair.
+    Task-graph callers provide raw traversal times, including remaining
+    committed-edge time for agent-origin relations. The fallbacks preserve
+    compatibility for callers that only construct the legacy normalized view.
+    Explicit masks distinguish an unreachable pair from a genuine
+    zero-distance pair.
     """
     agent = observation.agent_features
     target = observation.target_features
@@ -87,9 +91,11 @@ def attach_task_graph_fields(observation: PlannerObservation,
 
     remaining = agent[..., 8:9].unsqueeze(2)
     observation.agent_target_distances = (
-        observation.agent_target_relations[..., 0:1] + remaining)
+        observation.agent_target_relations[..., 0:1] + remaining
+        if agent_target_distances is None else agent_target_distances)
     observation.agent_action_distances = (
-        observation.agent_action_relations[..., 0:1] + remaining)
+        observation.agent_action_relations[..., 0:1] + remaining
+        if agent_action_distances is None else agent_action_distances)
     observation.action_target_distances = (
         observation.action_target_relations[..., 3:4]
         if action_target_distances is None else action_target_distances)
@@ -196,8 +202,13 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
     feasible = torch.zeros((len(agents), len(candidates)), dtype=torch.bool)
     at_reachable = torch.zeros((len(agents), len(targets)), dtype=torch.bool)
     ct_reachable = torch.zeros((len(candidates), len(targets)), dtype=torch.bool)
+    task_at_distance = torch.zeros(
+        (len(agents), len(targets), 1), dtype=torch.float32)
+    task_ac_distance = torch.zeros(
+        (len(agents), len(candidates), 1), dtype=torch.float32)
     task_ct_distance = torch.zeros(
         (len(candidates), len(targets), 1), dtype=torch.float32)
+    raw_remaining = torch.zeros(len(agents), dtype=torch.float32)
 
     for i, (agent, travel) in enumerate(zip(agents, transit)):
         x, y = pos.get(agent.position, (0.0, 0.0))
@@ -205,6 +216,7 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
             agent.planned_path[-1] if agent.planned_path else agent.position)
         dx, dy = pos.get(destination, (0.0, 0.0))
         remaining = max(0.0, float(travel[3]) - clock) if travel else 0.0
+        raw_remaining[i] = remaining
         base = [x, y, float(agent.alive), float(agent.scout_capable),
                 float(travel is None), float(travel is not None), dx, dy,
                 remaining / distance_scale]
@@ -263,6 +275,8 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
             path = _safe_path(graph, planning_position, target, live)
             dist = _path_distance(graph, path)
             at_reachable[i, j] = path is not None
+            if path is not None:
+                task_at_distance[i, j, 0] = raw_remaining[i] + dist
             kind = int(graph.nodes[target].get("rps_type", UNKNOWN_TYPE))
             known = kind != UNKNOWN_TYPE
             at_rel[i, j] = torch.tensor([
@@ -293,6 +307,8 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
             if travel is not None and not replan_transit:
                 valid = False
             feasible[i, c] = valid
+            if reachable:
+                task_ac_distance[i, c, 0] = raw_remaining[i] + dist
             ac_rel[i, c] = torch.tensor([
                 0.0 if dist == float("inf") else dist / distance_scale,
                 0.0 if dist == float("inf") else dist / distance_scale,
@@ -330,7 +346,7 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
             ct_reachable[c, j] = bool(
                 region and task_dist != float("inf"))
             if task_dist != float("inf"):
-                task_ct_distance[c, j, 0] = task_dist / distance_scale
+                task_ct_distance[c, j, 0] = task_dist
 
     observation = PlannerObservation(
         agent_x.unsqueeze(0), target_x.unsqueeze(0), action_x.unsqueeze(0),
@@ -342,6 +358,7 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
     )
     return attach_task_graph_fields(
         observation, at_reachable.unsqueeze(0), ct_reachable.unsqueeze(0),
+        task_at_distance.unsqueeze(0), task_ac_distance.unsqueeze(0),
         task_ct_distance.unsqueeze(0))
 
 

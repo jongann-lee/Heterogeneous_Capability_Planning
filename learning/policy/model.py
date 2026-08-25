@@ -84,12 +84,12 @@ class VanillaTransformerPolicy(nn.Module):
 
 
 class HeterogeneousGraphPolicy(nn.Module):
-    """Typed edge-conditioned task-graph actor with a shared graph critic."""
+    """Typed edge-conditioned task-graph actor with an optional graph critic."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.has_critic = True
+        self.has_critic = config.use_critic
         d = config.model_dim
         k = config.num_target_types
         edge_dim = config.distance_embedding_dim
@@ -161,15 +161,17 @@ class HeterogeneousGraphPolicy(nn.Module):
         logits = logits.masked_fill(
             ~observation.feasible_action_mask, -torch.inf)
 
-        def masked_sum(values, mask):
-            return (values * mask[..., None]).sum(dim=1)
+        values = None
+        if self.has_critic:
+            def masked_sum(items, mask):
+                return (items * mask[..., None]).sum(dim=1)
 
-        graph_state = torch.cat((
-            masked_sum(agents, observation.agent_mask),
-            masked_sum(targets, observation.target_mask),
-            masked_sum(actions, observation.action_mask),
-        ), dim=-1)
-        values = self.critic(graph_state).squeeze(-1)
+            graph_state = torch.cat((
+                masked_sum(agents, observation.agent_mask),
+                masked_sum(targets, observation.target_mask),
+                masked_sum(actions, observation.action_mask),
+            ), dim=-1)
+            values = self.critic(graph_state).squeeze(-1)
         return logits, values
 
     def forward(self, observation):

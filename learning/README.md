@@ -5,8 +5,9 @@ deterministic candidates, planner-visible routes, and constrained
 autoregressive joint assignment:
 
 - `task_graph` (the default in `learning/config.yaml`) is a typed,
-  edge-conditioned heterogeneous GNN over agent, target, and action nodes. It
-  uses a shared sum-pooled graph critic and actor-critic training.
+  edge-conditioned heterogeneous GNN over agent, target, and action nodes.
+  Its graph critic is implemented but currently disabled in the default
+  configuration, so training uses the scalar EMA REINFORCE baseline.
 - `transformer` is the original set-attention control architecture. Its
   preserved configuration is `learning/config_transformer.yaml`; it retains
   the scalar EMA REINFORCE baseline for checkpoint compatibility.
@@ -22,7 +23,7 @@ ground-truth graph is accepted by the observation builder or policy.
 
 `learning/policy/configuration.py` loads and validates experiment settings. The
 task-graph policy consumes only capabilities, completion/type beliefs, action
-categories, normalized safe-route distances, and typed action-target semantic
+categories, raw safe-route distances, and typed action-target semantic
 relations. It receives no absolute coordinates, heights, or ground truth.
 
 Training returns are normalized against `learning.policy.oracle.parallel_tsp`, a
@@ -65,8 +66,9 @@ targets, stalled rate, and all-agents-dead rate.
 For research runs, import `learning.train.train` and supply an
 `instance_factory(episode)` returning fresh `(env_map, ground_truth, agents)`
 objects. The Transformer uses complete episodic REINFORCE with an EMA baseline;
-the task graph uses its shared state-conditioned critic. Neither path depends
-on Gym or another RL framework.
+the default task graph now uses the same baseline approach. Set
+`model.use_critic: true` to restore its shared state-conditioned critic.
+Neither path depends on Gym or another RL framework.
 
 Fast checks:
 
