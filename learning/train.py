@@ -301,7 +301,6 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                     model, state, builder, reinforce_config.death_penalty,
                     reinforce_config.incomplete_penalty, training=True,
                     oracle_makespans=oracle_makespan)
-                world.clear_route_batch_cache()
                 update_return_sum += float(rollout.returns.detach().sum())
                 update_rollouts.append(rollout)
                 accumulated += current_batch

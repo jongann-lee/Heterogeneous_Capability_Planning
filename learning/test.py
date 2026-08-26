@@ -108,7 +108,6 @@ def _gpu_episode(model, config, env, truth, agents, device, terrain=None,
         training=False,
         state_callback=None if trace is None else _capture_state(trace),
         oracle_makespans=oracle_makespan)
-    world.clear_route_batch_cache()
     record = {
         "return": float(rollout.returns[0]),
         "makespan": float(rollout.makespans[0]),

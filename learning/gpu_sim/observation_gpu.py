@@ -31,7 +31,7 @@ class TensorObservationBuilder:
                 observed_links, staging_links)
 
     def _route_banks(self, state, episode_mask=None):
-        """One masked SSSP per source plus exact final-edge target recovery."""
+        """One exact batched GPU route bank plus final-edge target recovery."""
         batch, agents = state.positions.shape
         targets = state.target_live.shape[1]
         distances = torch.full(
@@ -41,20 +41,32 @@ class TensorObservationBuilder:
         if episode_mask is None:
             episode_mask = torch.ones(batch, dtype=torch.bool,
                                       device=state.positions.device)
-        for b in range(batch):
-            if not bool(episode_mask[b].item()):
-                continue
-            blocked_nodes = self.world.target_nodes[
-                state.target_live[b]].tolist()
+        active_episodes = torch.where(episode_mask)[0]
+        if active_episodes.numel():
             # A moving agent cannot change its current edge, but a shared
             # replan chooses its route beginning at that edge's arrival node.
-            sources = torch.where(
-                state.moving[b], state.transit_to[b], state.positions[b])
-            standard = self.world.router.sssp(
-                sources, blocked_nodes, self.world.required_route_nodes,
-                batch_cache=self.world.route_batch_cache)
-            distances[b] = standard.distances
-            predecessors[b] = standard.predecessors
+            all_sources = torch.where(
+                state.moving, state.transit_to, state.positions)
+            sources = all_sources[active_episodes]
+            query_live = state.target_live[active_episodes, None].expand(
+                -1, agents, -1)
+            query_rows = torch.cat((
+                query_live.reshape(-1, targets).long(),
+                sources.flatten()[:, None],
+            ), dim=1)
+            unique_rows, inverse = torch.unique(
+                query_rows, dim=0, sorted=False, return_inverse=True)
+            unique_live = unique_rows[:, :targets].bool()
+            unique_sources = unique_rows[:, targets]
+            blocked = torch.zeros(
+                (len(unique_rows), len(self.world.nodes)), dtype=torch.bool,
+                device=state.positions.device)
+            blocked[:, self.world.target_nodes] = unique_live
+            standard = self.world.router.sssp_batch(unique_sources, blocked)
+            distances[active_episodes] = standard.distances[inverse].reshape(
+                -1, agents, len(self.world.nodes))
+            predecessors[active_episodes] = standard.predecessors[
+                inverse].reshape(-1, agents, len(self.world.nodes))
         incoming = self.world.target_incoming_nodes.clamp_min(0)
         alternatives = (distances[..., incoming]
                         + self.world.target_incoming_costs[None, None])
@@ -92,29 +104,46 @@ class TensorObservationBuilder:
         if episode_mask is None:
             episode_mask = torch.ones(
                 batch, dtype=torch.bool, device=device)
-        if not world.candidate_region_mask.any():
+        active_episodes = torch.where(episode_mask)[0]
+        if not active_episodes.numel() or not world.candidate_region_mask.any():
             return output
 
-        for episode in range(batch):
-            if not bool(episode_mask[episode].item()):
-                continue
-            blocked = world.target_nodes[state.target_live[episode]].tolist()
-            for action in range(actions):
-                region = world.candidate_region_nodes[action][
-                    world.candidate_region_mask[action]]
-                if region.numel() == 0:
-                    continue
-                # A live target used as the action origin has been serviced by
-                # the time this relation applies, so it is no longer a blocker.
-                region_set = set(region.tolist())
-                effective_blocked = [node for node in blocked
-                                     if node not in region_set]
-                # SSSP from every target on the reversed graph yields directed
-                # original-graph distances from this action region to targets.
-                routes = world.reverse_router.sssp(
-                    world.target_nodes, effective_blocked, region,
-                    batch_cache=world.reverse_route_batch_cache).distances
-                output[episode, action] = routes[:, region].amin(dim=1)
+        # A live target used as the action origin has been serviced by the time
+        # this relation applies, so remove it from that action's blocker mask.
+        action_live = (
+            state.target_live[active_episodes, None]
+            & ~world.target_candidate_mask[None]
+        )
+        # The reverse SSSP source itself is also always traversable.
+        query_live = action_live[:, :, None] & ~torch.eye(
+            targets, dtype=torch.bool, device=device)[None, None]
+        query_sources = world.target_nodes[None, None].expand(
+            len(active_episodes), actions, targets)
+        query_rows = torch.cat((
+            query_live.reshape(-1, targets).long(),
+            query_sources.flatten()[:, None],
+        ), dim=1)
+        unique_rows, inverse = torch.unique(
+            query_rows, dim=0, sorted=False, return_inverse=True)
+        unique_live = unique_rows[:, :targets].bool()
+        unique_sources = unique_rows[:, targets]
+        blocked = torch.zeros(
+            (len(unique_rows), len(world.nodes)), dtype=torch.bool,
+            device=device)
+        blocked[:, world.target_nodes] = unique_live
+        routes = world.reverse_router.sssp_batch(
+            unique_sources, blocked).distances
+
+        inverse = inverse.reshape(len(active_episodes), actions, targets)
+        region_nodes = world.candidate_region_nodes.clamp_min(0)
+        region_slots = region_nodes.shape[1]
+        route_rows = inverse[..., None].expand(
+            -1, -1, -1, region_slots)
+        route_nodes = region_nodes[None, :, None].expand(
+            len(active_episodes), -1, targets, -1)
+        region_distances = routes[route_rows, route_nodes].masked_fill(
+            ~world.candidate_region_mask[None, :, None], torch.inf)
+        output[active_episodes] = region_distances.amin(dim=3)
         return output
 
     def build(self, state, planning_episode_mask=None):

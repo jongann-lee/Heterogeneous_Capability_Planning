@@ -1,7 +1,18 @@
+import hashlib
+import math
+from pathlib import Path as FilePath
+import pickle
+import tempfile
+
 import networkx as nx
 import numpy as np
-import math
 from matplotlib.path import Path
+
+
+VISIBILITY_CACHE_SCHEMA = 1
+DEFAULT_VISIBILITY_CACHE_DIR = (
+    FilePath(__file__).resolve().parents[1] / "cache" / "visibility"
+)
 
 class RealTerrainGrid:
     def __init__(self, elevation_array, source, targets, k_up=1.0, k_down=2.0, road_nodes=None, road_edges=None):
@@ -98,16 +109,114 @@ class RealTerrainGrid:
             self.G.edges[u, v]['is_road'] = (u, v) in self.road_edges or (v, u) in self.road_edges
 
 
-    def compute_all_visibilities(self, max_radius=30, angular_res=180):
-            """
-            Iterates through all nodes and calculates visibility using 
-            the manifold radial sweep method.
-            """
-            all_vis = {}
-            for node in self.G.nodes():
-                all_vis[node] = self._get_polytope_visibility(node, max_radius, angular_res)
-            
-            nx.set_node_attributes(self.G, all_vis, name="visible_edges")
+    def _visibility_cache_path(self, max_radius, angular_res, cache_dir):
+        """Return a content-addressed cache path for this loaded terrain."""
+        heights = np.ascontiguousarray(self.heights)
+        digest = hashlib.sha256()
+        digest.update(f"visibility-v{VISIBILITY_CACHE_SCHEMA}\0".encode())
+        digest.update(str(heights.shape).encode())
+        digest.update(heights.dtype.str.encode())
+        digest.update(heights.tobytes())
+        digest.update(f"\0{int(max_radius)}\0{int(angular_res)}".encode())
+        return FilePath(cache_dir) / f"{digest.hexdigest()}.pkl"
+
+    def _load_visibility_cache(self, path):
+        try:
+            with path.open("rb") as stream:
+                payload = pickle.load(stream)
+            nodes = tuple(self.G.nodes())
+            if (payload.get("schema") != VISIBILITY_CACHE_SCHEMA or
+                    tuple(payload.get("nodes", ())) != nodes):
+                return False
+            visible_edges = payload.get("visible_edges")
+            if (not isinstance(visible_edges, list) or
+                    len(visible_edges) != len(nodes)):
+                return False
+            nx.set_node_attributes(
+                self.G, dict(zip(nodes, visible_edges)), name="visible_edges")
+            return True
+        except (OSError, EOFError, pickle.PickleError, AttributeError,
+                TypeError, ValueError):
+            return False
+
+    def _write_visibility_cache(self, path):
+        nodes = tuple(self.G.nodes())
+        payload = {
+            "schema": VISIBILITY_CACHE_SCHEMA,
+            "nodes": nodes,
+            "visible_edges": [
+                self.G.nodes[node]["visible_edges"] for node in nodes
+            ],
+        }
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    mode="wb", dir=path.parent,
+                    prefix=f".{path.name}.", delete=False) as stream:
+                temporary = FilePath(stream.name)
+                pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            temporary.replace(path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def _calculate_all_visibilities(self, max_radius, angular_res):
+        all_vis = {
+            node: self._get_polytope_visibility(
+                node, max_radius, angular_res)
+            for node in self.G.nodes()
+        }
+        nx.set_node_attributes(self.G, all_vis, name="visible_edges")
+
+    def compute_all_visibilities(
+            self, max_radius=30, angular_res=180,
+            cache_dir=DEFAULT_VISIBILITY_CACHE_DIR):
+        """Load DEM visibility from disk or calculate and persist it once.
+
+        Visibility depends only on the normalized terrain heights and sweep
+        parameters, not on episode sources, targets, or agent state. The
+        content-addressed cache therefore remains valid for every scenario on
+        the same loaded DEM. An advisory lock prevents concurrent training
+        jobs from calculating the same missing entry independently.
+
+        Returns ``True`` on a cache hit and ``False`` after calculation.
+        """
+        cache_path = self._visibility_cache_path(
+            max_radius, angular_res, cache_dir)
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            self._calculate_all_visibilities(max_radius, angular_res)
+            return False
+
+        lock_path = cache_path.with_suffix(f"{cache_path.suffix}.lock")
+        calculated = False
+        try:
+            import fcntl
+
+            with lock_path.open("a+b") as lock_stream:
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+                if self._load_visibility_cache(cache_path):
+                    return True
+                self._calculate_all_visibilities(max_radius, angular_res)
+                calculated = True
+                try:
+                    self._write_visibility_cache(cache_path)
+                except OSError:
+                    pass
+                return False
+        except (ImportError, OSError):
+            # Cache failures must not prevent simulation. Atomic replacement
+            # still protects readers on platforms without advisory locking.
+            if self._load_visibility_cache(cache_path):
+                return True
+            if not calculated:
+                self._calculate_all_visibilities(max_radius, angular_res)
+            try:
+                self._write_visibility_cache(cache_path)
+            except OSError:
+                pass
+            return False
 
     def _get_polytope_visibility(self, obs_node, max_radius, angular_res):
             r0, c0 = obs_node

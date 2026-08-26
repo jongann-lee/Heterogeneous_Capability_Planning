@@ -8,14 +8,16 @@ import tempfile
 from types import SimpleNamespace
 
 import networkx as nx
+import numpy as np
 import torch
 import yaml
 
+from Real_Life_Maps.real_map_generation import RealTerrainGrid
 from learning.policy.candidates import (Candidate, CandidateTerrainCache,
                                         generate_candidates)
 from learning.policy.configuration import LearningConfig, load_config
 from learning.gpu_sim.routing import GridRouter
-from learning.gpu_sim.cugraph_router import CuGraphRouter, RoutingBatchCache
+from learning.gpu_sim.cugraph_router import CuGraphRouter
 from learning.gpu_sim.state import TensorEpisodeState
 from learning.policy.model import (
     HeterogeneousGraphPolicy,
@@ -69,6 +71,35 @@ def _model():
     return model
 
 
+def test_real_terrain_visibility_cache_is_persistent_and_dem_keyed():
+    first_heights = np.zeros((3, 3), dtype=np.float32)
+    changed_heights = first_heights.copy()
+    changed_heights[1, 1] = 1.0
+    with tempfile.TemporaryDirectory() as directory:
+        first = RealTerrainGrid(first_heights, source=(0, 0), targets=[])
+        assert not first.compute_all_visibilities(
+            max_radius=2, angular_res=8, cache_dir=directory)
+        expected = {
+            node: first.G.nodes[node]["visible_edges"]
+            for node in first.G
+        }
+
+        second = RealTerrainGrid(first_heights, source=(0, 0), targets=[])
+        second._get_polytope_visibility = lambda *_args: (_ for _ in ()).throw(
+            AssertionError("visibility was recalculated instead of loaded"))
+        assert second.compute_all_visibilities(
+            max_radius=2, angular_res=8, cache_dir=directory)
+        assert {
+            node: second.G.nodes[node]["visible_edges"]
+            for node in second.G
+        } == expected
+
+        changed = RealTerrainGrid(changed_heights, source=(0, 0), targets=[])
+        assert not changed.compute_all_visibilities(
+            max_radius=2, angular_res=8, cache_dir=directory)
+        assert len(list(Path(directory).glob("*.pkl"))) == 2
+
+
 def _graph_model(num_target_types=2, use_critic=True):
     torch.manual_seed(11)
     config = replace(
@@ -104,7 +135,7 @@ def test_tensor_router_matches_masked_networkx_shortest_paths():
     assert paths[0, :lengths[0]].tolist() == [0, 1, 2, 3, 4, 5]
 
 
-def test_cugraph_router_caches_only_safe_base_routes():
+def test_cugraph_router_caches_only_unmodified_base_rows():
     router = object.__new__(CuGraphRouter)
     router.num_nodes = 4
     router.target_nodes = ()
@@ -128,39 +159,39 @@ def test_cugraph_router_caches_only_safe_base_routes():
     router._run_sssp = fake_run
     router.graph = lambda blocked_nodes=(): tuple(blocked_nodes)
 
-    safe = router.sssp([0], blocked_nodes=[2], required_nodes=[1])
-    assert torch.equal(safe.distances[0], base[0])
+    unmodified = router.sssp([0])
+    assert torch.equal(unmodified.distances[0], base[0])
+    assert calls == [(0, ())]
+    router.sssp([0])
     assert calls == [(0, ())]
 
-    rerouted = router.sssp([0], blocked_nodes=[2], required_nodes=[3])
+    rerouted = router.sssp([0], blocked_nodes=[2])
     assert torch.equal(rerouted.distances[0], blocked[0])
     assert calls == [(0, ()), (0, (2,))]
     assert list(router._base_sssp_cache) == [0]
 
-    # Blocked results are deliberately recomputed rather than retained.
-    router.sssp([0], blocked_nodes=[2], required_nodes=[3])
+    # Blocked results and their graph variants do not survive this call.
+    router.sssp([0], blocked_nodes=[2])
     assert calls == [(0, ()), (0, (2,)), (0, (2,))]
 
-    # A caller-owned batch cache reuses exact blocked rows only for that batch.
-    batch_cache = RoutingBatchCache(max_cached_graphs=2, max_cached_routes=2)
-    router.sssp(
-        [0], blocked_nodes=[2], required_nodes=[3],
-        batch_cache=batch_cache)
-    assert calls == [(0, ()), (0, (2,)), (0, (2,)), (0, (2,))]
-    router.sssp(
-        [0], blocked_nodes=[2], required_nodes=[3],
-        batch_cache=batch_cache)
-    assert calls == [(0, ()), (0, (2,)), (0, (2,)), (0, (2,))]
-    assert list(batch_cache.routes) == [((2,), 0)]
 
-    batch_cache.clear()
-    assert not batch_cache.graphs
-    assert not batch_cache.routes
-    router.sssp(
-        [0], blocked_nodes=[2], required_nodes=[3],
-        batch_cache=batch_cache)
-    assert calls == [
-        (0, ()), (0, (2,)), (0, (2,)), (0, (2,)), (0, (2,))]
+def test_cugraph_batched_sssp_is_exact_for_independent_blockers_when_cuda():
+    if not torch.cuda.is_available():
+        return
+    router = CuGraphRouter(
+        5,
+        [0, 1, 2, 0, 4, 2, 3],
+        [1, 2, 3, 4, 3, 1, 4],
+        [1.0, 1.0, 1.0, 10.0, 1.0, 4.0, 2.0],
+    )
+    sources = torch.tensor([0, 0, 2], device="cuda")
+    blocked = torch.zeros((3, 5), dtype=torch.bool, device="cuda")
+    blocked[1, 2] = True
+    blocked[2, 2] = True  # A query source is always made traversable.
+    result = router.sssp_batch(sources, blocked)
+    assert torch.allclose(result.distances[:, 3], torch.tensor(
+        [3.0, 11.0, 1.0], device="cuda"))
+    assert result.predecessors[:, 3].tolist() == [2, 4, 2]
 
 
 def test_legacy_batch_size_config_is_split():

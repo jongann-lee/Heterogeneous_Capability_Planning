@@ -62,6 +62,8 @@ The package is `heterogeneous-capability-planning`, requires Python 3.12 or
     and CPU rollout/training path.
   - `gpu_sim/world.py`, `state.py`, `observation_gpu.py`, `rollout_gpu.py`, and
     `cugraph_router.py`: batched CUDA simulation and cuGraph routing path.
+    Independent exact route queries are deduplicated on-device and combined
+    as disjoint graph copies for one GPU SSSP operation.
   - `policy/oracle.py`: full-information min-max open-TSP normalization oracle.
   - `train.py`: CPU/CUDA REINFORCE training. Timestamped checkpoints contain
     the resolved config, rolling latest/best-return weights, progress metadata,
@@ -135,11 +137,14 @@ passed RNG where the API supports one.
   completion.
 - Keep CPU and tensor/CUDA transition semantics aligned. The CUDA path batches
   world state, routing, rollout, and gradient replay, not just inference.
-- CUDA routing may persistently cache only the original terrain graphs and
-  bounded SSSP rows computed on them. Active-target graph variants and exact
-  rerouted SSSP rows may use the bounded rollout-batch cache, which must be
-  cleared before the next batch so random scenarios cannot accumulate live
-  RAPIDS allocations.
+- CUDA task-graph routing batches independent exact queries as disjoint,
+  vertex-offset terrain copies connected to one super-source. Blocked copies
+  and their SSSP results are temporary and must not persist after the route
+  bank is consumed. The older single-source helper may persistently cache only
+  the original terrain graph and bounded SSSP rows computed on it.
+- Real-terrain visibility is content-addressed by normalized DEM heights and
+  sweep parameters under ignored `cache/visibility/`. Do not bypass or delete
+  that persistent preprocessing cache during normal runs.
 - `simulation_batch_size` controls simultaneous tensor episodes;
   `reinforce_batch_size` controls optimizer accumulation. Legacy configs with
   `batch_size` map it to both fields.

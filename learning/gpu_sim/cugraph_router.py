@@ -1,7 +1,7 @@
 """cuGraph-backed routing for the fixed WV graph."""
 
-from dataclasses import dataclass, field
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import torch
 
@@ -12,56 +12,11 @@ class SSSPResult:
     predecessors: torch.Tensor    # [sources, nodes]
 
 
-@dataclass
-class RoutingBatchCache:
-    """Bounded blocked-graph and exact reroute cache for one rollout batch."""
-
-    max_cached_graphs: int = 64
-    max_cached_routes: int = 512
-    graphs: OrderedDict = field(default_factory=OrderedDict, init=False)
-    routes: OrderedDict = field(default_factory=OrderedDict, init=False)
-
-    @staticmethod
-    def _get(items, key):
-        value = items.get(key)
-        if value is not None:
-            items.move_to_end(key)
-        return value
-
-    @staticmethod
-    def _put(items, key, value, limit):
-        items[key] = value
-        items.move_to_end(key)
-        while len(items) > limit:
-            items.popitem(last=False)
-
-    def get_graph(self, blocked):
-        return self._get(self.graphs, tuple(blocked))
-
-    def put_graph(self, blocked, graph):
-        self._put(
-            self.graphs, tuple(blocked), graph, self.max_cached_graphs)
-
-    def get_route(self, blocked, source):
-        return self._get(self.routes, (tuple(blocked), int(source)))
-
-    def put_route(self, blocked, source, result):
-        self._put(
-            self.routes, (tuple(blocked), int(source)), result,
-            self.max_cached_routes)
-
-    def clear(self):
-        """Release every batch-owned RAPIDS graph and rerouted tensor row."""
-        self.routes.clear()
-        self.graphs.clear()
-
-
 class CuGraphRouter:
-    """Run weighted SSSP with persistent terrain and caller-owned caches.
+    """Run weighted SSSP with a persistent immutable terrain graph.
 
-    The original graph and a bounded set of its SSSP rows persist. Graphs with
-    active target nodes removed, and routes calculated on those graphs, are
-    retained only when a caller supplies a bounded rollout-batch cache.
+    The original graph and a bounded set of its SSSP rows may persist. Graphs
+    with active targets removed and results calculated on them are temporary.
     """
 
     def __init__(self, num_nodes, edge_sources, edge_destinations, edge_costs,
@@ -143,71 +98,138 @@ class CuGraphRouter:
             self._base_sssp_cache.move_to_end(source)
         return cached
 
-    def _base_routes_are_safe(self, predecessor, source, blocked,
-                              required_nodes):
-        """Whether base-tree paths to every required node avoid blockers."""
-        if not blocked:
-            return True
-        device = predecessor.device
-        required = torch.as_tensor(required_nodes, dtype=torch.long,
-                                   device=device).flatten()
-        blocked_tensor = torch.as_tensor(blocked, dtype=torch.long,
-                                         device=device)
-        required = required[~torch.isin(required, blocked_tensor)]
-        cursor = required.clone()
-        active = (cursor >= 0) & (cursor != int(source))
-        for _ in range(self.num_nodes):
-            if torch.isin(cursor[active], blocked_tensor).any():
-                return False
-            if not active.any():
-                return True
-            previous = predecessor[cursor.clamp_min(0)]
-            active &= (previous >= 0) & (previous != int(source))
-            cursor = torch.where(active, previous, cursor)
-        return False
-
-    def sssp(self, sources, blocked_nodes=(), required_nodes=None,
-             batch_cache: RoutingBatchCache | None = None) -> SSSPResult:
-        """Return exact SSSP rows, reusing safe target-independent rows.
-
-        When every required destination's base-tree path avoids the sparse
-        blocked-node set, the unblocked row is exact and no blocked cuGraph
-        variant is constructed. Otherwise this falls back to exact SSSP.
-        """
+    def sssp(self, sources, blocked_nodes=()) -> SSSPResult:
+        """Return exact rows, caching only rows on the unmodified graph."""
         blocked = self._blocked_nodes(blocked_nodes)
         distance_rows, predecessor_rows = [], []
         temporary_graphs = {}
         for source in torch.as_tensor(sources).flatten().tolist():
             effective_blocked = tuple(node for node in blocked
                                       if node != int(source))
-            cached = (None if batch_cache is None else
-                      batch_cache.get_route(effective_blocked, source))
-            if cached is None:
-                base = self._base_sssp(source)
-                result = base
-                if effective_blocked and (
-                        required_nodes is None or not self._base_routes_are_safe(
-                            base[1], source, effective_blocked, required_nodes)):
-                    graph = (temporary_graphs.get(effective_blocked)
-                             if batch_cache is None else
-                             batch_cache.get_graph(effective_blocked))
-                    if graph is None:
-                        graph = self.graph(effective_blocked)
-                        if batch_cache is None:
-                            temporary_graphs[effective_blocked] = graph
-                        else:
-                            batch_cache.put_graph(effective_blocked, graph)
-                    result = self._run_sssp(
-                        source, effective_blocked, graph=graph)
-                    if batch_cache is not None:
-                        batch_cache.put_route(
-                            effective_blocked, source, result)
+            if effective_blocked:
+                graph = temporary_graphs.get(effective_blocked)
+                if graph is None:
+                    graph = self.graph(effective_blocked)
+                    temporary_graphs[effective_blocked] = graph
+                result = self._run_sssp(
+                    source, effective_blocked, graph=graph)
             else:
-                result = cached
+                result = self._base_sssp(source)
             distance_rows.append(result[0])
             predecessor_rows.append(result[1])
         return SSSPResult(torch.stack(distance_rows),
                           torch.stack(predecessor_rows))
+
+    def sssp_batch(self, sources, blocked_node_mask) -> SSSPResult:
+        """Run independent exact SSSP queries in one GPU graph traversal.
+
+        cuGraph exposes weighted SSSP for one source. To keep a whole rollout
+        routing bank in one GPU operation, this method constructs disjoint,
+        vertex-offset copies of the sparse terrain graph and connects a single
+        super-source to each query source. Each copy receives its own blocked
+        node mask. The copies cannot reach one another, so the one SSSP result
+        reshapes exactly into independent distance and predecessor rows.
+
+        This path intentionally performs no route or graph-variant caching.
+        """
+        import cudf
+        import cugraph
+        import cupy as cp
+
+        source_tensor = torch.as_tensor(
+            sources, dtype=torch.long, device="cuda").flatten()
+        query_count = int(source_tensor.numel())
+        if query_count == 0:
+            empty_distances = torch.empty(
+                (0, self.num_nodes), dtype=torch.float32,
+                device=source_tensor.device)
+            empty_predecessors = torch.empty(
+                (0, self.num_nodes), dtype=torch.long,
+                device=source_tensor.device)
+            return SSSPResult(empty_distances, empty_predecessors)
+        if query_count * self.num_nodes >= torch.iinfo(torch.int32).max:
+            raise ValueError("batched SSSP vertex IDs exceed int32 capacity")
+
+        blocked_tensor = torch.as_tensor(
+            blocked_node_mask, dtype=torch.bool,
+            device=source_tensor.device)
+        if blocked_tensor.shape != (query_count, self.num_nodes):
+            raise ValueError(
+                "blocked_node_mask must have shape [queries, nodes]")
+
+        source_array = cp.from_dlpack(source_tensor).astype(
+            cp.int32, copy=False)
+        blocked = cp.from_dlpack(blocked_tensor).copy()
+        query_rows = cp.arange(query_count, dtype=cp.int32)
+        blocked[query_rows, source_array] = False
+        offsets = query_rows * self.num_nodes
+
+        edge_sources = self._series_to_cupy(self._edges.src, cp.int32)
+        edge_destinations = self._series_to_cupy(self._edges.dst, cp.int32)
+        edge_costs = self._series_to_cupy(self._edges.weight, cp.float32)
+        allowed = (~blocked[:, edge_sources] &
+                   ~blocked[:, edge_destinations])
+        copied_sources = (
+            edge_sources[None] + offsets[:, None]).ravel()[allowed.ravel()]
+        copied_destinations = (
+            edge_destinations[None] + offsets[:, None]).ravel()[allowed.ravel()]
+        copied_costs = cp.broadcast_to(
+            edge_costs, allowed.shape).ravel()[allowed.ravel()]
+
+        super_source = query_count * self.num_nodes
+        copied_sources = cp.concatenate((
+            copied_sources,
+            cp.full(query_count, super_source, dtype=cp.int32),
+        ))
+        copied_destinations = cp.concatenate((
+            copied_destinations, source_array + offsets,
+        ))
+        copied_costs = cp.concatenate((
+            copied_costs,
+            cp.zeros(query_count, dtype=cp.float32),
+        ))
+        edges = cudf.DataFrame({
+            "src": copied_sources,
+            "dst": copied_destinations,
+            "weight": copied_costs,
+        })
+        graph = cugraph.Graph(directed=True)
+        graph.from_cudf_edgelist(
+            edges, source="src", destination="dst", edge_attr="weight",
+            renumber=False)
+        frame = cugraph.sssp(graph, source=int(super_source))
+
+        vertices = self._series_to_cupy(frame.vertex, cp.int32)
+        frame_distances = self._series_to_cupy(
+            frame.distance, cp.float32)
+        frame_predecessors = self._series_to_cupy(
+            frame.predecessor, cp.int32)
+        dense_size = query_count * self.num_nodes
+        distances = cp.full(dense_size, cp.inf, dtype=cp.float32)
+        predecessors = cp.full(dense_size, -1, dtype=cp.int32)
+        ordinary = vertices < dense_size
+        ordinary_vertices = vertices[ordinary]
+        ordinary_distances = frame_distances[ordinary]
+        distances[ordinary_vertices] = cp.where(
+            ordinary_distances < 1.0e30, ordinary_distances, cp.inf)
+        predecessor_values = frame_predecessors[ordinary]
+        valid_predecessor = ((predecessor_values >= 0) &
+                             (predecessor_values != super_source))
+        predecessors[ordinary_vertices] = cp.where(
+            valid_predecessor,
+            predecessor_values % self.num_nodes,
+            -1)
+        distances = distances.reshape(query_count, self.num_nodes)
+        predecessors = predecessors.reshape(query_count, self.num_nodes)
+        return SSSPResult(
+            torch.utils.dlpack.from_dlpack(distances),
+            torch.utils.dlpack.from_dlpack(predecessors).to(torch.long))
+
+    @staticmethod
+    def _series_to_cupy(series, dtype):
+        """Return a zero-copy cuDF view, casting only when necessary."""
+        value = series.to_cupy()
+        return value.astype(dtype, copy=False)
 
     def reconstruct_path(self, result, source_row, source, goal):
         """Reconstruct one route for diagnostics/CPU equivalence tests."""
