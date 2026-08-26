@@ -16,6 +16,8 @@ wheels/
 
 # Cache
 cache/
+.uv-cache/
+.cluster-cache/
 
 # Mac OS
 *.DS_Store
@@ -25,5 +27,8 @@ outputs/
 
 # Learned checkpoints
 learning/checkpoints/
+wandb/
+logs/
 
-
+# Cluster stuff
+cluster/

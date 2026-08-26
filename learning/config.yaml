@@ -30,7 +30,7 @@ reinforce:
   critic_coefficient: 0.5
 
 training:
-  episodes: 25600
+  episodes: 12800
   simulation_batch_size: 8
   reinforce_batch_size: 32
   num_agents: 4

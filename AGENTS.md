@@ -135,9 +135,11 @@ passed RNG where the API supports one.
   completion.
 - Keep CPU and tensor/CUDA transition semantics aligned. The CUDA path batches
   world state, routing, rollout, and gradient replay, not just inference.
-- CUDA routing may cache only the original terrain graphs and bounded SSSP rows
-  computed on them. Active-target graph variants and rerouted SSSP results must
-  remain temporary so random scenarios cannot accumulate RAPIDS allocations.
+- CUDA routing may persistently cache only the original terrain graphs and
+  bounded SSSP rows computed on them. Active-target graph variants and exact
+  rerouted SSSP rows may use the bounded rollout-batch cache, which must be
+  cleared before the next batch so random scenarios cannot accumulate live
+  RAPIDS allocations.
 - `simulation_batch_size` controls simultaneous tensor episodes;
   `reinforce_batch_size` controls optimizer accumulation. Legacy configs with
   `batch_size` map it to both fields.

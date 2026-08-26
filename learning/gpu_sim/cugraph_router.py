@@ -1,6 +1,6 @@
 """cuGraph-backed routing for the fixed WV graph."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import OrderedDict
 
 import torch
@@ -12,12 +12,56 @@ class SSSPResult:
     predecessors: torch.Tensor    # [sources, nodes]
 
 
+@dataclass
+class RoutingBatchCache:
+    """Bounded blocked-graph and exact reroute cache for one rollout batch."""
+
+    max_cached_graphs: int = 64
+    max_cached_routes: int = 512
+    graphs: OrderedDict = field(default_factory=OrderedDict, init=False)
+    routes: OrderedDict = field(default_factory=OrderedDict, init=False)
+
+    @staticmethod
+    def _get(items, key):
+        value = items.get(key)
+        if value is not None:
+            items.move_to_end(key)
+        return value
+
+    @staticmethod
+    def _put(items, key, value, limit):
+        items[key] = value
+        items.move_to_end(key)
+        while len(items) > limit:
+            items.popitem(last=False)
+
+    def get_graph(self, blocked):
+        return self._get(self.graphs, tuple(blocked))
+
+    def put_graph(self, blocked, graph):
+        self._put(
+            self.graphs, tuple(blocked), graph, self.max_cached_graphs)
+
+    def get_route(self, blocked, source):
+        return self._get(self.routes, (tuple(blocked), int(source)))
+
+    def put_route(self, blocked, source, result):
+        self._put(
+            self.routes, (tuple(blocked), int(source)), result,
+            self.max_cached_routes)
+
+    def clear(self):
+        """Release every batch-owned RAPIDS graph and rerouted tensor row."""
+        self.routes.clear()
+        self.graphs.clear()
+
+
 class CuGraphRouter:
-    """Run weighted SSSP while caching only untouched-terrain results.
+    """Run weighted SSSP with persistent terrain and caller-owned caches.
 
     The original graph and a bounded set of its SSSP rows persist. Graphs with
-    active target nodes removed, and routes calculated on those graphs, live
-    only for the duration of one ``sssp`` call.
+    active target nodes removed, and routes calculated on those graphs, are
+    retained only when a caller supplies a bounded rollout-batch cache.
     """
 
     def __init__(self, num_nodes, edge_sources, edge_destinations, edge_costs,
@@ -122,7 +166,8 @@ class CuGraphRouter:
             cursor = torch.where(active, previous, cursor)
         return False
 
-    def sssp(self, sources, blocked_nodes=(), required_nodes=None) -> SSSPResult:
+    def sssp(self, sources, blocked_nodes=(), required_nodes=None,
+             batch_cache: RoutingBatchCache | None = None) -> SSSPResult:
         """Return exact SSSP rows, reusing safe target-independent rows.
 
         When every required destination's base-tree path avoids the sparse
@@ -135,17 +180,30 @@ class CuGraphRouter:
         for source in torch.as_tensor(sources).flatten().tolist():
             effective_blocked = tuple(node for node in blocked
                                       if node != int(source))
-            base = self._base_sssp(source)
-            result = base
-            if effective_blocked and (
-                    required_nodes is None or not self._base_routes_are_safe(
-                        base[1], source, effective_blocked, required_nodes)):
-                graph = temporary_graphs.get(effective_blocked)
-                if graph is None:
-                    graph = self.graph(effective_blocked)
-                    temporary_graphs[effective_blocked] = graph
-                result = self._run_sssp(
-                    source, effective_blocked, graph=graph)
+            cached = (None if batch_cache is None else
+                      batch_cache.get_route(effective_blocked, source))
+            if cached is None:
+                base = self._base_sssp(source)
+                result = base
+                if effective_blocked and (
+                        required_nodes is None or not self._base_routes_are_safe(
+                            base[1], source, effective_blocked, required_nodes)):
+                    graph = (temporary_graphs.get(effective_blocked)
+                             if batch_cache is None else
+                             batch_cache.get_graph(effective_blocked))
+                    if graph is None:
+                        graph = self.graph(effective_blocked)
+                        if batch_cache is None:
+                            temporary_graphs[effective_blocked] = graph
+                        else:
+                            batch_cache.put_graph(effective_blocked, graph)
+                    result = self._run_sssp(
+                        source, effective_blocked, graph=graph)
+                    if batch_cache is not None:
+                        batch_cache.put_route(
+                            effective_blocked, source, result)
+            else:
+                result = cached
             distance_rows.append(result[0])
             predecessor_rows.append(result[1])
         return SSSPResult(torch.stack(distance_rows),

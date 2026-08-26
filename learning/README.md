@@ -23,8 +23,10 @@ ground-truth graph is accepted by the observation builder or policy.
 
 The CUDA router persistently caches only the original forward/reverse terrain
 graphs and bounded SSSP rows from those unmodified graphs. A cached row is
-reused when its required paths avoid all active targets; blocked graph variants
-and their recomputed routes are temporary and are never retained.
+reused when its required paths avoid all active targets. Blocked graph variants
+and exact rerouted rows use a separate bounded cache shared within one rollout
+batch; it is explicitly cleared before the next batch so randomized scenarios
+cannot accumulate live RAPIDS allocations.
 
 `learning/policy/configuration.py` loads and validates experiment settings. The
 task-graph policy consumes only capabilities, raw remaining transit time,

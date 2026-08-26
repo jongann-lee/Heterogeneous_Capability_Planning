@@ -15,7 +15,7 @@ from learning.policy.candidates import (Candidate, CandidateTerrainCache,
                                         generate_candidates)
 from learning.policy.configuration import LearningConfig, load_config
 from learning.gpu_sim.routing import GridRouter
-from learning.gpu_sim.cugraph_router import CuGraphRouter
+from learning.gpu_sim.cugraph_router import CuGraphRouter, RoutingBatchCache
 from learning.gpu_sim.state import TensorEpisodeState
 from learning.policy.model import (
     HeterogeneousGraphPolicy,
@@ -140,6 +140,27 @@ def test_cugraph_router_caches_only_safe_base_routes():
     # Blocked results are deliberately recomputed rather than retained.
     router.sssp([0], blocked_nodes=[2], required_nodes=[3])
     assert calls == [(0, ()), (0, (2,)), (0, (2,))]
+
+    # A caller-owned batch cache reuses exact blocked rows only for that batch.
+    batch_cache = RoutingBatchCache(max_cached_graphs=2, max_cached_routes=2)
+    router.sssp(
+        [0], blocked_nodes=[2], required_nodes=[3],
+        batch_cache=batch_cache)
+    assert calls == [(0, ()), (0, (2,)), (0, (2,)), (0, (2,))]
+    router.sssp(
+        [0], blocked_nodes=[2], required_nodes=[3],
+        batch_cache=batch_cache)
+    assert calls == [(0, ()), (0, (2,)), (0, (2,)), (0, (2,))]
+    assert list(batch_cache.routes) == [((2,), 0)]
+
+    batch_cache.clear()
+    assert not batch_cache.graphs
+    assert not batch_cache.routes
+    router.sssp(
+        [0], blocked_nodes=[2], required_nodes=[3],
+        batch_cache=batch_cache)
+    assert calls == [
+        (0, ()), (0, (2,)), (0, (2,)), (0, (2,)), (0, (2,))]
 
 
 def test_legacy_batch_size_config_is_split():

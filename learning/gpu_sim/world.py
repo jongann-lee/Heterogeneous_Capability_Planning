@@ -1,11 +1,11 @@
 """Immutable device terrain plus target-dependent episode overlays."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
 from learning.policy.candidates import CandidateTerrainCache, generate_candidates
-from learning.gpu_sim.cugraph_router import CuGraphRouter
+from learning.gpu_sim.cugraph_router import CuGraphRouter, RoutingBatchCache
 
 
 @dataclass
@@ -115,6 +115,10 @@ class TensorWorld:
     target_incoming_costs: torch.Tensor
     router: CuGraphRouter
     reverse_router: CuGraphRouter
+    route_batch_cache: RoutingBatchCache = field(
+        default_factory=RoutingBatchCache)
+    reverse_route_batch_cache: RoutingBatchCache = field(
+        default_factory=RoutingBatchCache)
 
     @classmethod
     def from_networkx(cls, graph, candidate_config, device="cuda",
@@ -211,3 +215,8 @@ class TensorWorld:
             target_nodes_tensor,
         )))
         return world
+
+    def clear_route_batch_cache(self):
+        """Destroy blocked routing artifacts after this rollout batch."""
+        self.route_batch_cache.clear()
+        self.reverse_route_batch_cache.clear()

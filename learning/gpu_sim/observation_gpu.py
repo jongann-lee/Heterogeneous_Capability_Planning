@@ -51,7 +51,8 @@ class TensorObservationBuilder:
             sources = torch.where(
                 state.moving[b], state.transit_to[b], state.positions[b])
             standard = self.world.router.sssp(
-                sources, blocked_nodes, self.world.required_route_nodes)
+                sources, blocked_nodes, self.world.required_route_nodes,
+                batch_cache=self.world.route_batch_cache)
             distances[b] = standard.distances
             predecessors[b] = standard.predecessors
         incoming = self.world.target_incoming_nodes.clamp_min(0)
@@ -111,7 +112,8 @@ class TensorObservationBuilder:
                 # SSSP from every target on the reversed graph yields directed
                 # original-graph distances from this action region to targets.
                 routes = world.reverse_router.sssp(
-                    world.target_nodes, effective_blocked, region).distances
+                    world.target_nodes, effective_blocked, region,
+                    batch_cache=world.reverse_route_batch_cache).distances
                 output[episode, action] = routes[:, region].amin(dim=1)
         return output
 
