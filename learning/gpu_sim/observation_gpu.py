@@ -281,7 +281,10 @@ class TensorObservationBuilder:
             torch.zeros_like(base_distance))[..., None]
         attach_task_graph_fields(
             observation, reachable_at, ct_reachable,
-            task_at_distance, task_ac_distance, task_ct_distance)
+            agent_target_distances=task_at_distance,
+            agent_action_distances=task_ac_distance,
+            action_target_distances=task_ct_distance,
+            agent_remaining_times=remaining)
         return (observation, route_distances, predecessors,
                 target_route_distances, target_entries,
                 candidate_entry_nodes)

@@ -13,16 +13,15 @@ class SSSPResult:
 
 
 class CuGraphRouter:
-    """Cache GPU graph variants and run weighted SSSP from many sources.
+    """Run weighted SSSP while caching only untouched-terrain results.
 
-    Graph variants are keyed by the actual blocked node IDs, not positions in
-    one episode's target list. This keeps the terrain cache valid when target
-    locations and counts change between episodes.
+    The original graph and a bounded set of its SSSP rows persist. Graphs with
+    active target nodes removed, and routes calculated on those graphs, live
+    only for the duration of one ``sssp`` call.
     """
 
     def __init__(self, num_nodes, edge_sources, edge_destinations, edge_costs,
-                 target_nodes=(), max_cached_routes=512,
-                 max_cached_graphs=64):
+                 target_nodes=(), max_cached_routes=512):
         import cudf
 
         self.num_nodes = int(num_nodes)
@@ -32,10 +31,9 @@ class CuGraphRouter:
             "dst": edge_destinations,
             "weight": edge_costs,
         })
-        self.max_cached_graphs = int(max_cached_graphs)
-        self._graphs = OrderedDict()
+        self._base_graph = None
         self.max_cached_routes = int(max_cached_routes)
-        self._sssp_cache = OrderedDict()
+        self._base_sssp_cache = OrderedDict()
 
     def _blocked_nodes(self, blocked):
         """Normalize either node IDs or the legacy fixed-target bit mask."""
@@ -44,15 +42,9 @@ class CuGraphRouter:
                          if blocked & (1 << index))
         return tuple(sorted({int(node) for node in blocked}))
 
-    def graph(self, blocked_nodes=()):
-        """Return a lazily-built graph for one sparse blocked-node set."""
+    def _build_graph(self, blocked):
         import cugraph
 
-        blocked = self._blocked_nodes(blocked_nodes)
-        graph = self._graphs.get(blocked)
-        if graph is not None:
-            self._graphs.move_to_end(blocked)
-            return graph
         keep = None
         for node in blocked:
             allowed = ((self._edges.src != node) &
@@ -63,10 +55,16 @@ class CuGraphRouter:
         graph.from_cudf_edgelist(
             edges, source="src", destination="dst", edge_attr="weight",
             renumber=False, vertices=list(range(self.num_nodes)))
-        self._graphs[blocked] = graph
-        while len(self._graphs) > self.max_cached_graphs:
-            self._graphs.popitem(last=False)
         return graph
+
+    def graph(self, blocked_nodes=()):
+        """Return the cached base graph or a temporary blocked graph."""
+        blocked = self._blocked_nodes(blocked_nodes)
+        if not blocked:
+            if self._base_graph is None:
+                self._base_graph = self._build_graph(())
+            return self._base_graph
+        return self._build_graph(blocked)
 
     @staticmethod
     def _series_to_torch(series, dtype=None):
@@ -75,10 +73,10 @@ class CuGraphRouter:
         value = torch.utils.dlpack.from_dlpack(series.to_cupy())
         return value.to(dtype=dtype) if dtype is not None else value
 
-    def _run_sssp(self, source, blocked):
+    def _run_sssp(self, source, blocked, graph=None):
         import cugraph
 
-        graph = self.graph(blocked)
+        graph = self.graph(blocked) if graph is None else graph
         frame = cugraph.sssp(graph, source=int(source)).sort_values("vertex")
         vertices = self._series_to_torch(frame.vertex, torch.long)
         if vertices.numel() != self.num_nodes or not torch.equal(
@@ -87,6 +85,19 @@ class CuGraphRouter:
             raise RuntimeError("cuGraph SSSP did not return every world node")
         return (self._series_to_torch(frame.distance, torch.float32),
                 self._series_to_torch(frame.predecessor, torch.long))
+
+    def _base_sssp(self, source):
+        """Return a cached SSSP row from the unmodified terrain graph."""
+        source = int(source)
+        cached = self._base_sssp_cache.get(source)
+        if cached is None:
+            cached = self._run_sssp(source, ())
+            self._base_sssp_cache[source] = cached
+            while len(self._base_sssp_cache) > self.max_cached_routes:
+                self._base_sssp_cache.popitem(last=False)
+        else:
+            self._base_sssp_cache.move_to_end(source)
+        return cached
 
     def _base_routes_are_safe(self, predecessor, source, blocked,
                               required_nodes):
@@ -120,31 +131,23 @@ class CuGraphRouter:
         """
         blocked = self._blocked_nodes(blocked_nodes)
         distance_rows, predecessor_rows = [], []
+        temporary_graphs = {}
         for source in torch.as_tensor(sources).flatten().tolist():
             effective_blocked = tuple(node for node in blocked
                                       if node != int(source))
-            key = (effective_blocked, int(source))
-            cached = self._sssp_cache.get(key)
-            if cached is None:
-                if effective_blocked and required_nodes is not None:
-                    base_key = ((), int(source))
-                    base = self._sssp_cache.get(base_key)
-                    if base is None:
-                        base = self._run_sssp(source, ())
-                        self._sssp_cache[base_key] = base
-                    if self._base_routes_are_safe(
-                            base[1], source, effective_blocked,
-                            required_nodes):
-                        cached = base
-                if cached is None:
-                    cached = self._run_sssp(source, effective_blocked)
-                self._sssp_cache[key] = cached
-                while len(self._sssp_cache) > self.max_cached_routes:
-                    self._sssp_cache.popitem(last=False)
-            else:
-                self._sssp_cache.move_to_end(key)
-            distance_rows.append(cached[0])
-            predecessor_rows.append(cached[1])
+            base = self._base_sssp(source)
+            result = base
+            if effective_blocked and (
+                    required_nodes is None or not self._base_routes_are_safe(
+                        base[1], source, effective_blocked, required_nodes)):
+                graph = temporary_graphs.get(effective_blocked)
+                if graph is None:
+                    graph = self.graph(effective_blocked)
+                    temporary_graphs[effective_blocked] = graph
+                result = self._run_sssp(
+                    source, effective_blocked, graph=graph)
+            distance_rows.append(result[0])
+            predecessor_rows.append(result[1])
         return SSSPResult(torch.stack(distance_rows),
                           torch.stack(predecessor_rows))
 

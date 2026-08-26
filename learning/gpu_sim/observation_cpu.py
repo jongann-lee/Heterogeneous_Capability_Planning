@@ -59,25 +59,28 @@ def attach_task_graph_fields(observation: PlannerObservation,
                              agent_target_distances: torch.Tensor | None = None,
                              agent_action_distances: torch.Tensor | None = None,
                              action_target_distances: torch.Tensor | None = None,
+                             agent_remaining_times: torch.Tensor | None = None,
                              ) -> PlannerObservation:
     """Attach the geometry-free heterogeneous task-graph view in-place.
 
     The legacy observation remains intact for the Transformer control policy.
-    Task-graph callers provide raw traversal times, including remaining
-    committed-edge time for agent-origin relations. The fallbacks preserve
-    compatibility for callers that only construct the legacy normalized view.
-    Explicit masks distinguish an unreachable pair from a genuine
-    zero-distance pair.
+    Task-graph callers provide raw traversal times for both the agent node
+    feature and distance relations. The fallbacks preserve compatibility for
+    callers that only construct the legacy normalized view. Explicit masks
+    distinguish an unreachable pair from a genuine zero-distance pair.
     """
     agent = observation.agent_features
     target = observation.target_features
     action = observation.action_features
     num_target_types = agent.shape[-1] - 9
 
-    # alive, normalized remaining transit time, scout capability, then every
-    # positive service capability.
+    remaining_feature = (
+        agent[..., 8:9] if agent_remaining_times is None else
+        agent_remaining_times[..., None])
+    # alive, raw remaining transit time, scout capability, then every positive
+    # service capability.
     observation.task_agent_features = torch.cat(
-        (agent[..., 2:3], agent[..., 8:9], agent[..., 3:4], agent[..., 9:]),
+        (agent[..., 2:3], remaining_feature, agent[..., 3:4], agent[..., 9:]),
         dim=-1)
 
     known = target[..., 4:5]
@@ -89,12 +92,12 @@ def attach_task_graph_fields(observation: PlannerObservation,
         (target[..., 3:4], belief), dim=-1)
     observation.task_action_features = action[..., 2:6]
 
-    remaining = agent[..., 8:9].unsqueeze(2)
+    legacy_remaining = agent[..., 8:9].unsqueeze(2)
     observation.agent_target_distances = (
-        observation.agent_target_relations[..., 0:1] + remaining
+        observation.agent_target_relations[..., 0:1] + legacy_remaining
         if agent_target_distances is None else agent_target_distances)
     observation.agent_action_distances = (
-        observation.agent_action_relations[..., 0:1] + remaining
+        observation.agent_action_relations[..., 0:1] + legacy_remaining
         if agent_action_distances is None else agent_action_distances)
     observation.action_target_distances = (
         observation.action_target_relations[..., 3:4]
@@ -358,8 +361,10 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
     )
     return attach_task_graph_fields(
         observation, at_reachable.unsqueeze(0), ct_reachable.unsqueeze(0),
-        task_at_distance.unsqueeze(0), task_ac_distance.unsqueeze(0),
-        task_ct_distance.unsqueeze(0))
+        agent_target_distances=task_at_distance.unsqueeze(0),
+        agent_action_distances=task_ac_distance.unsqueeze(0),
+        action_target_distances=task_ct_distance.unsqueeze(0),
+        agent_remaining_times=raw_remaining.unsqueeze(0))
 
 
 def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:

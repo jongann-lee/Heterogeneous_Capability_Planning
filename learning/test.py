@@ -30,13 +30,17 @@ DEFAULT_OUTPUT_MP4 = DEFAULT_RENDER_ROOT / "render_result.mp4"
 def _resolve_checkpoint(path):
     path = Path(path).expanduser().resolve()
     if path.is_dir():
-        weights = path / "trained_weights.pt"
+        weights = next((candidate for candidate in (
+            path / "trained_weights.pt",
+            path / "best_weights.pt",
+            path / "latest_weights.pt",
+        ) if candidate.is_file()), path / "trained_weights.pt")
         config = path / "config.yaml"
     else:
         weights = path
         config = path.with_name("config.yaml")
     if not weights.is_file():
-        raise FileNotFoundError(f"trained weights not found: {weights}")
+        raise FileNotFoundError(f"checkpoint weights not found: {weights}")
     return weights, config if config.is_file() else None
 
 

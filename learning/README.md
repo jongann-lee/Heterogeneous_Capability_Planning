@@ -21,10 +21,16 @@ agent traversing an edge must finish that edge, but its replacement route is
 chosen immediately from the committed arrival node and begins on arrival. No
 ground-truth graph is accepted by the observation builder or policy.
 
+The CUDA router persistently caches only the original forward/reverse terrain
+graphs and bounded SSSP rows from those unmodified graphs. A cached row is
+reused when its required paths avoid all active targets; blocked graph variants
+and their recomputed routes are temporary and are never retained.
+
 `learning/policy/configuration.py` loads and validates experiment settings. The
-task-graph policy consumes only capabilities, completion/type beliefs, action
-categories, raw safe-route distances, and typed action-target semantic
-relations. It receives no absolute coordinates, heights, or ground truth.
+task-graph policy consumes only capabilities, raw remaining transit time,
+completion/type beliefs, action categories, raw safe-route distances, and
+typed action-target semantic relations. It receives no absolute coordinates,
+heights, or ground truth.
 
 Training returns are normalized against `learning.policy.oracle.parallel_tsp`, a
 full-information min-max open-TSP oracle over the terrain's shortest-path
@@ -54,10 +60,16 @@ time unit, and encodes at 4 FPS. Use
 remain CPU-side, but simulation and policy inference stay on CUDA.
 
 Each training run creates a timestamped directory beneath
-`learning/checkpoints/` containing separate `trained_weights.pt` and
-`config.yaml` files. Pass `--checkpoint-dir` to use a different parent
-directory. With `training.wandb: true`, the same resolved configuration and
-one aggregate record per optimizer update are logged to the
+`learning/checkpoints/`. It writes `config.yaml` immediately, refreshes
+`latest_weights.pt` after every optimizer update, and updates
+`best_weights.pt` whenever mean episodic return improves. The associated
+progress is recorded in `checkpoint_state.yaml`; `trained_weights.pt` remains
+the final snapshot for compatibility. Pass `--checkpoint-dir` to use a
+different parent directory. Evaluation accepts any of these weight files
+directly; a run directory prefers the final snapshot when it exists and falls
+back to the rolling snapshots during an active run. With
+`training.wandb: true`, the same resolved
+configuration and one aggregate record per optimizer update are logged to the
 `heterogeneous-capability-planning` Weights & Biases project. Metrics include
 mean return, mean policy loss, mean makespan, and completion rate across the
 update's episode batch. Failure diagnostics include mean deaths, mean remaining

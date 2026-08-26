@@ -1,6 +1,7 @@
 """Fast checks for the centralized learned planner."""
 
 import copy
+from collections import OrderedDict
 from dataclasses import replace
 from pathlib import Path
 import tempfile
@@ -8,11 +9,13 @@ from types import SimpleNamespace
 
 import networkx as nx
 import torch
+import yaml
 
 from learning.policy.candidates import (Candidate, CandidateTerrainCache,
                                         generate_candidates)
-from learning.policy.configuration import load_config
+from learning.policy.configuration import LearningConfig, load_config
 from learning.gpu_sim.routing import GridRouter
+from learning.gpu_sim.cugraph_router import CuGraphRouter
 from learning.gpu_sim.state import TensorEpisodeState
 from learning.policy.model import (
     HeterogeneousGraphPolicy,
@@ -25,6 +28,7 @@ from learning.policy.oracle import parallel_tsp
 from learning.policy.adapter import LearnedPolicyAdapter
 from learning.gpu_sim.rollout_cpu import calculate_episode_return, collect_episode
 from learning.gpu_sim.rollout_gpu import DecisionTrace, replay_tensor_gradients
+from learning.train import train
 from simulation.agent import Agent
 from simulation.domain import UNKNOWN_TYPE, init_target_types
 from simulation.engine import run_simulation
@@ -98,6 +102,44 @@ def test_tensor_router_matches_masked_networkx_shortest_paths():
     paths, lengths = router.reconstruct_paths(
         result, torch.tensor([0, 0]), torch.tensor([5, 5]))
     assert paths[0, :lengths[0]].tolist() == [0, 1, 2, 3, 4, 5]
+
+
+def test_cugraph_router_caches_only_safe_base_routes():
+    router = object.__new__(CuGraphRouter)
+    router.num_nodes = 4
+    router.target_nodes = ()
+    router.max_cached_routes = 8
+    router._base_sssp_cache = OrderedDict()
+    calls = []
+    base = (
+        torch.tensor([0.0, 1.0, 2.0, 3.0]),
+        torch.tensor([-1, 0, 1, 2]),
+    )
+    blocked = (
+        torch.tensor([0.0, 1.0, torch.inf, torch.inf]),
+        torch.tensor([-1, 0, -1, -1]),
+    )
+
+    def fake_run(source, blocked_nodes, graph=None):
+        key = tuple(blocked_nodes)
+        calls.append((int(source), key))
+        return base if not key else blocked
+
+    router._run_sssp = fake_run
+    router.graph = lambda blocked_nodes=(): tuple(blocked_nodes)
+
+    safe = router.sssp([0], blocked_nodes=[2], required_nodes=[1])
+    assert torch.equal(safe.distances[0], base[0])
+    assert calls == [(0, ())]
+
+    rerouted = router.sssp([0], blocked_nodes=[2], required_nodes=[3])
+    assert torch.equal(rerouted.distances[0], blocked[0])
+    assert calls == [(0, ()), (0, (2,))]
+    assert list(router._base_sssp_cache) == [0]
+
+    # Blocked results are deliberately recomputed rather than retained.
+    router.sssp([0], blocked_nodes=[2], required_nodes=[3])
+    assert calls == [(0, ()), (0, (2,)), (0, (2,))]
 
 
 def test_legacy_batch_size_config_is_split():
@@ -221,6 +263,65 @@ def test_yaml_configuration_loads_and_validates():
     assert config.training.device in {"auto", "cpu", "cuda"}
 
 
+def test_training_writes_latest_best_and_final_weights():
+    config = load_config()
+    model_config = replace(
+        config.model,
+        num_target_types=1,
+        model_dim=16,
+        num_heads=4,
+        message_passing_blocks=1,
+        distance_embedding_dim=4,
+    )
+    candidate_config = replace(
+        config.candidates, staging_per_target=0, include_wait=False)
+
+    def instance_factory(_episode):
+        truth = _line(3)
+        truth.nodes[2].update(type="target_unreached", rps_type=1)
+        env = truth.copy()
+        env.nodes[2]["rps_type"] = UNKNOWN_TYPE
+        return env, truth, [Agent(0, capabilities={1})]
+
+    with tempfile.TemporaryDirectory() as directory:
+        training_config = replace(
+            config.training, episodes=2, device="cpu", wandb=False,
+            checkpoint=directory)
+        run_config = LearningConfig(
+            model_config, candidate_config, config.reinforce,
+            training_config,
+            replace(config.instances, min_targets=1, max_targets=1))
+        model, history = train(
+            instance_factory, 1, episodes=2,
+            model_config=model_config,
+            candidate_config=candidate_config,
+            reinforce_config=config.reinforce,
+            device="cpu", checkpoint=directory, run_config=run_config)
+        run_directory = train.last_run_directory
+        assert run_directory is not None
+        expected_files = {
+            "config.yaml", "checkpoint_state.yaml", "latest_weights.pt",
+            "best_weights.pt", "trained_weights.pt",
+        }
+        assert expected_files <= {
+            path.name for path in run_directory.iterdir()}
+        checkpoint_state = yaml.safe_load(
+            (run_directory / "checkpoint_state.yaml").read_text())
+        assert checkpoint_state["latest_episodes_seen"] == 2
+        assert checkpoint_state["best_episodes_seen"] in {1, 2}
+        assert checkpoint_state["best_mean_return"] == max(
+            record["return"] for record in history)
+        latest = torch.load(
+            run_directory / "latest_weights.pt", map_location="cpu",
+            weights_only=True)
+        assert all(torch.equal(value, latest[name])
+                   for name, value in model.state_dict().items())
+        from learning.policy.evaluation import load_policy
+        best_model, _policy = load_policy(
+            run_directory / "best_weights.pt", device="cpu")
+        assert isinstance(best_model, HeterogeneousGraphPolicy)
+
+
 def test_graph_and_transformer_configs_select_separate_policies():
     graph_config = load_config()
     transformer_path = Path(__file__).parents[1] / "learning" / "config_transformer.yaml"
@@ -265,6 +366,10 @@ def test_task_graph_schema_uses_beliefs_semantics_and_effective_distances():
     target_index = 0
     distance_scale = sum(float(data["distance"])
                          for _u, _v, data in graph.edges(data=True))
+    assert abs(float(observation.task_agent_features[0, 0, 1]) - 0.75) < 1e-6
+    # The Transformer keeps its original normalized remaining-time feature.
+    assert abs(float(observation.agent_features[0, 0, 8])
+               - 0.75 / distance_scale) < 1e-6
     expected = 0.75 + 3.0
     assert abs(float(observation.agent_action_distances[
         0, 0, target_action, 0]) - expected) < 1e-6

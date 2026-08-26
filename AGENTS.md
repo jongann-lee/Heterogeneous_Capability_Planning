@@ -64,7 +64,8 @@ The package is `heterogeneous-capability-planning`, requires Python 3.12 or
     `cugraph_router.py`: batched CUDA simulation and cuGraph routing path.
   - `policy/oracle.py`: full-information min-max open-TSP normalization oracle.
   - `train.py`: CPU/CUDA REINFORCE training. Timestamped checkpoints contain
-    `trained_weights.pt` and the resolved `config.yaml`.
+    the resolved config, rolling latest/best-return weights, progress metadata,
+    and final `trained_weights.pt`.
   - `test.py`: deterministic checkpoint evaluation and optional post-rollout
     rendering. `policy/evaluation.py` is a smaller legacy interface.
 - `Graph_Generation/`: visibility, blockage, target-graph, and stochastic
@@ -134,6 +135,9 @@ passed RNG where the API supports one.
   completion.
 - Keep CPU and tensor/CUDA transition semantics aligned. The CUDA path batches
   world state, routing, rollout, and gradient replay, not just inference.
+- CUDA routing may cache only the original terrain graphs and bounded SSSP rows
+  computed on them. Active-target graph variants and rerouted SSSP results must
+  remain temporary so random scenarios cannot accumulate RAPIDS allocations.
 - `simulation_batch_size` controls simultaneous tensor episodes;
   `reinforce_batch_size` controls optimizer accumulation. Legacy configs with
   `batch_size` map it to both fields.

@@ -15,11 +15,20 @@ from simulation.engine import run_simulation
 
 def load_policy(checkpoint, device="cpu"):
     checkpoint = Path(checkpoint)
-    weights_path = (checkpoint / "trained_weights.pt"
-                    if checkpoint.is_dir() else checkpoint)
+    if checkpoint.is_dir():
+        weights_path = next((candidate for candidate in (
+            checkpoint / "trained_weights.pt",
+            checkpoint / "best_weights.pt",
+            checkpoint / "latest_weights.pt",
+        ) if candidate.is_file()), checkpoint / "trained_weights.pt")
+    else:
+        weights_path = checkpoint
     payload = torch.load(weights_path, map_location=device, weights_only=True)
-    if weights_path.name == "trained_weights.pt":
-        saved_config = load_config(weights_path.with_name("config.yaml"))
+    config_path = weights_path.with_name("config.yaml")
+    if (weights_path.name in {
+            "trained_weights.pt", "best_weights.pt", "latest_weights.pt"}
+            and config_path.is_file()):
+        saved_config = load_config(config_path)
         config = saved_config.model
         candidate_config = saved_config.candidates
         state_dict = payload

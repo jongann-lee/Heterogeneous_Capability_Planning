@@ -3,6 +3,7 @@
 import argparse
 from dataclasses import asdict, replace
 from datetime import datetime
+import math
 from pathlib import Path
 
 import torch
@@ -28,8 +29,8 @@ from learning.gpu_sim.rollout_cpu import collect_episode
 # Fixed sanity-check setup. Set any value to None (or comment out its line) to
 # sample that component independently for every episode.
 SOURCE_POSITION = (0, 0)
-TARGET_POSITIONS = [(14,54), (1,29), (33,17), (34,35), (63,37), (37,5), (49,58)]
-TARGET_TYPES = [1, 2, 2, 1, 2, 3, 3]
+TARGET_POSITIONS = None # [(14,54), (1,29), (33,17), (34,35), (63,37), (37,5), (49,58)]
+TARGET_TYPES = None # [1, 2, 2, 1, 2, 3, 3]
 AGENT_CAPABILITIES = [{0}, {1}, {2}, {3}]
 
 
@@ -43,6 +44,51 @@ def _instance_config():
         "agent_capabilities": (None if capabilities is None else
                                [sorted(values) for values in capabilities]),
     }
+
+
+def _atomic_torch_save(payload, path: Path):
+    """Replace a checkpoint only after its complete payload reaches disk."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def _atomic_yaml_save(payload, path: Path):
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        yaml.safe_dump(payload, stream, sort_keys=False)
+    temporary.replace(path)
+
+
+def _save_run_config(run_directory: Path, run_config: LearningConfig,
+                     backend=None):
+    saved_config = asdict(run_config)
+    saved_config["instance"] = _instance_config()
+    if backend is not None:
+        saved_config["backend"] = backend
+    _atomic_yaml_save(saved_config, run_directory / "config.yaml")
+
+
+def _save_rolling_weights(model, run_directory: Path, episodes_seen: int,
+                          mean_return, best_mean_return,
+                          best_episodes_seen):
+    """Save latest weights and update the best-return snapshot if warranted."""
+    _atomic_torch_save(
+        model.state_dict(), run_directory / "latest_weights.pt")
+    score = None if mean_return is None else float(mean_return)
+    if score is not None and math.isfinite(score) and (
+            best_mean_return is None or score > best_mean_return):
+        best_mean_return = score
+        best_episodes_seen = int(episodes_seen)
+        _atomic_torch_save(
+            model.state_dict(), run_directory / "best_weights.pt")
+    metadata = {
+        "latest_episodes_seen": int(episodes_seen),
+        "best_mean_return": best_mean_return,
+        "best_episodes_seen": best_episodes_seen,
+    }
+    _atomic_yaml_save(metadata, run_directory / "checkpoint_state.yaml")
+    return best_mean_return, best_episodes_seen
 
 
 def train(instance_factory, num_target_types, episodes=100,
@@ -69,6 +115,8 @@ def train(instance_factory, num_target_types, episodes=100,
         run_config = LearningConfig(
             model_config, candidate_config, reinforce_config, training_config,
             defaults.instances)
+    if run_directory is not None:
+        _save_run_config(run_directory, run_config)
 
     wandb_run = None
     if run_config.training.wandb:
@@ -90,6 +138,12 @@ def train(instance_factory, num_target_types, episodes=100,
     optimizer = torch.optim.Adam(model.parameters(), lr=reinforce_config.learning_rate)
     baseline = EMABaseline(reinforce_config.baseline_decay)
     history = []
+    best_mean_return = None
+    best_episodes_seen = None
+    if run_directory is not None:
+        best_mean_return, best_episodes_seen = _save_rolling_weights(
+            model, run_directory, 0, None,
+            best_mean_return, best_episodes_seen)
     try:
         for episode in range(episodes):
             env, truth, agents = instance_factory(episode)
@@ -127,6 +181,11 @@ def train(instance_factory, num_target_types, episodes=100,
                                  + len(rollout.result["remaining_targets"])),
             }
             history.append(metrics)
+            if run_directory is not None:
+                best_mean_return, best_episodes_seen = _save_rolling_weights(
+                    model, run_directory, episode + 1,
+                    rollout.episode_return,
+                    best_mean_return, best_episodes_seen)
             if wandb_run is not None:
                 wandb_run.log(metrics, step=episode)
     finally:
@@ -134,11 +193,8 @@ def train(instance_factory, num_target_types, episodes=100,
             wandb_run.finish()
 
     if run_directory is not None:
-        torch.save(model.state_dict(), run_directory / "trained_weights.pt")
-        saved_config = asdict(run_config)
-        saved_config["instance"] = _instance_config()
-        with (run_directory / "config.yaml").open("w", encoding="utf-8") as stream:
-            yaml.safe_dump(saved_config, stream, sort_keys=False)
+        _atomic_torch_save(
+            model.state_dict(), run_directory / "trained_weights.pt")
     train.last_run_directory = run_directory
     return model, history
 
@@ -158,6 +214,7 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
     run_directory = Path(checkpoint) / timestamp if checkpoint else None
     if run_directory is not None:
         run_directory.mkdir(parents=True, exist_ok=False)
+        _save_run_config(run_directory, run_config, backend="cuda_tensor")
     wandb_run = None
     if run_config.training.wandb:
         import wandb
@@ -178,6 +235,12 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
     optimizer = torch.optim.Adam(model.parameters(),
                                  lr=reinforce_config.learning_rate)
     baseline = EMABaseline(reinforce_config.baseline_decay)
+    best_mean_return = None
+    best_episodes_seen = None
+    if run_directory is not None:
+        best_mean_return, best_episodes_seen = _save_rolling_weights(
+            model, run_directory, 0, None,
+            best_mean_return, best_episodes_seen)
     def encode_episode(episode_world, episode_truth, episode_agents):
         episode_source = episode_world.node_index[episode_agents[0].position]
         episode_caps = torch.zeros(
@@ -307,6 +370,12 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                 episode = completed_episodes + offset
                 metrics["episode"] = episode
                 history.append(metrics)
+            if run_directory is not None:
+                best_mean_return, best_episodes_seen = _save_rolling_weights(
+                    model, run_directory,
+                    completed_episodes + update_size,
+                    update_return_sum / update_size,
+                    best_mean_return, best_episodes_seen)
             if wandb_run is not None:
                 update_index = completed_episodes // reinforce_batch_size
                 completed_regrets = [
@@ -377,12 +446,8 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
         if wandb_run is not None:
             wandb_run.finish()
     if run_directory is not None:
-        torch.save(model.state_dict(), run_directory / "trained_weights.pt")
-        saved_config = asdict(run_config)
-        saved_config["instance"] = _instance_config()
-        saved_config["backend"] = "cuda_tensor"
-        with (run_directory / "config.yaml").open("w", encoding="utf-8") as stream:
-            yaml.safe_dump(saved_config, stream, sort_keys=False)
+        _atomic_torch_save(
+            model.state_dict(), run_directory / "trained_weights.pt")
     return model, history, world, run_directory
 
 
