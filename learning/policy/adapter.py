@@ -3,7 +3,7 @@
 import networkx as nx
 import torch
 
-from learning.policy.candidates import generate_candidates
+from learning.policy.candidates import CandidateScenarioCache, generate_candidates
 from learning.policy.configuration import CandidateConfig, load_config
 from learning.gpu_sim.observation_cpu import build_observation, candidate_path
 
@@ -26,6 +26,8 @@ class LearnedPolicyAdapter:
         self._all_agents = None
         self._transit = None
         self._clock = 0.0
+        self._candidate_graph = None
+        self._candidate_scenario_cache = None
 
     def set_runtime_state(self, agents, transit, clock):
         """Receive the full team state from the simulation engine."""
@@ -47,7 +49,15 @@ class LearnedPolicyAdapter:
     def __call__(self, env_map, at_node_agents, **_kwargs):
         all_agents = self._all_agents or list(at_node_agents)
         transit = self._transit or [None] * len(all_agents)
-        candidates = generate_candidates(env_map, self.candidate_config)
+        if env_map is not self._candidate_graph:
+            self._candidate_graph = env_map
+            self._candidate_scenario_cache = CandidateScenarioCache(
+                env_map,
+                include_pair_staging=(
+                    self.candidate_config.include_pair_staging))
+        candidates = generate_candidates(
+            env_map, self.candidate_config,
+            scenario_cache=self._candidate_scenario_cache)
         observation = build_observation(
             env_map, all_agents, self.num_target_types,
             candidates=candidates, transit=transit, clock=self._clock,
@@ -80,6 +90,11 @@ class LearnedPolicyAdapter:
             agent.planned_path = [source]
         for agent_index, action_index in decoded.assignments[0]:
             agent = all_agents[agent_index]
+            if observation.candidate_physical_group is not None:
+                group = int(observation.candidate_physical_group[
+                    0, action_index].item())
+                action_index = int(
+                    observation.physical_group_representative[0, group].item())
             candidate = candidates[action_index]
             if id(agent) not in active_ids:
                 continue

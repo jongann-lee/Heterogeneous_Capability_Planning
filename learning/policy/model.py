@@ -74,7 +74,15 @@ class VanillaTransformerPolicy(nn.Module):
                     capacities[b, c] = (unlimited if item.capacity is None
                                         else item.capacity)
         return self.decoder(logits, observation.feasible_action_mask,
-                            capacities, self.training if training is None else training)
+                            capacities,
+                            self.training if training is None else training,
+                            candidate_physical_group=(
+                                observation.candidate_physical_group),
+                            physical_group_capacity=(
+                                observation.physical_group_capacity),
+                            physical_group_representative=(
+                                observation.physical_group_representative),
+                            physical_group_mask=observation.physical_group_mask)
 
     def actor_critic(self, observation):
         return self(observation), None
@@ -197,7 +205,13 @@ class HeterogeneousGraphPolicy(nn.Module):
         capacities = self._capacities(observation, candidates, logits)
         decoded = self.decoder(
             logits, observation.feasible_action_mask, capacities,
-            self.training if training is None else training)
+            self.training if training is None else training,
+            candidate_physical_group=(
+                observation.candidate_physical_group),
+            physical_group_capacity=observation.physical_group_capacity,
+            physical_group_representative=(
+                observation.physical_group_representative),
+            physical_group_mask=observation.physical_group_mask)
         return decoded, values
 
     def decode(self, observation, candidates=None, training=None):

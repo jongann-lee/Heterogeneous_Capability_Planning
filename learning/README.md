@@ -16,6 +16,18 @@ Set `model.architecture` in a configuration file to select the implementation.
 The task graph is not the terrain graph: routing, visibility, candidate
 generation, and partial-observability updates remain outside the network.
 
+Staging actions retain semantic intent through encoding. Each unknown target
+keeps its configured single-target staging actions, while the closest `n`
+finite pairs among `n` unknown live targets receive one safe directed minimax
+staging action each. Single staging uses feature value `0.5`; pair staging uses
+`1.0`. Multiple semantic actions may therefore point to the same terrain node.
+The decoder combines their logits with `logsumexp`, selects one physical
+destination, and enforces capacity once for that destination. Its policy log
+probability and entropy are calculated over physical destinations rather than
+semantic aliases. Target-directed safe distance maps, target-pair separation,
+and pair minimax locations are computed once per sampled target layout; replans
+only filter that scenario cache using the current live/known target beliefs.
+
 The simulator adapter observes and jointly replans the full living team. An
 agent traversing an edge must finish that edge, but its replacement route is
 chosen immediately from the committed arrival node and begins on arrival. No
@@ -26,7 +38,8 @@ GPU, constructs disjoint vertex-offset copies of the terrain graph with each
 query's own blocked-node mask, and resolves the route bank with one cuGraph
 SSSP operation. These blocked graph copies and their results are temporary.
 Only the original terrain graph and bounded SSSP rows produced by the older
-single-source helper may persist.
+single-source helper may persist. This dynamic route bank is separate from the
+scenario-static staging-geometry cache described above.
 
 `learning/policy/configuration.py` loads and validates experiment settings. The
 task-graph policy consumes only capabilities, raw remaining transit time,
@@ -83,6 +96,10 @@ objects. The Transformer uses complete episodic REINFORCE with an EMA baseline;
 the default task graph now uses the same baseline approach. Set
 `model.use_critic: true` to restore its shared state-conditioned critic.
 Neither path depends on Gym or another RL framework.
+
+Although this change preserves model tensor dimensions, checkpoints trained
+before semantic staging and physical-location decoding should be treated as a
+different policy version and retrained for performance comparisons.
 
 Fast checks:
 

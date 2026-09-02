@@ -3,9 +3,11 @@
 import copy
 from collections import OrderedDict
 from dataclasses import replace
+from itertools import combinations
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import networkx as nx
 import numpy as np
@@ -13,8 +15,14 @@ import torch
 import yaml
 
 from Real_Life_Maps.real_map_generation import RealTerrainGrid
-from learning.policy.candidates import (Candidate, CandidateTerrainCache,
-                                        generate_candidates)
+from learning.policy.candidates import (
+    Candidate,
+    CandidateScenarioCache,
+    CandidateTerrainCache,
+    generate_candidates,
+    physical_group_metadata,
+)
+import learning.policy.candidates as candidate_module
 from learning.policy.configuration import (
     InstanceConfig,
     LearningConfig,
@@ -30,6 +38,7 @@ from learning.policy.model import (
 )
 from learning.modules import AssignmentDecoder, DecoderOutput
 from learning.gpu_sim.observation_cpu import batch_observations, build_observation
+from learning.gpu_sim.observation_gpu import TensorObservationBuilder
 from learning.policy.oracle import parallel_tsp
 from learning.policy.adapter import LearnedPolicyAdapter
 from learning.gpu_sim.rollout_cpu import calculate_episode_return, collect_episode
@@ -60,6 +69,42 @@ def _instance(two_agents=True):
     if two_agents:
         agents.append(Agent(0, capabilities={2}))
     return graph, agents
+
+
+def _pair_graph(targets=("a", "b"), pair_weights=None):
+    """Directed target graph with one safe staging hub for every pair."""
+    graph = nx.DiGraph()
+    targets = tuple(targets)
+    for index, target in enumerate(targets):
+        graph.add_node(
+            target, pos=(index, 1), height=0.0,
+            type="target_unreached", rps_type=UNKNOWN_TYPE,
+            visible_edges=[])
+    pair_weights = pair_weights or {}
+    for pair_index, (first, second) in enumerate(combinations(targets, 2)):
+        default = float(pair_index + 1)
+        forward, reverse = pair_weights.get(
+            (first, second), (default, default))
+        if forward is not None:
+            graph.add_edge(first, second, distance=float(forward))
+        if reverse is not None:
+            graph.add_edge(second, first, distance=float(reverse))
+        hub = f"hub_{first}_{second}"
+        graph.add_node(
+            hub, pos=(pair_index, 0), height=0.0,
+            type="intermediate", visible_edges=[])
+        graph.add_edge(hub, first, distance=1.0)
+        graph.add_edge(hub, second, distance=1.0)
+    return graph
+
+
+def _candidate_config(staging_per_target=0):
+    return replace(
+        load_config().candidates,
+        staging_per_target=staging_per_target,
+        include_pair_staging=True,
+        include_wait=False,
+    )
 
 
 def _model():
@@ -247,6 +292,7 @@ training:
     assert config.instances.max_targets == 7
     assert config.instances.min_agents is None
     assert config.instances.max_agents is None
+    assert config.candidates.include_pair_staging
 
 
 def test_episode_agent_count_uses_seeded_range_and_fixed_overrides():
@@ -341,6 +387,7 @@ def test_yaml_configuration_loads_and_validates():
     config = load_config()
     assert config.model.model_dim % config.model.num_heads == 0
     assert config.candidates.include_wait
+    assert config.candidates.include_pair_staging
     assert config.instances.min_targets == 5
     assert config.instances.max_targets == 9
     assert config.instances.min_agents == 3
@@ -620,6 +667,266 @@ def test_cached_candidate_generation_matches_uncached_generation():
         candidate.staging_targets for candidate in uncached]
 
 
+def test_scenario_cache_computes_staging_geometry_only_once():
+    graph = _pair_graph(("a", "b", "c"))
+    config = _candidate_config(staging_per_target=1)
+    with (
+        patch.object(
+            candidate_module, "_safe_distances_to_target",
+            wraps=candidate_module._safe_distances_to_target,
+        ) as distance_spy,
+        patch.object(
+            candidate_module, "_pair_staging_definitions",
+            wraps=candidate_module._pair_staging_definitions,
+        ) as pair_spy,
+    ):
+        cache = CandidateScenarioCache(
+            graph, include_pair_staging=config.include_pair_staging)
+        assert distance_spy.call_count == 3
+        assert pair_spy.call_count == 1
+
+        first = generate_candidates(
+            graph, config, scenario_cache=cache)
+        graph.nodes["c"]["rps_type"] = 1
+        second = generate_candidates(
+            graph, config, scenario_cache=cache)
+
+        assert distance_spy.call_count == 3
+        assert pair_spy.call_count == 1
+        assert len([item for item in first if item.staging_arity == 2]) == 3
+        assert len([item for item in second if item.staging_arity == 2]) == 1
+
+
+def test_pair_staging_count_selection_and_belief_filtering():
+    config = _candidate_config()
+    empty = nx.DiGraph()
+    assert not [candidate for candidate in generate_candidates(empty, config)
+                if candidate.staging_arity == 2]
+
+    singleton = _pair_graph(("a",))
+    assert not [candidate for candidate in generate_candidates(singleton, config)
+                if candidate.staging_arity == 2]
+
+    two = _pair_graph(("a", "b"))
+    pair = [candidate for candidate in generate_candidates(two, config)
+            if candidate.staging_arity == 2]
+    assert len(pair) == 1
+    assert pair[0].staging_targets == {"a", "b"}
+
+    weights = {
+        ("a", "b"): (1, 1),
+        ("a", "c"): (2, 2),
+        ("a", "d"): (3, 3),
+        ("b", "c"): (4, 4),
+        ("b", "d"): (5, 5),
+        ("c", "d"): (6, 6),
+    }
+    four = _pair_graph(("a", "b", "c", "d"), weights)
+    selected = [candidate for candidate in generate_candidates(four, config)
+                if candidate.staging_arity == 2]
+    assert len(selected) == 4
+    assert {frozenset(candidate.staging_targets) for candidate in selected} == {
+        frozenset(pair) for pair in (
+            ("a", "b"), ("a", "c"), ("a", "d"), ("b", "c"))}
+
+    four.nodes["c"]["rps_type"] = 1
+    four.nodes["d"]["type"] = "target_reached"
+    filtered = [candidate for candidate in generate_candidates(four, config)
+                if candidate.staging_arity == 2]
+    assert len(filtered) == 1
+    assert filtered[0].staging_targets == {"a", "b"}
+
+
+def test_pair_staging_excludes_infinite_pairs_and_uses_symmetric_distance():
+    config = _candidate_config()
+    one_way = _pair_graph(
+        ("a", "b"), {("a", "b"): (2.0, None)})
+    assert not [candidate for candidate in generate_candidates(one_way, config)
+                if candidate.staging_arity == 2]
+
+    asymmetric = _pair_graph(
+        ("a", "b"), {("a", "b"): (2.0, 7.0)})
+    pair = next(candidate for candidate in generate_candidates(
+        asymmetric, config) if candidate.staging_arity == 2)
+    assert pair.pair_distance == 7.0
+
+
+def test_pair_staging_ties_use_stable_target_order():
+    targets = ("a", "b", "c", "d")
+    weights = {pair: (1.0, 1.0) for pair in combinations(targets, 2)}
+    graph = _pair_graph(targets, weights)
+    pairs = [candidate for candidate in generate_candidates(
+        graph, _candidate_config()) if candidate.staging_arity == 2]
+    assert {frozenset(candidate.staging_targets) for candidate in pairs} == {
+        frozenset(pair) for pair in (
+            ("a", "b"), ("a", "c"), ("a", "d"), ("b", "c"))}
+
+
+def test_pair_staging_minimax_total_and_repr_tiebreaks():
+    config = _candidate_config()
+
+    def graph_with_locations(locations):
+        graph = nx.DiGraph()
+        for index, target in enumerate(("p", "q")):
+            graph.add_node(
+                target, pos=(index, 1), height=0.0,
+                type="target_unreached", rps_type=UNKNOWN_TYPE,
+                visible_edges=[])
+        graph.add_edge("p", "q", distance=10.0)
+        graph.add_edge("q", "p", distance=10.0)
+        for index, (node, to_p, to_q) in enumerate(locations):
+            graph.add_node(
+                node, pos=(index, 0), height=0.0,
+                type="intermediate", visible_edges=[])
+            if to_p is not None:
+                graph.add_edge(node, "p", distance=float(to_p))
+            if to_q is not None:
+                graph.add_edge(node, "q", distance=float(to_q))
+        return graph
+
+    minimax = graph_with_locations([
+        ("x", 5, 1), ("y", 3, 3), ("unreachable", 1, None)])
+    pair = next(candidate for candidate in generate_candidates(
+        minimax, config) if candidate.staging_arity == 2)
+    assert pair.node == "y"
+
+    total_tie = graph_with_locations([("x", 4, 1), ("y", 4, 3)])
+    pair = next(candidate for candidate in generate_candidates(
+        total_tie, config) if candidate.staging_arity == 2)
+    assert pair.node == "x"
+
+    repr_tie = graph_with_locations([("x", 2, 2), ("y", 2, 2)])
+    pair = next(candidate for candidate in generate_candidates(
+        repr_tie, config) if candidate.staging_arity == 2)
+    assert pair.node == "x"
+    assert pair.node not in pair.staging_targets
+
+
+def test_single_staging_ranks_candidate_to_target_on_directed_graph():
+    graph = nx.DiGraph()
+    graph.add_node(
+        "target", pos=(0, 1), height=0.0, type="target_unreached",
+        rps_type=UNKNOWN_TYPE, visible_edges=[])
+    for index, node in enumerate(("near_from_target", "near_to_target")):
+        graph.add_node(
+            node, pos=(index, 0), height=0.0,
+            type="intermediate", visible_edges=[])
+    graph.add_edge("target", "near_from_target", distance=1.0)
+    graph.add_edge("near_from_target", "target", distance=100.0)
+    graph.add_edge("target", "near_to_target", distance=100.0)
+    graph.add_edge("near_to_target", "target", distance=2.0)
+    singles = [candidate for candidate in generate_candidates(
+        graph, _candidate_config(staging_per_target=1))
+        if candidate.staging_arity == 1]
+    assert len(singles) == 1
+    assert singles[0].node == "near_to_target"
+
+
+def test_semantic_staging_aliases_share_physical_group_and_encode_arity():
+    graph = nx.DiGraph()
+    for index, target in enumerate(("p", "q")):
+        graph.add_node(
+            target, pos=(index, 1), height=0.0,
+            type="target_unreached", rps_type=UNKNOWN_TYPE,
+            visible_edges=[])
+    graph.add_node(
+        "v", pos=(0, 0), height=0.0,
+        type="source", visible_edges=[])
+    graph.add_edge("p", "q", distance=5.0)
+    graph.add_edge("q", "p", distance=5.0)
+    graph.add_edge("v", "p", distance=1.0)
+    graph.add_edge("v", "q", distance=1.0)
+    candidates = generate_candidates(
+        graph, _candidate_config(staging_per_target=1))
+    staging = [candidate for candidate in candidates
+               if candidate.node == "v" and candidate.is_staging]
+    assert len(staging) == 3
+    assert len({candidate.semantic_key for candidate in staging}) == 3
+    assert len({candidate.physical_key for candidate in staging}) == 1
+    groups, capacities, _representatives = physical_group_metadata(candidates)
+    staging_indices = [candidates.index(candidate) for candidate in staging]
+    assert len({groups[index] for index in staging_indices}) == 1
+    assert capacities[groups[staging_indices[0]]] == 1
+
+    observation = build_observation(
+        graph, [Agent("v", capabilities={0, 1, 2})], 2,
+        candidates=candidates)
+    single_indices = [index for index, candidate in enumerate(candidates)
+                      if candidate.staging_arity == 1]
+    pair_index = next(index for index, candidate in enumerate(candidates)
+                      if candidate.staging_arity == 2)
+    assert torch.equal(
+        observation.action_features[0, single_indices, 4],
+        torch.full((2,), 0.5))
+    assert observation.action_features[0, pair_index, 4] == 1.0
+    assert observation.stages_for_mask[0, pair_index].sum() == 2
+
+
+def test_cuda_static_pair_activation_matches_cpu_belief_selection():
+    graph = _pair_graph(("a", "b", "c", "d"))
+    config = _candidate_config()
+    static_candidates = generate_candidates(
+        graph, config, include_all_pairs=True)
+    targets = sorted(
+        (node for node, data in graph.nodes(data=True)
+         if data["type"].startswith("target_")), key=repr)
+    target_index = {target: index for index, target in enumerate(targets)}
+    shape = (len(static_candidates), len(targets))
+    target_mask = torch.zeros(shape, dtype=torch.bool)
+    observed_mask = torch.zeros_like(target_mask)
+    staging_mask = torch.zeros_like(target_mask)
+    for candidate_index, candidate in enumerate(static_candidates):
+        if candidate.is_target:
+            target_mask[candidate_index, target_index[candidate.node]] = True
+        for target in candidate.observed_targets:
+            observed_mask[candidate_index, target_index[target]] = True
+        for target in candidate.staging_targets:
+            staging_mask[candidate_index, target_index[target]] = True
+    pair_order = sorted(
+        (index for index, candidate in enumerate(static_candidates)
+         if candidate.staging_arity == 2),
+        key=lambda index: (
+            static_candidates[index].pair_distance,
+            tuple(repr(target) for target in sorted(
+                static_candidates[index].staging_targets, key=repr))))
+    world = SimpleNamespace(
+        target_candidate_mask=target_mask,
+        candidate_observed_mask=observed_mask,
+        candidate_staging_mask=staging_mask,
+        candidate_staging_arity=torch.tensor([
+            candidate.staging_arity for candidate in static_candidates]),
+        candidate_pair_order=torch.tensor(pair_order, dtype=torch.long),
+        candidate_is_wait=torch.tensor([
+            candidate.is_wait for candidate in static_candidates]),
+    )
+    state = SimpleNamespace(
+        target_live=torch.tensor([[True, True, True, False]]),
+        target_known=torch.tensor([[False, False, True, False]]),
+    )
+    roles = TensorObservationBuilder(world, 3).candidate_roles(state)
+    is_staging, staging_links = roles[2], roles[6]
+    active_pairs = {
+        frozenset(static_candidates[index].staging_targets)
+        for index in torch.where(
+            is_staging[0]
+            & (world.candidate_staging_arity == 2))[0].tolist()
+    }
+
+    cpu_graph = graph.copy()
+    cpu_graph.nodes["c"]["rps_type"] = 1
+    cpu_graph.nodes["d"]["type"] = "target_reached"
+    cpu_pairs = {
+        frozenset(candidate.staging_targets)
+        for candidate in generate_candidates(cpu_graph, config)
+        if candidate.staging_arity == 2
+    }
+    assert active_pairs == cpu_pairs == {frozenset(("a", "b"))}
+    active_pair_index = next(index for index in range(len(static_candidates))
+                             if is_staging[0, index]
+                             and static_candidates[index].staging_arity == 2)
+    assert staging_links[0, active_pair_index].sum() == 2
+
+
 def test_hidden_ground_truth_never_enters_observation():
     env, agents = _instance(False)
     env.nodes[4]["rps_type"] = UNKNOWN_TYPE
@@ -742,6 +1049,137 @@ def test_decoder_constraints_and_probabilities():
     assert torch.isfinite(sampled.log_probabilities).all()
 
 
+def test_grouped_decoder_sums_alias_probabilities_and_replays_exactly():
+    decoder = AssignmentDecoder()
+    logits = torch.tensor([[[0.0, 0.0, 0.5]]], requires_grad=True)
+    valid = torch.ones_like(logits, dtype=torch.bool)
+    action_capacities = torch.ones((1, 3), dtype=torch.long)
+    candidate_groups = torch.tensor([[0, 0, 1]])
+    group_capacities = torch.tensor([[1, 1]])
+    representatives = torch.tensor([[0, 2]])
+    group_mask = torch.ones((1, 2), dtype=torch.bool)
+
+    grouped = decoder.grouped_logits(
+        logits[0], valid[0], candidate_groups[0], group_mask[0])
+    assert torch.allclose(
+        grouped[0],
+        torch.stack((torch.logsumexp(logits[0, 0, :2], dim=0),
+                     logits[0, 0, 2])))
+    output = decoder(
+        logits, valid, action_capacities, training=False,
+        candidate_physical_group=candidate_groups,
+        physical_group_capacity=group_capacities,
+        physical_group_representative=representatives,
+        physical_group_mask=group_mask)
+    # Neither alias is individually largest, but their summed location wins.
+    assert output.assignments == [[(0, 0)]]
+    expected_distribution = torch.distributions.Categorical(logits=grouped[0])
+    assert torch.allclose(
+        output.log_probabilities[0],
+        expected_distribution.log_prob(torch.tensor(0)))
+    assert torch.allclose(
+        output.entropies[0], expected_distribution.entropy())
+
+    replay_logp, replay_entropy = decoder.evaluate_selected(
+        logits, valid, action_capacities, output.selected_pair_indices,
+        candidate_physical_group=candidate_groups,
+        physical_group_capacity=group_capacities,
+        physical_group_representative=representatives,
+        physical_group_mask=group_mask)
+    assert torch.allclose(replay_logp, output.log_probabilities)
+    assert torch.allclose(replay_entropy, output.entropies)
+
+    output.log_probabilities.sum().backward()
+    assert logits.grad[0, 0, 0] != 0
+    assert logits.grad[0, 0, 1] != 0
+
+
+def test_grouped_decoder_consumes_shared_capacity_once():
+    decoder = AssignmentDecoder()
+    logits = torch.tensor([[
+        [10.0, 9.0, 0.0],
+        [8.0, 7.0, 0.0],
+    ]])
+    valid = torch.ones_like(logits, dtype=torch.bool)
+    unlimited = torch.iinfo(torch.long).max
+    output = decoder(
+        logits, valid, torch.ones((1, 3), dtype=torch.long),
+        training=False,
+        candidate_physical_group=torch.tensor([[0, 0, 1]]),
+        physical_group_capacity=torch.tensor([[1, unlimited]]),
+        physical_group_representative=torch.tensor([[0, 2]]),
+        physical_group_mask=torch.ones((1, 2), dtype=torch.bool))
+    assert len(output.assignments[0]) == 2
+    assert sum(action == 0 for _agent, action in output.assignments[0]) == 1
+    assert sum(action == 2 for _agent, action in output.assignments[0]) == 1
+
+
+def test_grouped_logits_are_invariant_to_semantic_alias_permutation():
+    decoder = AssignmentDecoder()
+    logits = torch.tensor([
+        [0.2, -0.4, 0.7, 0.1],
+        [1.2, 0.3, -0.5, 0.8],
+    ])
+    valid = torch.ones_like(logits, dtype=torch.bool)
+    groups = torch.tensor([0, 1, 0, 1])
+    group_mask = torch.ones(2, dtype=torch.bool)
+    base = decoder.grouped_logits(logits, valid, groups, group_mask)
+    order = torch.tensor([3, 0, 2, 1])
+    permuted = decoder.grouped_logits(
+        logits[:, order], valid[:, order], groups[order], group_mask)
+    assert torch.allclose(base, permuted)
+
+
+def test_grouped_decoder_cpu_cuda_parity_when_cuda():
+    if not torch.cuda.is_available():
+        return
+    decoder = AssignmentDecoder()
+    logits = torch.tensor([[
+        [0.0, 0.0, 0.5],
+        [1.0, -0.5, 0.25],
+    ]])
+    valid = torch.ones_like(logits, dtype=torch.bool)
+    action_capacities = torch.ones((1, 3), dtype=torch.long)
+    candidate_groups = torch.tensor([[0, 0, 1]])
+    group_capacities = torch.tensor([[1, torch.iinfo(torch.long).max]])
+    representatives = torch.tensor([[0, 2]])
+    group_mask = torch.ones((1, 2), dtype=torch.bool)
+
+    def decode(device):
+        return decoder(
+            logits.to(device), valid.to(device),
+            action_capacities.to(device), training=False,
+            candidate_physical_group=candidate_groups.to(device),
+            physical_group_capacity=group_capacities.to(device),
+            physical_group_representative=representatives.to(device),
+            physical_group_mask=group_mask.to(device))
+
+    cpu = decode("cpu")
+    cuda = decode("cuda")
+    assert cpu.assignments == cuda.assignments
+    assert cpu.selected_group_indices == cuda.selected_group_indices
+    assert torch.allclose(
+        cpu.log_probabilities, cuda.log_probabilities.cpu(), atol=1e-6)
+    assert torch.allclose(cpu.entropies, cuda.entropies.cpu(), atol=1e-6)
+
+
+def test_physical_group_capacity_conflicts_are_rejected():
+    aliases = [
+        Candidate(
+            "v", is_staging=True, staging_arity=1,
+            staging_targets={"a"}, capacity=1),
+        Candidate(
+            "v", is_staging=True, staging_arity=1,
+            staging_targets={"b"}, capacity=2),
+    ]
+    try:
+        physical_group_metadata(aliases)
+    except ValueError as error:
+        assert "conflicting capacities" in str(error)
+    else:
+        raise AssertionError("conflicting alias capacities were accepted")
+
+
 def test_forward_backward_and_tiny_overfit():
     graph, agents = _instance(False)
     observation = build_observation(graph, agents, 2)
@@ -785,6 +1223,85 @@ class _TargetFirst(torch.nn.Module):
                     used.add(choices[0])
         zero = self.anchor.reshape(1) * 0
         return DecoderOutput([pairs], [[]], zero, zero)
+
+
+class _GroupedAliasesThenTargets(torch.nn.Module):
+    """Smoke policy whose first choice only wins after alias aggregation."""
+
+    def __init__(self, staging_node):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+        self.decoder = AssignmentDecoder()
+        self.staging_node = staging_node
+        self.calls = 0
+        self.first_individual_is_target = None
+        self.first_selected_node = None
+
+    def decode(self, observation, candidates, training=False):
+        logits = observation.action_features.new_full(
+            observation.feasible_action_mask.shape, -5.0)
+        items = candidates[0]
+        if self.calls == 0:
+            for action, candidate in enumerate(items):
+                if candidate.is_staging and candidate.node == self.staging_node:
+                    logits[0, :, action] = 0.0
+                elif candidate.is_target:
+                    logits[0, :, action] = 0.5
+            individual_action = int(logits[0, 0].argmax())
+            self.first_individual_is_target = items[
+                individual_action].is_target
+        else:
+            for action, candidate in enumerate(items):
+                if candidate.is_target:
+                    logits[0, :, action] = 10.0
+        logits = logits + self.anchor * 0.0
+        output = self.decoder(
+            logits, observation.feasible_action_mask,
+            observation.action_capacities, training=training,
+            candidate_physical_group=observation.candidate_physical_group,
+            physical_group_capacity=observation.physical_group_capacity,
+            physical_group_representative=(
+                observation.physical_group_representative),
+            physical_group_mask=observation.physical_group_mask)
+        if self.calls == 0:
+            selected_action = output.assignments[0][0][1]
+            self.first_selected_node = items[selected_action].node
+        self.calls += 1
+        return output
+
+
+def test_cpu_rollout_executes_grouped_alias_location_winner():
+    truth = nx.DiGraph()
+    for node, position, node_type in (
+        ("s", (0, 0), "source"),
+        ("v", (1, 0), "intermediate"),
+        ("p", (2, 1), "target_unreached"),
+        ("q", (2, -1), "target_unreached"),
+    ):
+        truth.add_node(
+            node, pos=position, height=0.0, type=node_type,
+            visible_edges=[])
+    for source, target, distance in (
+        ("s", "v", 1), ("v", "s", 1),
+        ("v", "p", 1), ("p", "v", 1),
+        ("v", "q", 1), ("q", "v", 1),
+        ("p", "q", 2), ("q", "p", 2),
+    ):
+        truth.add_edge(
+            source, target, distance=float(distance), observed_edge=False)
+    env = truth.copy()
+    init_target_types(env, truth, {"p": 1, "q": 2})
+    config = _candidate_config(staging_per_target=1)
+    model = _GroupedAliasesThenTargets("v")
+    policy = LearnedPolicyAdapter(
+        model, 2, candidate_config=config, training=False)
+    result = run_simulation(
+        env, truth, [Agent("s", capabilities={1, 2})], policy=policy)
+    # The recorded individual winner was a target, while grouped decoding
+    # selected the representative of the three-alias staging location.
+    assert model.first_individual_is_target
+    assert model.first_selected_node == "v"
+    assert result["completed"]
 
 
 def test_complete_adapter_episode_runs_through_simulator():

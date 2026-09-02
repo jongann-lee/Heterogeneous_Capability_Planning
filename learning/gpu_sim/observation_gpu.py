@@ -20,10 +20,25 @@ class TensorObservationBuilder:
         unknown = live & ~state.target_known
         target_links = self.world.target_candidate_mask[None] & live[:, None]
         observed_links = self.world.candidate_observed_mask[None] & unknown[:, None]
-        staging_links = self.world.candidate_staging_mask[None] & unknown[:, None]
+        staging_members = (
+            self.world.candidate_staging_mask[None] & unknown[:, None])
+        member_count = staging_members.sum(dim=2)
+        arity = self.world.candidate_staging_arity
+        single_active = (arity[None] == 1) & (member_count == 1)
+        pair_eligible = (arity[None] == 2) & (member_count == 2)
+        pair_active = torch.zeros_like(pair_eligible)
+        pair_order = self.world.candidate_pair_order
+        if pair_order.numel():
+            ordered_eligible = pair_eligible[:, pair_order]
+            ordered_rank = ordered_eligible.cumsum(dim=1)
+            pair_limit = unknown.sum(dim=1, keepdim=True)
+            selected = ordered_eligible & (ordered_rank <= pair_limit)
+            pair_active[:, pair_order] = selected
+        staging_active = single_active | pair_active
+        staging_links = staging_members & staging_active[..., None]
         is_target = target_links.any(dim=2)
         is_observation = observed_links.any(dim=2)
-        is_staging = staging_links.any(dim=2)
+        is_staging = staging_active
         active = (is_target | is_observation | is_staging |
                   self.world.candidate_is_wait[None])
         associated = target_links | observed_links | staging_links
@@ -194,7 +209,8 @@ class TensorObservationBuilder:
         action_x[..., :2] = region_positions[None]
         action_x[..., 2] = is_target
         action_x[..., 3] = is_observation
-        action_x[..., 4] = is_staging
+        action_x[..., 4] = (
+            world.candidate_staging_arity.float()[None] / 2.0)
         action_x[..., 5] = world.candidate_is_wait
         action_x[..., 6] = associated.sum(dim=2) / max(targets, 1)
         action_x[..., 7] = observed_links.sum(dim=2) / max(targets, 1)
@@ -296,7 +312,15 @@ class TensorObservationBuilder:
                     world.candidate_capacity < 0,
                     torch.full_like(world.candidate_capacity,
                                     torch.iinfo(torch.long).max),
-                    world.candidate_capacity)[None].expand(batch, -1)))
+                    world.candidate_capacity)[None].expand(batch, -1)),
+            candidate_physical_group=(
+                world.candidate_physical_group[None].expand(batch, -1)),
+            physical_group_capacity=(
+                world.physical_group_capacity[None].expand(batch, -1)),
+            physical_group_representative=(
+                world.physical_group_representative[None].expand(batch, -1)),
+            physical_group_mask=(
+                world.physical_group_mask[None].expand(batch, -1)))
         ct_reachable = (
             torch.isfinite(base_distance) & (base_distance < 1e30)
             & physical[None, :, None]

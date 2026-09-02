@@ -55,12 +55,15 @@ class CandidateConfig:
     staging_per_target: int
     staging_capacity: int
     include_wait: bool
+    include_pair_staging: bool = True
 
     def __post_init__(self):
         if self.staging_per_target < 0:
             raise ValueError("staging_per_target must be non-negative")
         if self.staging_capacity < 1:
             raise ValueError("staging_capacity must be positive")
+        if not isinstance(self.include_pair_staging, bool):
+            raise ValueError("include_pair_staging must be a boolean")
 
 
 @dataclass(frozen=True)

@@ -285,6 +285,7 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
         globals().get(name) is None for name in (
             "SOURCE_POSITION", "TARGET_POSITIONS", "TARGET_TYPES",
             "AGENT_CAPABILITIES"))
+    initial_overlay_available = random_overlay
     history = []
     completed_episodes = 0
     try:
@@ -305,18 +306,22 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                                     update_size - accumulated)
                 if random_overlay:
                     episode_number = completed_episodes + accumulated
-                    batch_env, batch_truth, batch_agents = instance_factory(
-                        episode_number)
-                    world = TensorWorld.from_networkx(
-                        batch_env, candidate_config, device=device,
-                        terrain=terrain)
-                    builder = TensorObservationBuilder(
-                        world, model_config.num_target_types,
-                        task_graph=model_config.architecture == "task_graph")
-                    source, caps, types = encode_episode(
-                        world, batch_truth, batch_agents)
-                    oracle_makespan = parallel_tsp(
-                        batch_truth, batch_agents)
+                    if initial_overlay_available and episode_number == 0:
+                        initial_overlay_available = False
+                    else:
+                        batch_env, batch_truth, batch_agents = instance_factory(
+                            episode_number)
+                        world = TensorWorld.from_networkx(
+                            batch_env, candidate_config, device=device,
+                            terrain=terrain)
+                        builder = TensorObservationBuilder(
+                            world, model_config.num_target_types,
+                            task_graph=(
+                                model_config.architecture == "task_graph"))
+                        source, caps, types = encode_episode(
+                            world, batch_truth, batch_agents)
+                        oracle_makespan = parallel_tsp(
+                            batch_truth, batch_agents)
                 state = TensorEpisodeState.create(
                     world, torch.full((current_batch,), source, device=device),
                     caps[None].expand(current_batch, -1, -1).clone(),

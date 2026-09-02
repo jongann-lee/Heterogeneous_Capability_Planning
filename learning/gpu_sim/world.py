@@ -4,7 +4,12 @@ from dataclasses import dataclass
 
 import torch
 
-from learning.policy.candidates import CandidateTerrainCache, generate_candidates
+from learning.policy.candidates import (
+    CandidateScenarioCache,
+    CandidateTerrainCache,
+    generate_candidates,
+    physical_group_metadata,
+)
 from learning.gpu_sim.cugraph_router import CuGraphRouter
 
 
@@ -101,6 +106,9 @@ class TensorWorld:
     candidate_target_mask: torch.Tensor
     candidate_observed_mask: torch.Tensor
     candidate_staging_mask: torch.Tensor
+    candidate_staging_arity: torch.Tensor
+    candidate_pair_distance: torch.Tensor
+    candidate_pair_order: torch.Tensor
     visible_targets: torch.Tensor
     edge_cost: torch.Tensor
     candidate_is_target: torch.Tensor
@@ -108,6 +116,10 @@ class TensorWorld:
     candidate_is_staging: torch.Tensor
     candidate_is_wait: torch.Tensor
     candidate_capacity: torch.Tensor
+    candidate_physical_group: torch.Tensor
+    physical_group_capacity: torch.Tensor
+    physical_group_representative: torch.Tensor
+    physical_group_mask: torch.Tensor
     target_candidate_mask: torch.Tensor
     distance_scale: float
     target_distances: torch.Tensor
@@ -126,8 +138,12 @@ class TensorWorld:
             (node for node, data in graph.nodes(data=True)
              if data.get("type") in ("target_unreached", "target_reached")),
             key=repr)
+        scenario_cache = CandidateScenarioCache(
+            graph, terrain_cache=terrain.candidate_cache,
+            include_pair_staging=candidate_config.include_pair_staging)
         candidates = generate_candidates(
-            graph, candidate_config, terrain.candidate_cache)
+            graph, candidate_config, terrain.candidate_cache,
+            include_all_pairs=True, scenario_cache=scenario_cache)
         target_index = {node: index for index, node in enumerate(targets)}
 
         positions = terrain.positions
@@ -163,6 +179,35 @@ class TensorWorld:
             for node in item.staging_targets:
                 staging[c, target_index[node]] = True
 
+        staging_arity = torch.tensor(
+            [item.staging_arity for item in candidates], dtype=torch.long,
+            device=device)
+        pair_distance = torch.tensor([
+            torch.inf if item.pair_distance is None else item.pair_distance
+            for item in candidates
+        ], dtype=torch.float32, device=device)
+        pair_indices = [
+            index for index, item in enumerate(candidates)
+            if item.staging_arity == 2]
+        pair_indices.sort(key=lambda index: (
+            candidates[index].pair_distance,
+            tuple(repr(target) for target in sorted(
+                candidates[index].staging_targets, key=repr)),
+        ))
+        pair_order = torch.tensor(
+            pair_indices, dtype=torch.long, device=device)
+
+        (candidate_groups, group_capacities,
+         group_representatives) = physical_group_metadata(candidates)
+        candidate_physical_group = torch.tensor(
+            candidate_groups, dtype=torch.long, device=device)
+        physical_group_capacity = torch.tensor(
+            group_capacities, dtype=torch.long, device=device)
+        physical_group_representative = torch.tensor(
+            group_representatives, dtype=torch.long, device=device)
+        physical_group_mask = torch.ones(
+            len(group_capacities), dtype=torch.bool, device=device)
+
         target_nodes_tensor = torch.tensor(
             [node_index[node] for node in targets], device=device)
         visible_targets = terrain.visibility[:, target_nodes_tensor]
@@ -173,7 +218,9 @@ class TensorWorld:
         target_candidate_mask = (
             candidate_nodes[:, None] == target_nodes_tensor[None, :])
         distance_scale = terrain.distance_scale
-        target_sssp = router.sssp([node_index[node] for node in targets], ())
+        # Reverse-graph SSSP yields directed Candidate -> Target distances.
+        target_sssp = reverse_router.sssp(
+            [node_index[node] for node in targets], ())
         max_incoming = max(graph.in_degree(node) for node in targets)
         target_incoming_nodes = torch.full(
             (len(targets), max_incoming), -1, dtype=torch.long, device=device)
@@ -186,24 +233,44 @@ class TensorWorld:
                 target_incoming_costs[target_index_value, slot] = float(
                     data.get("distance", 1.0))
         world = cls(
-            terrain, graph, nodes, node_index, targets, candidates,
-            positions, heights, target_nodes_tensor,
-            candidate_nodes, candidate_region_nodes, candidate_region_mask,
-            associated, observed, staging, visible_targets,
-            edge_cost,
-            torch.tensor([item.is_target for item in candidates],
-                         dtype=torch.bool, device=device),
-            torch.tensor([item.is_observation for item in candidates],
-                         dtype=torch.bool, device=device),
-            torch.tensor([item.is_staging for item in candidates],
-                         dtype=torch.bool, device=device),
-            torch.tensor([item.is_wait for item in candidates],
-                         dtype=torch.bool, device=device),
-            torch.tensor([-1 if item.capacity is None else item.capacity
-                          for item in candidates], dtype=torch.long,
-            device=device), target_candidate_mask, distance_scale,
-            target_sssp.distances, target_incoming_nodes,
-            target_incoming_costs, router, reverse_router)
+            terrain=terrain, graph=graph, nodes=nodes, node_index=node_index,
+            targets=targets, candidates=candidates, positions=positions,
+            heights=heights, target_nodes=target_nodes_tensor,
+            candidate_nodes=candidate_nodes,
+            candidate_region_nodes=candidate_region_nodes,
+            candidate_region_mask=candidate_region_mask,
+            candidate_target_mask=associated,
+            candidate_observed_mask=observed,
+            candidate_staging_mask=staging,
+            candidate_staging_arity=staging_arity,
+            candidate_pair_distance=pair_distance,
+            candidate_pair_order=pair_order,
+            visible_targets=visible_targets, edge_cost=edge_cost,
+            candidate_is_target=torch.tensor(
+                [item.is_target for item in candidates],
+                dtype=torch.bool, device=device),
+            candidate_is_observation=torch.tensor(
+                [item.is_observation for item in candidates],
+                dtype=torch.bool, device=device),
+            candidate_is_staging=torch.tensor(
+                [item.is_staging for item in candidates],
+                dtype=torch.bool, device=device),
+            candidate_is_wait=torch.tensor(
+                [item.is_wait for item in candidates],
+                dtype=torch.bool, device=device),
+            candidate_capacity=torch.tensor(
+                [-1 if item.capacity is None else item.capacity
+                 for item in candidates], dtype=torch.long, device=device),
+            candidate_physical_group=candidate_physical_group,
+            physical_group_capacity=physical_group_capacity,
+            physical_group_representative=physical_group_representative,
+            physical_group_mask=physical_group_mask,
+            target_candidate_mask=target_candidate_mask,
+            distance_scale=distance_scale,
+            target_distances=target_sssp.distances,
+            target_incoming_nodes=target_incoming_nodes,
+            target_incoming_costs=target_incoming_costs,
+            router=router, reverse_router=reverse_router)
         world.neighbors = neighbors
         world.required_route_nodes = torch.unique(torch.cat((
             candidate_region_nodes[candidate_region_mask],

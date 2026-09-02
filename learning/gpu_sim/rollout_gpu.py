@@ -8,7 +8,12 @@ import torch
 @dataclass
 class DecisionTrace:
     observation: object
-    selected_pair_indices: list[list[int]]
+    selected_group_indices: list[list[int]]
+
+    @property
+    def selected_pair_indices(self):
+        """Compatibility alias for checkpoints/tests using the old name."""
+        return self.selected_group_indices
 
 
 @dataclass
@@ -54,7 +59,7 @@ def collect_tensor_episodes(model, state, observation_builder,
                 decoded = model.decode(observation, training=training)
             if training:
                 decision_traces.append(DecisionTrace(
-                    observation.to("cpu"), decoded.selected_pair_indices))
+                    observation.to("cpu"), decoded.selected_group_indices))
 
             action_indices = torch.full_like(state.positions, -1)
             for b, assignments in enumerate(decoded.assignments):
@@ -174,7 +179,7 @@ def replay_tensor_gradients(model, rollout, episode_signals,
     decision_counts = torch.zeros_like(episode_signals)
     for trace in rollout.decision_traces:
         decision_counts += torch.tensor(
-            [bool(selected) for selected in trace.selected_pair_indices],
+            [bool(selected) for selected in trace.selected_group_indices],
             dtype=episode_signals.dtype, device=device)
     loss_divisors = decision_counts.clamp_min(1.0)
     totals = torch.zeros_like(episode_signals)
@@ -186,9 +191,15 @@ def replay_tensor_gradients(model, rollout, episode_signals,
         logits, values = model.actor_critic(observation)
         logp, entropy = model.decoder.evaluate_selected(
             logits, observation.feasible_action_mask,
-            observation.action_capacities, trace.selected_pair_indices)
+            observation.action_capacities, trace.selected_group_indices,
+            candidate_physical_group=(
+                observation.candidate_physical_group),
+            physical_group_capacity=observation.physical_group_capacity,
+            physical_group_representative=(
+                observation.physical_group_representative),
+            physical_group_mask=observation.physical_group_mask)
         active = torch.tensor(
-            [bool(selected) for selected in trace.selected_pair_indices],
+            [bool(selected) for selected in trace.selected_group_indices],
             dtype=episode_signals.dtype, device=device)
         if values is None:
             advantages = episode_signals

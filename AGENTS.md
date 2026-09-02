@@ -54,8 +54,11 @@ The package is `heterogeneous-capability-planning`, requires Python 3.12 or
     common training fields.
   - `modules/` and `policy/model.py`: selectable Transformer or typed
     heterogeneous graph actor, optional graph critic, and constrained joint
-    decoder.
-  - `policy/candidates.py`: deterministic target, staging, and wait candidates.
+    decoder. Semantic action logits are marginalized by physical destination
+    before assignment and capacity enforcement.
+  - `policy/candidates.py`: deterministic target, observation, single-target
+    staging, closest-pair minimax staging, and wait candidates. Semantic and
+    physical candidate identities are intentionally distinct.
   - `gpu_sim/observation_cpu.py`: canonical planner-visible feature builder and
     CPU batching despite the historical module path.
   - `policy/adapter.py` and `gpu_sim/rollout_cpu.py`: simulator-backed policy
@@ -133,6 +136,12 @@ passed RNG where the API supports one.
 - Agent, target, and candidate counts vary. Masks/padding must remain correct
   and permutation equivariant.
 - Constrained decoding enforces feasibility and candidate capacity.
+- Staging aliases at one node remain distinct graph actions but share one
+  physical decoder group. Group logits use masked `logsumexp`; log probability,
+  entropy, and finite capacity are defined over physical groups, not aliases.
+- Single-target staging has arity feature `0.5`; pair staging has `1.0`. Among
+  `n` unknown live targets, only the closest `n` finite pairs are active, using
+  conservative directed separation and Candidate-to-Target minimax locations.
 - Incomplete episodes need an explicit penalty so stopping early cannot beat
   completion.
 - Keep CPU and tensor/CUDA transition semantics aligned. The CUDA path batches
@@ -142,6 +151,9 @@ passed RNG where the API supports one.
   and their SSSP results are temporary and must not persist after the route
   bank is consumed. The older single-source helper may persistently cache only
   the original terrain graph and bounded SSSP rows computed on it.
+- Candidate staging geometry is scenario-static: compute target-directed safe
+  distance maps, pair separation, and pair minimax locations once per sampled
+  target layout, then only filter cached definitions as target beliefs change.
 - Real-terrain visibility is content-addressed by normalized DEM heights and
   sweep parameters under ignored `cache/visibility/`. Do not bypass or delete
   that persistent preprocessing cache during normal runs.

@@ -14,6 +14,7 @@ model:
 candidates:
   staging_per_target: 2
   staging_capacity: 1
+  include_pair_staging: True
   include_wait: True
 
 instances:

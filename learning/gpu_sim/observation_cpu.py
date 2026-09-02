@@ -6,7 +6,11 @@ from typing import Any
 import networkx as nx
 import torch
 
-from learning.policy.candidates import Candidate, generate_candidates
+from learning.policy.candidates import (
+    Candidate,
+    generate_candidates,
+    physical_group_metadata,
+)
 from learning.policy.configuration import CandidateConfig, load_config
 from simulation.domain import UNKNOWN_TYPE
 
@@ -27,6 +31,10 @@ class PlannerObservation:
     agents: list[list[Any]] | None = None
     targets: list[list[Any]] | None = None
     action_capacities: torch.Tensor | None = None
+    candidate_physical_group: torch.Tensor | None = None
+    physical_group_capacity: torch.Tensor | None = None
+    physical_group_representative: torch.Tensor | None = None
+    physical_group_mask: torch.Tensor | None = None
     task_agent_features: torch.Tensor | None = None
     task_target_features: torch.Tensor | None = None
     task_action_features: torch.Tensor | None = None
@@ -262,7 +270,7 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
                   if region else 0.0)
         action_x[c] = torch.tensor([
             x, y, float(candidate.is_target), float(candidate.is_observation),
-            float(candidate.is_staging), float(candidate.is_wait),
+            candidate.staging_arity / 2.0, float(candidate.is_wait),
             len(candidate.associated_targets) / max(len(targets), 1),
             len(candidate.observed_targets) /
             max(len(targets), 1), height,
@@ -351,6 +359,13 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
             if task_dist != float("inf"):
                 task_ct_distance[c, j, 0] = task_dist
 
+    candidate_groups, group_capacities, group_representatives = (
+        physical_group_metadata(candidates))
+    unlimited = torch.iinfo(torch.long).max
+    action_capacities = torch.tensor([[
+        unlimited if candidate.capacity is None else candidate.capacity
+        for candidate in candidates
+    ]], dtype=torch.long)
     observation = PlannerObservation(
         agent_x.unsqueeze(0), target_x.unsqueeze(0), action_x.unsqueeze(0),
         torch.ones((1, len(agents)), dtype=torch.bool),
@@ -358,6 +373,15 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
         torch.ones((1, len(candidates)), dtype=torch.bool),
         at_rel.unsqueeze(0), ac_rel.unsqueeze(0), ct_rel.unsqueeze(0),
         feasible.unsqueeze(0), [candidates], [agents], [targets],
+        action_capacities=action_capacities,
+        candidate_physical_group=torch.tensor(
+            [candidate_groups], dtype=torch.long),
+        physical_group_capacity=torch.tensor(
+            [group_capacities], dtype=torch.long),
+        physical_group_representative=torch.tensor(
+            [group_representatives], dtype=torch.long),
+        physical_group_mask=torch.ones(
+            (1, len(group_capacities)), dtype=torch.bool),
     )
     return attach_task_graph_fields(
         observation, at_reachable.unsqueeze(0), ct_reachable.unsqueeze(0),
@@ -373,7 +397,8 @@ def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:
         raise ValueError("cannot batch an empty observation list")
     maxima = [max(x.agent_features.shape[1] for x in items),
               max(x.target_features.shape[1] for x in items),
-              max(x.action_features.shape[1] for x in items)]
+              max(x.action_features.shape[1] for x in items),
+              max(x.physical_group_mask.shape[1] for x in items)]
 
     def pad(tensor, shape, value=0):
         out = tensor.new_full(shape, value)
@@ -381,7 +406,7 @@ def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:
         out[slices] = tensor
         return out
 
-    a, t, c = maxima
+    a, t, c, g = maxima
     kwargs = {}
     specs = {
         "agent_features": (1, a, items[0].agent_features.shape[-1]),
@@ -392,6 +417,11 @@ def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:
         "agent_action_relations": (1, a, c, items[0].agent_action_relations.shape[-1]),
         "action_target_relations": (1, c, t, items[0].action_target_relations.shape[-1]),
         "feasible_action_mask": (1, a, c),
+        "action_capacities": (1, c),
+        "candidate_physical_group": (1, c),
+        "physical_group_capacity": (1, g),
+        "physical_group_representative": (1, g),
+        "physical_group_mask": (1, g),
         "task_agent_features": (1, a, items[0].task_agent_features.shape[-1]),
         "task_target_features": (1, t, items[0].task_target_features.shape[-1]),
         "task_action_features": (1, c, items[0].task_action_features.shape[-1]),
@@ -409,6 +439,5 @@ def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:
         kwargs[name] = torch.cat([pad(getattr(item, name), shape) for item in items])
     kwargs.update(candidates=sum((x.candidates or [] for x in items), []),
                   agents=sum((x.agents or [] for x in items), []),
-                  targets=sum((x.targets or [] for x in items), []),
-                  action_capacities=None)
+                  targets=sum((x.targets or [] for x in items), []))
     return PlannerObservation(**kwargs)

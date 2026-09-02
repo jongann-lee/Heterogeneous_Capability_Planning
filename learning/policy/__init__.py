@@ -1,6 +1,11 @@
 """Centralized policy definition, configuration, and action generation."""
 
-from learning.policy.candidates import Candidate, CandidateTerrainCache, generate_candidates
+from learning.policy.candidates import (
+    Candidate,
+    CandidateScenarioCache,
+    CandidateTerrainCache,
+    generate_candidates,
+)
 from learning.policy.adapter import LearnedPolicyAdapter
 from learning.policy.configuration import (
     CandidateConfig,
@@ -20,6 +25,7 @@ from learning.policy.oracle import parallel_tsp
 __all__ = [
     "Candidate",
     "CandidateConfig",
+    "CandidateScenarioCache",
     "CandidateTerrainCache",
     "LearningConfig",
     "LearnedPolicyAdapter",
