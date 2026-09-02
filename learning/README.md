@@ -21,12 +21,12 @@ agent traversing an edge must finish that edge, but its replacement route is
 chosen immediately from the committed arrival node and begins on arrival. No
 ground-truth graph is accepted by the observation builder or policy.
 
-The CUDA router persistently caches only the original forward/reverse terrain
-graphs and bounded SSSP rows from those unmodified graphs. A cached row is
-reused when its required paths avoid all active targets. Blocked graph variants
-and exact rerouted rows use a separate bounded cache shared within one rollout
-batch; it is explicitly cleared before the next batch so randomized scenarios
-cannot accumulate live RAPIDS allocations.
+The CUDA task-graph router deduplicates independent exact route queries on the
+GPU, constructs disjoint vertex-offset copies of the terrain graph with each
+query's own blocked-node mask, and resolves the route bank with one cuGraph
+SSSP operation. These blocked graph copies and their results are temporary.
+Only the original terrain graph and bounded SSSP rows produced by the older
+single-source helper may persist.
 
 `learning/policy/configuration.py` loads and validates experiment settings. The
 task-graph policy consumes only capabilities, raw remaining transit time,
@@ -90,3 +90,69 @@ Fast checks:
 uv run python -m tests.test_learning
 uv run python -m tests.test_simulation
 ```
+
+## Synchronizing with DeltaAI
+
+The DeltaAI repository is expected at:
+
+```text
+/projects/bhmi/jongann2/Heterogeneous_Capability_Planning/
+```
+
+### Send desktop code to DeltaAI
+
+Run this from the desktop repository root. It updates source code and cluster
+scripts without copying generated data or overwriting DeltaAI's environment,
+checkpoints, logs, W&B data, or persistent preprocessing cache. The command
+intentionally omits `--delete`, so files that exist only on DeltaAI are
+preserved.
+
+```bash
+rsync -avP --itemize-changes \
+  --exclude='/.git/' \
+  --exclude='/.venv/' \
+  --exclude='/.uv-cache/' \
+  --exclude='/.cluster-cache/' \
+  --exclude='/learning/checkpoints/' \
+  --exclude='/outputs/' \
+  --exclude='/logs/' \
+  --exclude='/wandb/' \
+  --exclude='/cache/' \
+  --exclude='__pycache__/' \
+  --exclude='*.py[cod]' \
+  --exclude='.DS_Store' \
+  ./ \
+  Delta_AI:/projects/bhmi/jongann2/Heterogeneous_Capability_Planning/
+```
+
+If `pyproject.toml` or `uv.lock` changed, rebuild/synchronize the DeltaAI
+environment from a GPU allocation with `cluster/delta/HCP_build_env.sh`. Do not
+run the CUDA environment verification or training on a login node.
+
+### Pull one checkpoint run back to the desktop
+
+First identify the desired timestamped run on DeltaAI:
+
+```bash
+ssh Delta_AI \
+  'ls -dt /projects/bhmi/jongann2/Heterogeneous_Capability_Planning/learning/checkpoints/20* | head -1'
+```
+
+Then, from the desktop repository root, set `RUN` to that directory's basename
+and pull only its checkpoint results. The W&B directory is excluded because it
+may be large and may still be receiving writes during an active run.
+
+```bash
+RUN=2026-08-26_17-02-11_300431
+mkdir -p "learning/checkpoints/${RUN}"
+
+rsync -avP \
+  --exclude='wandb/' \
+  --exclude='*.tmp' \
+  Delta_AI:/projects/bhmi/jongann2/Heterogeneous_Capability_Planning/learning/checkpoints/"${RUN}"/ \
+  learning/checkpoints/"${RUN}"/
+```
+
+Rolling `latest_weights.pt` and `best_weights.pt` files are replaced atomically,
+so this result command can be rerun safely while training continues. The final
+`trained_weights.pt` appears only after training completes.

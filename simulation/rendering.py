@@ -21,7 +21,9 @@ import networkx as nx
 from simulation.domain import UNKNOWN_TYPE
 
 
-DEFAULT_AGENT_COLORS = ["blue", "red", "green"]
+# Keep the first ten identities on one palette. The previous three-color list
+# fell back to tab10 for later agents, which made agents 1 and 3 both red.
+DEFAULT_AGENT_COLORS = tuple(mcolors.TABLEAU_COLORS.values())
 
 DEAD_AGENT_COLOR = "grey"
 
@@ -31,6 +33,21 @@ def _agent_color(idx, agent_colors=None):
     if idx < len(colors):
         return colors[idx]
     return plt.cm.tab10(idx % 10)
+
+
+def _stacked_agent_label_offsets(points, base_offset=16, spacing=20):
+    """Return vertical label offsets, stacking agents at the same position."""
+    levels = {}
+    offsets = []
+    for x, y in points:
+        # Interpolated locations are floats; rounding avoids microscopic
+        # arithmetic differences preventing visibly co-located labels from
+        # being grouped together.
+        key = (round(float(x), 9), round(float(y), 9))
+        level = levels.get(key, 0)
+        levels[key] = level + 1
+        offsets.append((0, base_offset + spacing * level))
+    return offsets
 
 
 def render_simulation_frame(env_map, blocked_env_graph, agents, turn_idx, output_path,
@@ -215,6 +232,9 @@ def render_frame(env_map, ground_truth, agents, turn_idx, output_path,
     def _apos(i, agent):
         return agent_xy[i] if agent_xy is not None else pos[agent.position]
 
+    agent_points = [_apos(i, agent) for i, agent in enumerate(agents)]
+    agent_label_offsets = _stacked_agent_label_offsets(agent_points)
+
     # Trajectory (solid) + planned path (dotted), colored per agent identity.
     for i, agent in enumerate(agents):
         color = DEAD_AGENT_COLOR if not agent.alive else _agent_color(i)
@@ -240,14 +260,14 @@ def render_frame(env_map, ground_truth, agents, turn_idx, output_path,
     # (e.g. it just engaged, or died there) the target's revealed type stays
     # visible -- the agent's presence is still shown by its trajectory line.
     for i, agent in enumerate(agents):
-        point = _apos(i, agent)
+        point = agent_points[i]
         color = DEAD_AGENT_COLOR if not agent.alive else _agent_color(i)
         ax.scatter([point[0]], [point[1]], marker='o', s=140,
                    facecolor=color, edgecolor='black', linewidths=1.2, zorder=11)
         ax.annotate(
             _agent_capability_text(i, agent),
             xy=point,
-            xytext=(0, 16),
+            xytext=agent_label_offsets[i],
             textcoords="offset points",
             ha="center",
             va="bottom",

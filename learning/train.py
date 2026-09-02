@@ -5,6 +5,7 @@ from dataclasses import asdict, replace
 from datetime import datetime
 import math
 from pathlib import Path
+import random
 
 import torch
 import yaml
@@ -31,7 +32,30 @@ from learning.gpu_sim.rollout_cpu import collect_episode
 SOURCE_POSITION = (0, 0)
 TARGET_POSITIONS = None # [(14,54), (1,29), (33,17), (34,35), (63,37), (37,5), (49,58)]
 TARGET_TYPES = None # [1, 2, 2, 1, 2, 3, 3]
-AGENT_CAPABILITIES = [{0}, {1}, {2}, {3}]
+AGENT_CAPABILITIES = None # [{0}, {1}, {2}, {3}]
+
+
+def _episode_agent_count(episode_seed, configured_num_agents,
+                         instance_config, requested_num_agents=None,
+                         agent_capabilities=None):
+    """Resolve a reproducible fixed or ranged agent count for one scenario."""
+    if agent_capabilities is not None:
+        capability_count = len(agent_capabilities)
+        if capability_count < 1:
+            raise ValueError("AGENT_CAPABILITIES must contain at least one agent")
+        if (requested_num_agents is not None
+                and requested_num_agents != capability_count):
+            raise ValueError(
+                "--num-agents must match the number of AGENT_CAPABILITIES entries")
+        return capability_count
+    if requested_num_agents is not None:
+        if requested_num_agents < 1:
+            raise ValueError("--num-agents must be positive")
+        return requested_num_agents
+    if instance_config.min_agents is not None:
+        return random.Random(episode_seed).randint(
+            instance_config.min_agents, instance_config.max_agents)
+    return configured_num_agents
 
 
 def _instance_config():
@@ -459,7 +483,9 @@ def main():
     parser.add_argument("--simulation-batch-size", type=int)
     parser.add_argument("--reinforce-batch-size", type=int)
     parser.add_argument("--num-target-types", type=int)
-    parser.add_argument("--num-agents", type=int)
+    parser.add_argument(
+        "--num-agents", type=int,
+        help="fix the agent count, overriding instances.min/max_agents")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"])
     parser.add_argument(
@@ -479,8 +505,18 @@ def main():
         else training.reinforce_batch_size)
     num_target_types = (args.num_target_types if args.num_target_types is not None
                         else config.model.num_target_types)
-    num_agents = args.num_agents if args.num_agents is not None else training.num_agents
     seed = args.seed if args.seed is not None else training.seed
+    agent_capabilities = globals().get("AGENT_CAPABILITIES")
+    # Keep the legacy fixed count in the resolved training section when the
+    # instance range is active; the actual range is saved under ``instances``.
+    # Explicit capability lists and CLI overrides still resolve to one count.
+    num_agents = (
+        _episode_agent_count(
+            seed, training.num_agents, config.instances,
+            requested_num_agents=args.num_agents,
+            agent_capabilities=agent_capabilities)
+        if args.num_agents is not None or agent_capabilities is not None
+        else training.num_agents)
     requested_device = args.device or training.device
     device = ("cuda" if torch.cuda.is_available() else "cpu") \
         if requested_device == "auto" else requested_device
@@ -498,12 +534,17 @@ def main():
     torch.manual_seed(seed)
 
     def factory(episode):
+        episode_seed = seed + episode
+        episode_num_agents = _episode_agent_count(
+            episode_seed, training.num_agents, config.instances,
+            requested_num_agents=args.num_agents,
+            agent_capabilities=agent_capabilities)
         return make_wv_dem_instance(
-            seed + episode, num_target_types, num_agents,
+            episode_seed, num_target_types, episode_num_agents,
             source_position=globals().get("SOURCE_POSITION"),
             target_positions=globals().get("TARGET_POSITIONS"),
             target_types=globals().get("TARGET_TYPES"),
-            agent_capabilities=globals().get("AGENT_CAPABILITIES"),
+            agent_capabilities=agent_capabilities,
             min_targets=config.instances.min_targets,
             max_targets=config.instances.max_targets)
 

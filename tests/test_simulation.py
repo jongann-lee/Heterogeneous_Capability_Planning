@@ -142,6 +142,20 @@ def test_random_capabilities_are_reproducible_and_cover_types():
     assert any(0 in values for values in first)
 
 
+def test_random_capabilities_cover_three_types_for_variable_agent_counts():
+    for num_agents in range(3, 7):
+        capabilities = assign_agent_capabilities(
+            num_agents=num_agents,
+            num_target_types=3,
+            ensure_target_coverage=True,
+            ensure_scout=True,
+            rng=random.Random(num_agents),
+        )
+        assert len(capabilities) == num_agents
+        assert any(0 in values for values in capabilities)
+        assert {1, 2, 3}.issubset(set().union(*capabilities))
+
+
 def test_capability_zero_grants_scouting():
     truth = _line(5)
     _full_visibility(truth)

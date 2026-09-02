@@ -92,6 +92,8 @@ class ReinforceConfig:
 class InstanceConfig:
     min_targets: int = 7
     max_targets: int = 7
+    min_agents: int | None = None
+    max_agents: int | None = None
 
     def __post_init__(self):
         if self.min_targets < 1:
@@ -99,6 +101,15 @@ class InstanceConfig:
         if self.max_targets < self.min_targets:
             raise ValueError(
                 "instances.max_targets must be at least instances.min_targets")
+        if (self.min_agents is None) != (self.max_agents is None):
+            raise ValueError(
+                "instances.min_agents and instances.max_agents must be set together")
+        if self.min_agents is not None:
+            if self.min_agents < 1:
+                raise ValueError("instances.min_agents must be positive")
+            if self.max_agents < self.min_agents:
+                raise ValueError(
+                    "instances.max_agents must be at least instances.min_agents")
 
 
 @dataclass(frozen=True)

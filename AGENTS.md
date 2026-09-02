@@ -176,10 +176,12 @@ uv run python -m learning.test learning/checkpoints/<run-directory> --device cud
 uv run python -m learning.test learning/checkpoints/<run-directory> --device cuda --render
 ```
 
-The default learning config currently uses 3 target types, 5-9 targets, 4
-agents, CUDA, and Weights & Biases logging. For local smoke runs, override
-`--episodes` and `--device`; disable `training.wandb` in a temporary config when
-external logging is not intended. MP4 creation requires `ffmpeg`.
+The default learning config currently uses 3 target types, 5-9 targets, and
+3-6 randomly generated agents whose capabilities collectively cover every
+target type and include at least one scout. It uses CUDA and Weights & Biases
+logging. `--num-agents` fixes the count for a run. For local smoke runs,
+override `--episodes` and `--device`; disable `training.wandb` in a temporary
+config when external logging is not intended. MP4 creation requires `ffmpeg`.
 
 ## Working conventions
 

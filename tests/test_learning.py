@@ -15,7 +15,11 @@ import yaml
 from Real_Life_Maps.real_map_generation import RealTerrainGrid
 from learning.policy.candidates import (Candidate, CandidateTerrainCache,
                                         generate_candidates)
-from learning.policy.configuration import LearningConfig, load_config
+from learning.policy.configuration import (
+    InstanceConfig,
+    LearningConfig,
+    load_config,
+)
 from learning.gpu_sim.routing import GridRouter
 from learning.gpu_sim.cugraph_router import CuGraphRouter
 from learning.gpu_sim.state import TensorEpisodeState
@@ -30,10 +34,11 @@ from learning.policy.oracle import parallel_tsp
 from learning.policy.adapter import LearnedPolicyAdapter
 from learning.gpu_sim.rollout_cpu import calculate_episode_return, collect_episode
 from learning.gpu_sim.rollout_gpu import DecisionTrace, replay_tensor_gradients
-from learning.train import train
+from learning.train import _episode_agent_count, train
 from simulation.agent import Agent
 from simulation.domain import UNKNOWN_TYPE, init_target_types
 from simulation.engine import run_simulation
+from simulation.rendering import _agent_color, _stacked_agent_label_offsets
 
 
 def _line(length=5):
@@ -98,6 +103,14 @@ def test_real_terrain_visibility_cache_is_persistent_and_dem_keyed():
         assert not changed.compute_all_visibilities(
             max_radius=2, angular_res=8, cache_dir=directory)
         assert len(list(Path(directory).glob("*.pkl"))) == 2
+
+
+def test_rendering_uses_distinct_agent_colors_and_stacks_shared_labels():
+    colors = [_agent_color(index) for index in range(6)]
+    assert len(set(colors)) == 6
+    assert _stacked_agent_label_offsets(
+        [(1, 2), (3, 4), (1.0, 2.0), (1, 2)]) == [
+            (0, 16), (0, 16), (0, 36), (0, 56)]
 
 
 def _graph_model(num_target_types=2, use_critic=True):
@@ -232,6 +245,26 @@ training:
     assert config.training.reinforce_batch_size == 3
     assert config.instances.min_targets == 7
     assert config.instances.max_targets == 7
+    assert config.instances.min_agents is None
+    assert config.instances.max_agents is None
+
+
+def test_episode_agent_count_uses_seeded_range_and_fixed_overrides():
+    instances = InstanceConfig(
+        min_targets=5, max_targets=9, min_agents=3, max_agents=6)
+    counts = [
+        _episode_agent_count(seed, 4, instances)
+        for seed in range(32)
+    ]
+    assert counts == [
+        _episode_agent_count(seed, 4, instances)
+        for seed in range(32)
+    ]
+    assert set(counts) == {3, 4, 5, 6}
+    assert _episode_agent_count(
+        0, 4, instances, requested_num_agents=5) == 5
+    assert _episode_agent_count(
+        0, 4, instances, agent_capabilities=[{0}, {1}, {2}]) == 3
 
 
 def test_parallel_tsp_partitions_targets_to_minimize_makespan():
@@ -310,6 +343,8 @@ def test_yaml_configuration_loads_and_validates():
     assert config.candidates.include_wait
     assert config.instances.min_targets == 5
     assert config.instances.max_targets == 9
+    assert config.instances.min_agents == 3
+    assert config.instances.max_agents == 6
     assert config.training.simulation_batch_size >= 1
     assert config.training.reinforce_batch_size >= 1
     assert config.training.device in {"auto", "cpu", "cuda"}
