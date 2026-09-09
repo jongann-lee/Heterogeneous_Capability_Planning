@@ -28,9 +28,14 @@ def calculate_episode_return(result, death_penalty=100.0,
         return (-makespan - death_penalty * deaths
                 - incomplete_penalty * remaining)
     oracle = float(oracle_makespan)
-    if oracle <= 0:
-        raise ValueError("oracle_makespan must be positive")
-    normalized_regret = makespan / oracle - 1.0
+    if oracle < 0:
+        raise ValueError("oracle_makespan must be nonnegative")
+    if oracle == 0.0:
+        if remaining or makespan != 0.0:
+            raise ValueError("a zero oracle makespan is valid only for a targetless episode")
+        normalized_regret = 0.0
+    else:
+        normalized_regret = makespan / oracle - 1.0
     return (-normalized_regret - death_penalty * deaths
             - incomplete_penalty * remaining)
 
@@ -64,8 +69,10 @@ def collect_episode(env_map, ground_truth, agents, adapter,
     episode_return = calculate_episode_return(
         result, death_penalty, incomplete_penalty, oracle_makespan)
     result["oracle_makespan"] = oracle_makespan
+    result["fi_opt_makespan"] = oracle_makespan
     result["normalized_regret"] = (
         None if oracle_makespan is None else
+        0.0 if float(oracle_makespan) == 0.0 else
         float(result["makespan"]) / float(oracle_makespan) - 1.0)
     return Rollout(
         result, episode_return, logp, entropy,

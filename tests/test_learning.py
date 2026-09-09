@@ -3,7 +3,8 @@
 import copy
 from collections import OrderedDict
 from dataclasses import replace
-from itertools import combinations
+from itertools import combinations, permutations, product
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -15,6 +16,15 @@ import torch
 import yaml
 
 from Real_Life_Maps.real_map_generation import RealTerrainGrid
+from learning.analyze import analyze_evaluation, format_analysis
+from learning.evaluation_suite import (
+    AgentConfiguration,
+    EvaluationCase,
+    TargetConfiguration,
+    TargetDefinition,
+    load_evaluation_suite,
+    select_evaluation_cases,
+)
 from learning.policy.candidates import (
     Candidate,
     CandidateScenarioCache,
@@ -40,10 +50,26 @@ from learning.modules import AssignmentDecoder, DecoderOutput
 from learning.gpu_sim.observation_cpu import batch_observations, build_observation
 from learning.gpu_sim.observation_gpu import TensorObservationBuilder
 from learning.policy.oracle import parallel_tsp
+from planning.full_information import (
+    FullInformationInfeasibleError,
+    full_information_makespan,
+    solve_full_information,
+)
+from planning.policies.scout_then_execute import (
+    ScoutThenExecutePolicy,
+    solve_cooperative_scouting,
+)
+from planning.policies.scout_wrp import solve_cover_walk
 from learning.policy.adapter import LearnedPolicyAdapter
 from learning.gpu_sim.rollout_cpu import calculate_episode_return, collect_episode
-from learning.gpu_sim.rollout_gpu import DecisionTrace, replay_tensor_gradients
+from learning.gpu_sim.rollout_gpu import (
+    DecisionTrace,
+    collect_tensor_episodes,
+    replay_tensor_gradients,
+)
 from learning.train import _episode_agent_count, train
+from learning.test import _cuda_batch_plan, evaluate as evaluate_suite
+import learning.test as evaluation_module
 from simulation.agent import Agent
 from simulation.domain import UNKNOWN_TYPE, init_target_types
 from simulation.engine import run_simulation
@@ -148,6 +174,281 @@ def test_real_terrain_visibility_cache_is_persistent_and_dem_keyed():
         assert not changed.compute_all_visibilities(
             max_radius=2, angular_res=8, cache_dir=directory)
         assert len(list(Path(directory).glob("*.pkl"))) == 2
+
+
+def test_development_evaluation_suite_preserves_original_rps_case():
+    suite, path = load_evaluation_suite("development")
+    assert path.name == "wv_rps_fixed_v1.json"
+    assert suite.suite_id == "wv_rps_fixed_v1"
+    assert suite.source_position == (0, 0)
+    assert len(suite.agent_configurations) == 1
+    assert len(suite.target_configurations) == 1
+    case = select_evaluation_cases(suite)[0]
+    assert case.scenario_id == "rps_agents__rps_targets"
+    assert case.agent.capabilities == tuple(map(frozenset, (
+        {0}, {1}, {2}, {3})))
+    assert [target.position for target in case.target.targets] == [
+        (14, 54), (1, 29), (33, 17), (34, 35),
+        (63, 37), (37, 5), (49, 58),
+    ]
+    assert [target.target_type for target in case.target.targets] == [
+        1, 2, 2, 1, 2, 3, 3]
+
+
+def test_factorial_evaluation_suite_has_180_filterable_cases():
+    suite, path = load_evaluation_suite("test")
+    explicit, explicit_path = load_evaluation_suite(path)
+    assert explicit == suite
+    assert explicit_path == path
+    assert path.name == "wv_factorial_test_v1.json"
+    assert len(suite.agent_configurations) == 12
+    assert len(suite.target_configurations) == 15
+    assert len(select_evaluation_cases(suite)) == 180
+    for count in range(3, 7):
+        assert sum(item.agent_count == count
+                   for item in suite.agent_configurations) == 3
+    for count in range(5, 10):
+        assert sum(item.target_count == count
+                   for item in suite.target_configurations) == 3
+    filtered = select_evaluation_cases(
+        suite, agent_count=4, target_count=8)
+    assert len(filtered) == 9
+    assert len(select_evaluation_cases(
+        suite, agent_config="agents_04_b",
+        target_config="targets_08_c")) == 1
+    assert select_evaluation_cases(suite, limit=1)[0].scenario_id == (
+        "agents_03_a__targets_05_a")
+
+    plan = _cuda_batch_plan(select_evaluation_cases(suite))
+    batches = [batch for _target_id, target_batches in plan
+               for batch in target_batches]
+    assert len(plan) == 15
+    assert len(batches) == 60
+    assert {len(batch) for batch in batches} == {3}
+    for batch in batches:
+        assert len({case.target.id for _index, case in batch}) == 1
+        assert len({case.agent.agent_count for _index, case in batch}) == 1
+
+
+def test_factorial_targets_have_one_alternating_heavy_and_multi_clusters():
+    suite, _path = load_evaluation_suite("test")
+    expected_heavy_type = {5: 1, 6: 2, 7: 1, 8: 2, 9: 1}
+    expected_cluster_sizes = {
+        5: [2, 3],
+        6: [3, 3],
+        7: [2, 2, 3],
+        8: [2, 3, 3],
+        9: [3, 3, 3],
+    }
+    for target_count, heavy_type in expected_heavy_type.items():
+        configurations = [
+            item for item in suite.target_configurations
+            if item.target_count == target_count
+        ]
+        assert {item.profile for item in configurations} == {
+            "balanced", f"type_{heavy_type}_heavy",
+            "multi_cluster_balanced"}
+        heavy = next(item for item in configurations
+                     if item.profile.endswith("_heavy"))
+        type_counts = {
+            target_type: sum(target.target_type == target_type
+                             for target in heavy.targets)
+            for target_type in range(1, 4)
+        }
+        assert type_counts[heavy_type] > max(
+            count for target_type, count in type_counts.items()
+            if target_type != heavy_type)
+        clustered = next(
+            item for item in configurations
+            if item.profile == "multi_cluster_balanced")
+        positions = [target.position for target in clustered.targets]
+        unseen = set(range(len(positions)))
+        components = []
+        while unseen:
+            component = {unseen.pop()}
+            frontier = list(component)
+            while frontier:
+                current = frontier.pop()
+                row, column = positions[current]
+                neighbors = {
+                    index for index in unseen
+                    if max(abs(positions[index][0] - row),
+                           abs(positions[index][1] - column)) <= 4
+                }
+                unseen -= neighbors
+                component |= neighbors
+                frontier.extend(neighbors)
+            components.append(component)
+        assert sorted(map(len, components)) == expected_cluster_sizes[
+            target_count]
+        cluster_type_counts = [
+            sum(target.target_type == target_type
+                for target in clustered.targets)
+            for target_type in range(1, 4)
+        ]
+        assert max(cluster_type_counts) - min(cluster_type_counts) <= 1
+
+
+def test_cuda_evaluation_executes_compatible_cases_in_one_batch():
+    if not torch.cuda.is_available():
+        return
+    env = nx.DiGraph()
+    for node, position, node_type in (
+        (0, (0, 0), "source"),
+        (1, (1, 0), "intermediate"),
+        (2, (2, 1), "target_unreached"),
+        (3, (2, -1), "target_unreached"),
+    ):
+        env.add_node(
+            node, pos=position, height=0.0, type=node_type,
+            visible_edges=[])
+    for source, target in (
+        (0, 1), (1, 0), (1, 2), (2, 1), (1, 3), (3, 1),
+    ):
+        env.add_edge(
+            source, target, distance=1.0, observed_edge=False)
+    # Both target types are known at time zero. This regression tests CUDA
+    # suite batching, not exploration by a randomly initialized policy.
+    env.nodes[0]["visible_edges"] = [(1, 2), (1, 3)]
+    truth = env.copy()
+    init_target_types(env, truth, {2: 1, 3: 2})
+
+    target_configuration = TargetConfiguration(
+        "targets", 2, "synthetic",
+        (TargetDefinition((2, 1), 1), TargetDefinition((2, -1), 2)))
+    agent_configurations = (
+        AgentConfiguration(
+            "agents_a", 2, "synthetic",
+            (frozenset({0, 1}), frozenset({2}))),
+        AgentConfiguration(
+            "agents_b", 2, "synthetic",
+            (frozenset({0, 2}), frozenset({1}))),
+    )
+    cases = [
+        EvaluationCase(
+            "synthetic", f"{agents.id}__targets", 0, 2,
+            agents, target_configuration)
+        for agents in agent_configurations
+    ]
+    config = load_config()
+    config = replace(config, model=replace(
+        config.model, num_target_types=2, model_dim=32, num_heads=4,
+        message_passing_blocks=1, distance_embedding_dim=8,
+        critic_hidden_dim=16))
+    class TargetsFirst(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+            self.decoder = AssignmentDecoder()
+
+        def decode(self, observation, training=False):
+            target_actions = observation.serves_mask.any(dim=2)
+            logits = observation.task_agent_features.new_full(
+                observation.feasible_action_mask.shape, -20.0
+            )
+            logits = torch.where(
+                target_actions[:, None], logits.new_tensor(20.0), logits
+            ) + self.anchor * 0.0
+            return self.decoder(
+                logits,
+                observation.feasible_action_mask,
+                observation.action_capacities,
+                training=training,
+                candidate_physical_group=observation.candidate_physical_group,
+                physical_group_capacity=observation.physical_group_capacity,
+                physical_group_representative=(
+                    observation.physical_group_representative
+                ),
+                physical_group_mask=observation.physical_group_mask,
+            )
+
+    model = TargetsFirst().to("cuda").eval()
+    with patch.object(
+            evaluation_module, "_case_factory",
+            return_value=(env, truth, [])):
+        records = evaluation_module._gpu_suite_records(
+            model, config, cases, "cuda")
+    assert len(records) == 2
+    assert {record["evaluation_batch_id"] for record in records} == {0}
+    assert {record["evaluation_batch_size"] for record in records} == {2}
+
+
+def test_evaluation_render_requires_one_filtered_scenario():
+    missing_checkpoint = Path("/definitely/missing/checkpoint.pt")
+    for filters in ({}, {"agent_count": 4, "target_count": 8}):
+        try:
+            evaluate_suite(
+                missing_checkpoint, suite="test", render=True, **filters)
+        except ValueError as error:
+            assert str(error) == (
+                "--render requires exactly one selected evaluation scenario")
+        else:
+            raise AssertionError("multi-scenario rendering was accepted")
+
+    for filters in (
+        {"agent_config": "agents_04_b", "target_config": "targets_08_c"},
+        {"limit": 1},
+    ):
+        try:
+            evaluate_suite(
+                missing_checkpoint, suite="test", render=True, **filters)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError(
+                "single-scenario rendering did not reach checkpoint")
+
+
+def test_evaluation_analysis_aggregates_size_and_failure_metrics():
+    def record(identifier, agents, targets, makespan, completed, deaths,
+               remaining, regret, stalled=False, all_dead=False):
+        return {
+            "suite_id": "synthetic_suite",
+            "scenario_id": identifier,
+            "agent_count": agents,
+            "target_count": targets,
+            "makespan": makespan,
+            "normalized_regret": regret,
+            "completed": completed,
+            "deaths": deaths,
+            "remaining_targets": remaining,
+            "stalled": stalled,
+            "all_agents_dead": all_dead,
+        }
+
+    payload = {
+        "suite_id": "synthetic_suite",
+        "scenarios": [
+            record("a", 3, 5, 10.0, True, 0, 0, 0.1),
+            record("b", 3, 5, 14.0, False, 1, 2, 0.4, stalled=True),
+            record("c", 4, 5, 8.0, True, 2, 0, -0.1),
+        ],
+    }
+    analysis = analyze_evaluation(payload)
+    overall = analysis["overall"]
+    assert overall["scenario_count"] == 3
+    assert overall["completion_count"] == 2
+    assert abs(overall["failure_rate"] - 1 / 3) < 1e-12
+    assert overall["total_deaths"] == 3
+    assert abs(overall["death_scenario_rate"] - 2 / 3) < 1e-12
+    assert abs(overall["agent_mortality_rate"] - 0.3) < 1e-12
+    assert overall["completed_makespan"] == {
+        "count": 2, "mean": 9.0, "std": 1.0}
+
+    by_size = {
+        (item["agent_count"], item["target_count"]): item
+        for item in analysis["by_agent_and_target_count"]
+    }
+    assert by_size[(3, 5)]["makespan"] == {
+        "count": 2, "mean": 12.0, "std": 2.0}
+    assert by_size[(3, 5)]["completion_rate"] == 0.5
+    assert by_size[(4, 5)]["makespan"] == {
+        "count": 1, "mean": 8.0, "std": 0.0}
+    rendered = format_analysis(analysis)
+    assert "Makespan by problem size" in rendered
+    assert "Completion by problem size" in rendered
+    assert "Scenarios with a death: 2/3 (66.67%)" in rendered
+    assert "Agent deaths: 3/10 deployed (30.00%)" in rendered
 
 
 def test_rendering_uses_distinct_agent_colors_and_stacks_shared_labels():
@@ -327,6 +628,366 @@ def test_parallel_tsp_partitions_targets_to_minimize_makespan():
     assert parallel_tsp(graph, agents) == 3.0
 
 
+def _full_information_route_graph():
+    graph = nx.DiGraph()
+    for node, node_type in (
+        ("s", "source"), ("x", "intermediate"),
+        ("a", "target_unreached"), ("b", "target_unreached"),
+    ):
+        graph.add_node(node, type=node_type, pos=(0, 0), visible_edges=[])
+    graph.nodes["a"]["rps_type"] = 1
+    graph.nodes["b"]["rps_type"] = 2
+    for source, target, distance in (
+        ("s", "x", 1.0), ("x", "a", 1.0), ("x", "b", 3.0),
+        ("a", "x", 7.0), ("b", "x", 2.0),
+    ):
+        graph.add_edge(source, target, distance=distance, observed_edge=False)
+    return graph
+
+
+def test_full_information_plan_is_complete_disjoint_and_executable():
+    truth = _full_information_route_graph()
+    agents = [
+        Agent("s", capabilities={1}),
+        Agent("s", capabilities={2}),
+        Agent("s", capabilities=set()),
+    ]
+    graph_before = copy.deepcopy(nx.node_link_data(truth))
+    agent_before = [copy.deepcopy(agent.__dict__) for agent in agents]
+    plan = solve_full_information(truth, agents)
+    assert plan.feasible and plan.exact
+    assigned = [target for values in plan.assignments for target in values]
+    assert sorted(assigned) == ["a", "b"]
+    assert len(set(assigned)) == len(assigned)
+    assert plan.assignments[2] == () and plan.paths[2] == ("s",)
+    assert plan.makespan == 4.0
+    assert full_information_makespan(truth, agents) == plan.makespan
+    assert nx.node_link_data(truth) == graph_before
+    assert [agent.__dict__ for agent in agents] == agent_before
+
+    env = truth.copy()
+    init_target_types(env, truth, {"a": 1, "b": 2})
+    for agent, route in zip(agents, plan.paths):
+        agent.planned_path = list(route)
+    result = run_simulation(
+        env, truth, agents,
+        policy=lambda _env, _agents, **_kwargs: None,
+    )
+    assert result["completed"] and not result["deaths"]
+    assert result["makespan"] == plan.makespan
+
+
+def test_full_information_routes_record_incidental_supported_targets():
+    graph = nx.DiGraph()
+    for node, node_type, target_type in (
+        ("s", "source", None), ("a", "target_unreached", 1),
+        ("b", "target_unreached", 1),
+    ):
+        graph.add_node(node, type=node_type, rps_type=target_type)
+    graph.add_edge("s", "a", distance=1.0)
+    graph.add_edge("a", "b", distance=1.0)
+    plan = solve_full_information(graph, [Agent("s", capabilities={1})])
+    assert plan.feasible
+    assert plan.assignments == (("a", "b"),)
+    assert plan.target_orders == (("a", "b"),)
+    assert plan.paths == (("s", "a", "b"),)
+
+
+def test_full_information_can_revisit_an_already_serviced_target():
+    graph = nx.DiGraph()
+    for node, node_type in (
+        ("s", "source"), ("a", "target_unreached"),
+        ("b", "target_unreached"), ("c", "target_unreached"),
+    ):
+        graph.add_node(node, type=node_type, rps_type=1)
+    for source, target in (
+        ("s", "a"), ("a", "b"), ("b", "a"), ("a", "c"),
+    ):
+        graph.add_edge(source, target, distance=1.0)
+    plan = solve_full_information(graph, [Agent("s", capabilities={1})])
+    assert plan.feasible and plan.makespan == 4.0
+    assert plan.paths == (("s", "a", "b", "a", "c"),)
+    assert plan.target_orders == (("a", "b", "c"),)
+
+
+def test_full_information_never_relies_on_another_agent_clearing_a_target():
+    graph = nx.DiGraph()
+    for node, node_type, target_type in (
+        ("s", "source", None), ("a", "target_unreached", 1),
+        ("b", "target_unreached", 2),
+    ):
+        graph.add_node(node, type=node_type, rps_type=target_type)
+    graph.add_edge("s", "a", distance=1.0)
+    graph.add_edge("a", "b", distance=1.0)
+    agents = [Agent("s", capabilities={1}), Agent("s", capabilities={2})]
+    plan = solve_full_information(graph, agents)
+    assert not plan.feasible
+    assert "executable" in plan.diagnostic["message"]
+    try:
+        full_information_makespan(graph, agents)
+    except FullInformationInfeasibleError as error:
+        assert error.diagnostic == plan.diagnostic
+    else:
+        raise AssertionError("scalar FI-OPT did not report infeasibility")
+
+    unsupported = graph.copy()
+    unsupported.nodes["b"]["rps_type"] = 3
+    unsupported_plan = solve_full_information(unsupported, agents)
+    assert not unsupported_plan.feasible
+    assert unsupported_plan.diagnostic["targets"] == ["b"]
+
+
+def test_full_information_handles_overlap_asymmetry_release_and_permutations():
+    graph = _full_information_route_graph()
+    agents = [
+        Agent("s", capabilities={1, 2}),
+        Agent("s", capabilities={1}),
+    ]
+    first = full_information_makespan(
+        graph, agents, release_times=[2.0, 0.0])
+    second = full_information_makespan(
+        graph, list(reversed(agents)), release_times=[0.0, 2.0])
+    assert first == second == 6.0
+    assert graph.edges["a", "x"]["distance"] == 7.0
+
+    reordered = nx.DiGraph()
+    for node in reversed(list(graph.nodes)):
+        reordered.add_node(node, **graph.nodes[node])
+    for source, target, data in reversed(list(graph.edges(data=True))):
+        reordered.add_edge(source, target, **data)
+    assert full_information_makespan(
+        reordered, agents, release_times=[2.0, 0.0]) == first
+
+
+def test_full_information_matches_brute_force_on_a_small_complete_graph():
+    graph = nx.DiGraph()
+    targets = ("a", "b", "c")
+    types = {"a": 1, "b": 1, "c": 2}
+    for node in ("s", *targets):
+        graph.add_node(
+            node,
+            type="source" if node == "s" else "target_unreached",
+            rps_type=types.get(node),
+        )
+    distances = {
+        ("s", "a"): 2, ("s", "b"): 4, ("s", "c"): 3,
+        ("a", "b"): 1, ("a", "c"): 5,
+        ("b", "a"): 2, ("b", "c"): 1,
+        ("c", "a"): 1, ("c", "b"): 3,
+    }
+    for edge, distance in distances.items():
+        graph.add_edge(*edge, distance=float(distance))
+    agents = [
+        Agent("s", capabilities={0, 1, 2}),
+        Agent("s", capabilities={1}),
+    ]
+
+    brute = float("inf")
+    for owners in product(range(len(agents)), repeat=len(targets)):
+        if any(
+            not agents[owner].can_service(types[target])
+            for target, owner in zip(targets, owners)
+        ):
+            continue
+        finish = []
+        for agent_index in range(len(agents)):
+            jobs = [
+                target for target, owner in zip(targets, owners)
+                if owner == agent_index
+            ]
+            if not jobs:
+                finish.append(0.0)
+                continue
+            finish.append(min(
+                sum(
+                    distances[("s" if index == 0 else order[index - 1], target)]
+                    for index, target in enumerate(order)
+                )
+                for order in permutations(jobs)
+            ))
+        brute = min(brute, max(finish))
+    assert full_information_makespan(graph, agents) == brute
+
+
+def test_full_information_targetless_normalization_has_no_divide_by_zero():
+    graph = _line(2)
+    agents = [Agent(0, capabilities={1})]
+    assert full_information_makespan(graph, agents) == 0.0
+    result = {
+        "makespan": 0.0, "num_deaths": 0, "remaining_targets": [],
+    }
+    assert calculate_episode_return(result, oracle_makespan=0.0) == 0.0
+
+
+def _cooperative_visibility_graph():
+    graph = nx.DiGraph()
+    positions = {
+        "s": (0, 0), "l1": (-1, 0), "l2": (-2, 0),
+        "r1": (1, 0), "r2": (2, 0),
+        "tl": (-2, 1), "tr": (2, 1),
+    }
+    for node, position in positions.items():
+        graph.add_node(
+            node, pos=position, height=0.0,
+            type=("source" if node == "s" else
+                  "target_unreached" if node in {"tl", "tr"} else
+                  "intermediate"),
+            visible_edges=[],
+        )
+    for source, target in (
+        ("s", "l1"), ("l1", "l2"), ("s", "r1"), ("r1", "r2"),
+        ("l2", "tl"), ("r2", "tr"),
+    ):
+        graph.add_edge(source, target, distance=1.0, observed_edge=False)
+        graph.add_edge(target, source, distance=1.0, observed_edge=False)
+    graph.nodes["l2"]["visible_edges"] = [("l2", "tl")]
+    graph.nodes["r2"]["visible_edges"] = [("r2", "tr")]
+    graph.nodes["tl"]["rps_type"] = UNKNOWN_TYPE
+    graph.nodes["tr"]["rps_type"] = UNKNOWN_TYPE
+    return graph
+
+
+def test_cooperative_scouting_uses_all_scouts_and_minimizes_last_reveal():
+    env = _cooperative_visibility_graph()
+    beliefs_before = {
+        target: env.nodes[target]["rps_type"] for target in ("tl", "tr")
+    }
+    scouts = [Agent("s", capabilities={0}), Agent("s", capabilities={0, 1})]
+    plan = solve_cooperative_scouting(env, scouts)
+    assert plan.feasible and plan.exact
+    assert plan.makespan == 2.0
+    assert all(plan.responsibilities)
+    assert {target for values in plan.responsibilities for target in values} == {
+        "tl", "tr"
+    }
+    assert all(path[0] == "s" for path in plan.paths)
+    assert {
+        target: env.nodes[target]["rps_type"] for target in ("tl", "tr")
+    } == beliefs_before
+
+    pure_plan = solve_cooperative_scouting(
+        env,
+        [Agent("s", capabilities={0}), Agent("s", capabilities={0})],
+    )
+    assert pure_plan.makespan == plan.makespan
+    assert pure_plan.paths == plan.paths
+
+    single = solve_cooperative_scouting(env, scouts[:1])
+    wrp_path, wrp_schedule, missing, _stats = solve_cover_walk(
+        env, "s", ["tl", "tr"], {"tl", "tr"}, weight=1.0)
+    assert not missing and wrp_path is not None
+    assert single.makespan == max(wrp_schedule.values()) == 6.0
+
+
+def test_strict_scout_then_execute_waits_and_matches_phase_prediction():
+    env = _cooperative_visibility_graph()
+    truth = env.copy()
+    init_target_types(env, truth, {"tl": 1, "tr": 1})
+    agents = [
+        Agent("s", capabilities={0}), Agent("s", capabilities={0}),
+        Agent("s", capabilities={1}),
+    ]
+    policy = ScoutThenExecutePolicy()
+    result = run_simulation(env, truth, agents, policy=policy)
+    assert result["completed"] and not result["deaths"]
+    assert policy.diagnostics["scouting_completion_time"] == 2.0
+    assert result["makespan"] == policy.diagnostics["predicted_makespan"]
+    json.dumps(policy.diagnostics)
+    first_service = min(
+        event["time"] for event in result["events"]
+        if event["event"] == "agent_wins"
+    )
+    assert first_service > policy.diagnostics["scouting_completion_time"]
+    assert agents[2].trajectory[0] == "s"
+
+
+def test_hybrid_scouts_join_overlapping_full_information_execution():
+    env = _cooperative_visibility_graph()
+    truth = env.copy()
+    init_target_types(env, truth, {"tl": 1, "tr": 2})
+    agents = [
+        Agent("s", capabilities={0, 1}),
+        Agent("s", capabilities={0, 2}),
+        Agent("s", capabilities={1, 2}),
+    ]
+    policy = ScoutThenExecutePolicy()
+    result = run_simulation(env, truth, agents, policy=policy)
+    assert result["completed"] and not result["deaths"]
+    assert "tl" in policy.diagnostics["fi_assignments"][0]
+    assert "tr" in policy.diagnostics["fi_assignments"][1]
+    assert agents[0].trajectory[-1] == "tl"
+    assert agents[1].trajectory[-1] == "tr"
+
+
+def test_scout_then_execute_reports_unscoutable_and_handles_transit_boundary():
+    env = _cooperative_visibility_graph()
+    env.nodes["r2"]["visible_edges"] = []
+    scouts = [Agent("s", capabilities={0}), Agent("s", capabilities={0, 1})]
+    plan = solve_cooperative_scouting(env, scouts)
+    assert not plan.feasible and plan.unscoutable == ("tr",)
+
+    graph = nx.DiGraph()
+    for node, node_type in (
+        ("s", "source"), ("x", "intermediate"),
+        ("t", "target_unreached"),
+    ):
+        graph.add_node(node, type=node_type, rps_type=1, visible_edges=[])
+    graph.add_edge("s", "x", distance=3.0)
+    graph.add_edge("x", "t", distance=4.0)
+    agent = Agent("s", capabilities={0, 1})
+    policy = ScoutThenExecutePolicy()
+    policy.set_runtime_state([agent], [("s", "x", 0.0, 3.0)], 1.0)
+    policy(graph, [agent])
+    assert policy.phase == "execution"
+    assert agent.planned_path == ["x", "t"]
+    assert policy.diagnostics["execution_makespan_estimate"] == 6.0
+    assert policy.diagnostics["predicted_makespan"] == 7.0
+
+
+def test_classical_evaluation_needs_no_checkpoint_or_model_load():
+    truth = _line(3)
+    truth.nodes[2].update(type="target_unreached", rps_type=1)
+    env = truth.copy()
+    env.nodes[2]["rps_type"] = UNKNOWN_TYPE
+
+    def factory(_case):
+        return env.copy(), truth.copy(), [Agent(0, capabilities={1})]
+
+    with patch.object(evaluation_module, "_case_factory", side_effect=factory), \
+            patch.object(torch, "load", side_effect=AssertionError("loaded weights")):
+        records, _summary, _config, weights, _suite, _path = evaluate_suite(
+            None, suite="development", limit=1, policy="fi-opt", device="cuda")
+    assert weights is None
+    assert records[0]["completed"]
+    assert abs(records[0]["normalized_regret"]) < 1e-12
+    assert records[0]["simulation_backend"] == "cpu_classical"
+
+    scout_env = _cooperative_visibility_graph()
+    scout_truth = scout_env.copy()
+    init_target_types(scout_env, scout_truth, {"tl": 1, "tr": 1})
+
+    def scout_factory(_case):
+        return (
+            scout_env.copy(), scout_truth.copy(),
+            [Agent("s", capabilities={0}), Agent("s", capabilities={1})],
+        )
+
+    with patch.object(evaluation_module, "_case_factory", side_effect=scout_factory), \
+            patch.object(torch, "load", side_effect=AssertionError("loaded weights")):
+        scout_records, *_rest = evaluate_suite(
+            None, suite="development", limit=1,
+            policy="scout-then-execute", episodes=2)
+    assert len(scout_records) == 2
+    assert all(record["completed"] for record in scout_records)
+
+    try:
+        evaluate_suite(None, suite="development", limit=1, policy="learned")
+    except ValueError as error:
+        assert "requires a checkpoint" in str(error)
+    else:
+        raise AssertionError("learned evaluation accepted a missing checkpoint")
+
+
 def test_oracle_normalized_return_applies_dimensionless_failure_penalties():
     result = {
         "makespan": 120.0, "num_deaths": 1,
@@ -347,6 +1008,34 @@ def test_oracle_reward_makes_immediate_stall_strictly_bad():
         stalled, death_penalty=1.0, incomplete_penalty=10.0,
         oracle_makespan=146.475743)
     assert abs(value - -69.0) < 1e-9
+
+
+def test_cpu_and_tensor_fi_normalized_rewards_match():
+    class FinishedTensorState:
+        clock = torch.tensor([120.0])
+        target_live = torch.tensor([[True, True]])
+        deaths = torch.tensor([1])
+        alive = torch.tensor([[True]])
+        moving = torch.tensor([[False]])
+        needs_replan = torch.tensor([[False]])
+        stalled = torch.tensor([True])
+
+        def completed(self):
+            return ~self.target_live.any(dim=1)
+
+    cpu = calculate_episode_return(
+        {"makespan": 120.0, "num_deaths": 1,
+         "remaining_targets": ["a", "b"]},
+        death_penalty=20.0, incomplete_penalty=60.0,
+        oracle_makespan=100.0,
+    )
+    tensor = collect_tensor_episodes(
+        None, FinishedTensorState(), None,
+        death_penalty=20.0, incomplete_penalty=60.0,
+        training=False, oracle_makespans=100.0,
+    )
+    assert abs(float(tensor.returns[0]) - cpu) < 1e-4
+    assert abs(float(tensor.normalized_regrets[0]) - 0.2) < 1e-6
 
 
 def test_tensor_episode_transition_matches_cpu_line_episode():

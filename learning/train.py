@@ -20,7 +20,7 @@ from learning.policy.configuration import (
 )
 from learning.policy.model import build_policy
 from learning.gpu_sim.instances import make_wv_dem_instance
-from learning.policy.oracle import parallel_tsp
+from learning.policy.oracle import full_information_makespan
 from learning.policy.adapter import LearnedPolicyAdapter
 from learning.policy.reinforce import (EMABaseline, batched_optimization_step,
                                        optimization_step)
@@ -171,7 +171,7 @@ def train(instance_factory, num_target_types, episodes=100,
     try:
         for episode in range(episodes):
             env, truth, agents = instance_factory(episode)
-            oracle_makespan = parallel_tsp(truth, agents)
+            oracle_makespan = full_information_makespan(truth, agents)
             adapter = LearnedPolicyAdapter(
                 model, num_target_types, training=True,
                 candidate_config=candidate_config, device=device)
@@ -192,6 +192,7 @@ def train(instance_factory, num_target_types, episodes=100,
                 "loss": loss,
                 "makespan": rollout.result["makespan"],
                 "oracle_makespan": oracle_makespan,
+                "fi_opt_makespan": oracle_makespan,
                 "normalized_regret": rollout.result["normalized_regret"],
                 "completed": rollout.result["completed"],
                 "actor_loss": loss_metrics["actor_loss"],
@@ -280,7 +281,7 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
         return episode_source, episode_caps, episode_types
 
     source, caps, types = encode_episode(world, truth, agents)
-    oracle_makespan = parallel_tsp(truth, agents)
+    oracle_makespan = full_information_makespan(truth, agents)
     random_overlay = instance_factory is not None and any(
         globals().get(name) is None for name in (
             "SOURCE_POSITION", "TARGET_POSITIONS", "TARGET_TYPES",
@@ -320,7 +321,7 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                                 model_config.architecture == "task_graph"))
                         source, caps, types = encode_episode(
                             world, batch_truth, batch_agents)
-                        oracle_makespan = parallel_tsp(
+                        oracle_makespan = full_information_makespan(
                             batch_truth, batch_agents)
                 state = TensorEpisodeState.create(
                     world, torch.full((current_batch,), source, device=device),
@@ -365,6 +366,8 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                         "loss": float(detached_losses[item]),
                         "makespan": float(rollout.makespans[item]),
                         "oracle_makespan": float(
+                            rollout.oracle_makespans[item]),
+                        "fi_opt_makespan": float(
                             rollout.oracle_makespans[item]),
                         "normalized_regret": float(
                             rollout.normalized_regrets[item]),
@@ -444,6 +447,9 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                                          for record in update_records) / update_size,
                     "mean_oracle_makespan": sum(
                         record["oracle_makespan"]
+                        for record in update_records) / update_size,
+                    "mean_fi_opt_makespan": sum(
+                        record["fi_opt_makespan"]
                         for record in update_records) / update_size,
                     "mean_normalized_regret": sum(
                         record["normalized_regret"]

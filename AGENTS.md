@@ -15,8 +15,9 @@ positive integer types are initially hidden. Agent capabilities are integers:
   active.
 
 The simulator objective is mission makespan plus a configurable death penalty.
-The learning objective normalizes makespan by a full-information parallel
-open-TSP oracle and adds dimensionless death and incompletion penalties.
+The learning objective normalizes makespan by the executable FI-OPT
+heterogeneous min-max makespan and adds dimensionless death and incompletion
+penalties.
 
 The package is `heterogeneous-capability-planning`, requires Python 3.12 or
 3.13, and has a working root `main.py` for the real-map benchmark.
@@ -36,6 +37,9 @@ The package is `heterogeneous-capability-planning`, requires Python 3.12 or
   - `rendering.py`: visualization and ffmpeg integration, kept outside the core
     engine import path.
 - `planning/`
+  - `full_information.py`: exact heterogeneous min-max open-route solver. Its
+    per-agent Dijkstra state is `(physical node, serviced-target mask)`, so it
+    exposes consistent scalar and reconstructed assignment/order/path results.
   - `policies/baseline1.py`: independent distance routing. Service agents
     prefer supported, unknown, then unsupported targets; pure scouts move to
     the tallest safe node.
@@ -43,6 +47,10 @@ The package is `heterogeneous-capability-planning`, requires Python 3.12 or
     service-capable scout a Watchman Route Problem covering walk, then uses the
     baseline-1 attacker layer. Exact A* is used through 12 scoutable unknown
     targets, with weighted A* above that threshold.
+  - `policies/scout_then_execute.py`: strict cooperative two-phase benchmark.
+    All scouts minimize the final reveal time while service-only agents wait;
+    the execution phase then commits to FI-OPT, including transit release
+    offsets at the phase boundary.
   - `finite_horizon.py`: older reward-driven Hungarian and sequential-greedy
     comparison planners; these are not benchmark defaults.
   - `legacy/`: retained comparison code, not an active entry point.
@@ -67,12 +75,20 @@ The package is `heterogeneous-capability-planning`, requires Python 3.12 or
     `cugraph_router.py`: batched CUDA simulation and cuGraph routing path.
     Independent exact route queries are deduplicated on-device and combined
     as disjoint graph copies for one GPU SSSP operation.
-  - `policy/oracle.py`: full-information min-max open-TSP normalization oracle.
+  - `policy/oracle.py`: compatibility import for the FI-OPT normalization
+    scalar in `planning/full_information.py`.
   - `train.py`: CPU/CUDA REINFORCE training. Timestamped checkpoints contain
     the resolved config, rolling latest/best-return weights, progress metadata,
     and final `trained_weights.pt`.
-  - `test.py`: deterministic checkpoint evaluation and optional post-rollout
-    rendering. `policy/evaluation.py` is a smaller legacy interface.
+  - `evaluation_suite.py` and `evaluation_suites/`: validated factorized fixed
+    evaluation definitions. `development` is the original one-case RPS setup;
+    `test` is the 12-by-15, 180-case WV factorial suite.
+  - `test.py`: deterministic suite-based learned, FI-OPT, and strict
+    Scout-Then-Execute evaluation with optional single-scenario rendering.
+    Only the learned mode requires a checkpoint. `policy/evaluation.py` is a
+    smaller legacy interface.
+  - `analyze.py`: compact post-processing for full evaluation JSON, including
+    agent-count/target-count matrices and overall failure/death diagnostics.
 - `Graph_Generation/`: visibility, blockage, target-graph, and stochastic
   diverse-path helpers used by older planners.
 - `Real_Life_Maps/`: bundled `WV_DEM.tif`, `WV_roads.pkl`, terrain builder, and
@@ -161,7 +177,18 @@ passed RNG where the API supports one.
   `reinforce_batch_size` controls optimizer accumulation. Legacy configs with
   `batch_size` map it to both fields.
 - Evaluation accepts a checkpoint run directory or weights path and normally
-  uses the configuration saved beside the weights.
+  uses the configuration saved beside the weights. It defaults to the
+  `development` suite; rendering is valid only after filters select one case.
+  Non-rendering CUDA evaluation batches cases only when they share a target
+  world and agent count, while reusing each target world across those batches.
+- FI-OPT routes are target-aware and independently executable: a supported
+  target encountered on a route belongs to that agent, and a target outside
+  its assignment is never used as a transit node. Do not replace this with an
+  ordinary all-node shortest-path metric closure.
+- Strict Scout-Then-Execute uses only planner-visible state during scouting.
+  Every scout-capable agent may participate, service-only agents wait, and the
+  final reveal triggers one FI-OPT plan over remaining targets. Moving agents
+  use committed destinations as starts and remaining edge times as releases.
 
 ## Environment and commands
 
@@ -185,7 +212,11 @@ uv run python -m simulation.real_map_benchmark --policy baseline2 --render
 # Learned policy
 uv run python -m learning.train --config learning/config.yaml --episodes 100 --device cpu
 uv run python -m learning.test learning/checkpoints/<run-directory> --device cuda
-uv run python -m learning.test learning/checkpoints/<run-directory> --device cuda --render
+uv run python -m learning.test learning/checkpoints/<run-directory> --suite test --device cuda
+uv run python -m learning.test --policy fi-opt --suite test
+uv run python -m learning.test --policy scout-then-execute --suite test
+uv run python -m learning.analyze outputs/evaluation/<result>.json
+uv run python -m learning.test learning/checkpoints/<run-directory> --suite development --device cuda --render
 ```
 
 The default learning config currently uses 3 target types, 5-9 targets, and

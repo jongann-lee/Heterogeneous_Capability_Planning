@@ -47,9 +47,12 @@ completion/type beliefs, action categories, raw safe-route distances, and
 typed action-target semantic relations. It receives no absolute coordinates,
 heights, or ground truth.
 
-Training returns are normalized against `learning.policy.oracle.parallel_tsp`, a
-full-information min-max open-TSP oracle over the terrain's shortest-path
-metric closure. The logged `normalized_regret` is
+Training returns are normalized against
+`planning.full_information.full_information_makespan`, the exact FI-OPT
+heterogeneous min-max open-route result. Unlike the retired optimistic metric
+closure, FI-OPT returns executable target-aware routes: crossing a supported
+live target records it in that agent's assignment, while targets outside the
+assignment cannot be transit nodes. The logged `normalized_regret` is
 `makespan / oracle_makespan - 1`; zero matches the oracle. Death and incomplete
 penalties are dimensionless and applied directly after makespan normalization,
 so an incomplete episode cannot exploit the oracle credit by stopping early.
@@ -61,8 +64,47 @@ uv run python -m learning.train --episodes 100
 uv run python -m learning.train --config learning/config.yaml
 uv run python -m learning.train --config learning/config_transformer.yaml
 uv run python -m learning.test learning/checkpoints/<run-timestamp> --device cuda
-uv run python -m learning.test learning/checkpoints/<run-timestamp> --device cuda --render
+uv run python -m learning.test --policy fi-opt --suite test
+uv run python -m learning.test --policy scout-then-execute --suite test
+uv run python -m learning.test learning/checkpoints/<run-timestamp> \
+  --suite test --output outputs/evaluation/<checkpoint-name>.json
+uv run python -m learning.analyze outputs/evaluation/<checkpoint-name>.json
+uv run python -m learning.test learning/checkpoints/<run-timestamp> \
+  --suite test --agent-config agents_04_b \
+  --target-config targets_08_c --render
 ```
+
+Evaluation always uses a validated fixed suite. `learned` is the default policy
+and requires the positional checkpoint; `fi-opt` and `scout-then-execute` do
+not load model weights and currently execute in the CPU simulator. FI-OPT knows
+all target types at time zero. Scout-Then-Execute jointly routes every living
+scout-capable agent, forces all service-only agents to wait for the last reveal,
+and then invokes the same FI-OPT solver. `--episodes N` repeats each selected
+case with consecutive recorded seeds. The default
+`development` alias resolves to the original single RPS scenario in
+`learning/evaluation_suites/wv_rps_fixed_v1.json`. The `test` alias resolves to
+`wv_factorial_test_v1.json`, whose 12 agent configurations and 15 target
+configurations form 180 deterministic scenarios. For each target count, the
+suite contains a dispersed balanced layout, one dispersed type-heavy layout
+(alternating type 1 and type 2), and a balanced multi-cluster layout. The
+multi-cluster case uses two separated clusters for 5-6 targets and three for
+7-9 targets, with only 2-3 targets in each cluster. CUDA
+evaluation batches the three compatible agent profiles sharing a target layout
+and agent count, requiring 60 tensor rollouts and 15 world constructions for
+the complete suite. `--agent-config`,
+`--target-config`, `--agent-count`, `--target-count`, and `--limit` filter that
+Cartesian product. An explicit suite JSON path can replace either alias.
+Rendering is accepted only when the final filtered selection contains exactly
+one scenario. Every result records both its resolved suite ID and scenario ID.
+
+`learning.analyze` keeps the full evaluation JSON as the raw reproducible
+artifact and prints a compact report derived from it. The report contains
+makespan mean/population-standard-deviation and completion matrices indexed by
+agent and target count. Its overall section reports failure, scenarios with at
+least one death, deaths per deployed agent, mean deaths, stalled and all-dead
+rates, remaining targets, and raw/completed-only normalized regret. Pass
+`--output <path>` to additionally save the compact aggregate as JSON; it will
+not overwrite an existing file.
 
 The optional test renderer records the deterministic CUDA tensor rollout and
 draws its event trace afterward; it does not recompute the policy or routes on

@@ -1,0 +1,293 @@
+{
+  "schema_version": 1,
+  "suite_id": "wv_factorial_test_v1",
+  "terrain_id": "wv_dem_64_v1",
+  "num_target_types": 3,
+  "source_position": [0, 0],
+  "agent_configurations": [
+    {
+      "id": "agents_03_a",
+      "agent_count": 3,
+      "profile": "specialist_minimal",
+      "capabilities": [[0, 1], [2], [3]]
+    },
+    {
+      "id": "agents_03_b",
+      "agent_count": 3,
+      "profile": "balanced_hybrid",
+      "capabilities": [[0, 2], [1, 3], [1, 2]]
+    },
+    {
+      "id": "agents_03_c",
+      "agent_count": 3,
+      "profile": "scout_redundant",
+      "capabilities": [[0, 1], [0, 2], [3]]
+    },
+    {
+      "id": "agents_04_a",
+      "agent_count": 4,
+      "profile": "specialists",
+      "capabilities": [[0], [1], [2], [3]]
+    },
+    {
+      "id": "agents_04_b",
+      "agent_count": 4,
+      "profile": "balanced_hybrid",
+      "capabilities": [[0, 1], [0, 2], [1, 3], [2, 3]]
+    },
+    {
+      "id": "agents_04_c",
+      "agent_count": 4,
+      "profile": "scout_redundant",
+      "capabilities": [[0, 1, 2], [0, 3], [1, 3], [2]]
+    },
+    {
+      "id": "agents_05_a",
+      "agent_count": 5,
+      "profile": "specialists_with_generalist",
+      "capabilities": [[0], [1], [2], [3], [1, 2, 3]]
+    },
+    {
+      "id": "agents_05_b",
+      "agent_count": 5,
+      "profile": "balanced_hybrid",
+      "capabilities": [[0, 1], [0, 2], [0, 3], [1, 2], [2, 3]]
+    },
+    {
+      "id": "agents_05_c",
+      "agent_count": 5,
+      "profile": "scout_redundant",
+      "capabilities": [[0], [0, 1], [1, 2], [2, 3], [1, 3]]
+    },
+    {
+      "id": "agents_06_a",
+      "agent_count": 6,
+      "profile": "specialists_with_redundancy",
+      "capabilities": [[0], [1], [2], [3], [1, 2], [2, 3]]
+    },
+    {
+      "id": "agents_06_b",
+      "agent_count": 6,
+      "profile": "balanced_hybrid",
+      "capabilities": [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]]
+    },
+    {
+      "id": "agents_06_c",
+      "agent_count": 6,
+      "profile": "scout_redundant",
+      "capabilities": [[0], [0], [1], [2], [3], [1, 2, 3]]
+    }
+  ],
+  "target_configurations": [
+    {
+      "id": "targets_05_a",
+      "target_count": 5,
+      "profile": "balanced",
+      "targets": [
+        {"position": [53, 48], "type": 2},
+        {"position": [30, 14], "type": 2},
+        {"position": [30, 11], "type": 1},
+        {"position": [13, 11], "type": 1},
+        {"position": [45, 10], "type": 3}
+      ]
+    },
+    {
+      "id": "targets_05_b",
+      "target_count": 5,
+      "profile": "type_1_heavy",
+      "targets": [
+        {"position": [32, 50], "type": 3},
+        {"position": [41, 51], "type": 2},
+        {"position": [42, 62], "type": 1},
+        {"position": [54, 46], "type": 1},
+        {"position": [52, 19], "type": 1}
+      ]
+    },
+    {
+      "id": "targets_05_c",
+      "target_count": 5,
+      "profile": "multi_cluster_balanced",
+      "targets": [
+        {"position": [11, 12], "type": 1},
+        {"position": [13, 11], "type": 2},
+        {"position": [12, 14], "type": 3},
+        {"position": [48, 50], "type": 1},
+        {"position": [51, 49], "type": 2}
+      ]
+    },
+    {
+      "id": "targets_06_a",
+      "target_count": 6,
+      "profile": "balanced",
+      "targets": [
+        {"position": [48, 45], "type": 3},
+        {"position": [40, 56], "type": 3},
+        {"position": [2, 54], "type": 2},
+        {"position": [30, 32], "type": 1},
+        {"position": [47, 19], "type": 2},
+        {"position": [29, 37], "type": 1}
+      ]
+    },
+    {
+      "id": "targets_06_b",
+      "target_count": 6,
+      "profile": "type_2_heavy",
+      "targets": [
+        {"position": [37, 60], "type": 2},
+        {"position": [33, 55], "type": 2},
+        {"position": [12, 38], "type": 1},
+        {"position": [11, 31], "type": 3},
+        {"position": [35, 56], "type": 2},
+        {"position": [18, 26], "type": 2}
+      ]
+    },
+    {
+      "id": "targets_06_c",
+      "target_count": 6,
+      "profile": "multi_cluster_balanced",
+      "targets": [
+        {"position": [8, 49], "type": 1},
+        {"position": [10, 51], "type": 2},
+        {"position": [11, 48], "type": 3},
+        {"position": [50, 12], "type": 1},
+        {"position": [52, 14], "type": 2},
+        {"position": [49, 15], "type": 3}
+      ]
+    },
+    {
+      "id": "targets_07_a",
+      "target_count": 7,
+      "profile": "balanced",
+      "targets": [
+        {"position": [4, 57], "type": 2},
+        {"position": [12, 62], "type": 1},
+        {"position": [0, 60], "type": 1},
+        {"position": [21, 16], "type": 2},
+        {"position": [3, 12], "type": 3},
+        {"position": [0, 21], "type": 3},
+        {"position": [63, 36], "type": 1}
+      ]
+    },
+    {
+      "id": "targets_07_b",
+      "target_count": 7,
+      "profile": "type_1_heavy",
+      "targets": [
+        {"position": [9, 50], "type": 3},
+        {"position": [16, 35], "type": 1},
+        {"position": [55, 30], "type": 2},
+        {"position": [7, 24], "type": 1},
+        {"position": [39, 37], "type": 1},
+        {"position": [50, 27], "type": 1},
+        {"position": [26, 60], "type": 1}
+      ]
+    },
+    {
+      "id": "targets_07_c",
+      "target_count": 7,
+      "profile": "multi_cluster_balanced",
+      "targets": [
+        {"position": [9, 10], "type": 1},
+        {"position": [11, 9], "type": 2},
+        {"position": [10, 12], "type": 3},
+        {"position": [49, 12], "type": 1},
+        {"position": [52, 13], "type": 2},
+        {"position": [30, 50], "type": 3},
+        {"position": [33, 52], "type": 1}
+      ]
+    },
+    {
+      "id": "targets_08_a",
+      "target_count": 8,
+      "profile": "balanced",
+      "targets": [
+        {"position": [33, 33], "type": 2},
+        {"position": [33, 5], "type": 1},
+        {"position": [18, 55], "type": 1},
+        {"position": [61, 3], "type": 3},
+        {"position": [53, 13], "type": 1},
+        {"position": [5, 12], "type": 2},
+        {"position": [61, 61], "type": 3},
+        {"position": [43, 49], "type": 2}
+      ]
+    },
+    {
+      "id": "targets_08_b",
+      "target_count": 8,
+      "profile": "type_2_heavy",
+      "targets": [
+        {"position": [45, 34], "type": 2},
+        {"position": [0, 29], "type": 2},
+        {"position": [11, 43], "type": 1},
+        {"position": [18, 26], "type": 2},
+        {"position": [19, 24], "type": 2},
+        {"position": [59, 1], "type": 2},
+        {"position": [25, 2], "type": 3},
+        {"position": [46, 4], "type": 1}
+      ]
+    },
+    {
+      "id": "targets_08_c",
+      "target_count": 8,
+      "profile": "multi_cluster_balanced",
+      "targets": [
+        {"position": [7, 44], "type": 1},
+        {"position": [9, 46], "type": 2},
+        {"position": [10, 43], "type": 3},
+        {"position": [47, 9], "type": 1},
+        {"position": [49, 11], "type": 2},
+        {"position": [50, 8], "type": 3},
+        {"position": [49, 50], "type": 1},
+        {"position": [52, 52], "type": 2}
+      ]
+    },
+    {
+      "id": "targets_09_a",
+      "target_count": 9,
+      "profile": "balanced",
+      "targets": [
+        {"position": [1, 39], "type": 2},
+        {"position": [63, 4], "type": 1},
+        {"position": [3, 10], "type": 1},
+        {"position": [34, 31], "type": 3},
+        {"position": [31, 14], "type": 2},
+        {"position": [25, 35], "type": 1},
+        {"position": [27, 8], "type": 2},
+        {"position": [50, 29], "type": 3},
+        {"position": [47, 0], "type": 3}
+      ]
+    },
+    {
+      "id": "targets_09_b",
+      "target_count": 9,
+      "profile": "type_1_heavy",
+      "targets": [
+        {"position": [35, 8], "type": 2},
+        {"position": [24, 11], "type": 1},
+        {"position": [32, 27], "type": 1},
+        {"position": [7, 16], "type": 2},
+        {"position": [28, 24], "type": 1},
+        {"position": [53, 41], "type": 1},
+        {"position": [8, 11], "type": 1},
+        {"position": [5, 8], "type": 1},
+        {"position": [11, 22], "type": 3}
+      ]
+    },
+    {
+      "id": "targets_09_c",
+      "target_count": 9,
+      "profile": "multi_cluster_balanced",
+      "targets": [
+        {"position": [9, 9], "type": 1},
+        {"position": [11, 10], "type": 2},
+        {"position": [10, 12], "type": 3},
+        {"position": [51, 11], "type": 1},
+        {"position": [53, 13], "type": 2},
+        {"position": [50, 14], "type": 3},
+        {"position": [31, 51], "type": 1},
+        {"position": [33, 53], "type": 2},
+        {"position": [34, 50], "type": 3}
+      ]
+    }
+  ]
+}

@@ -153,9 +153,17 @@ def collect_tensor_episodes(model, state, observation_builder,
             oracle_makespans = oracle_makespans.expand_as(state.clock)
         if oracle_makespans.shape != state.clock.shape:
             raise ValueError("oracle_makespans must be scalar or batch-sized")
-        if (oracle_makespans <= 0).any():
-            raise ValueError("oracle_makespans must be positive")
-        normalized_regrets = state.clock / oracle_makespans - 1.0
+        if (oracle_makespans < 0).any():
+            raise ValueError("oracle_makespans must be nonnegative")
+        if state.target_live.shape[1] > 0 and (oracle_makespans == 0).any():
+            raise ValueError("zero oracle makespans require targetless episodes")
+        safe_oracles = torch.where(
+            oracle_makespans > 0, oracle_makespans,
+            torch.ones_like(oracle_makespans))
+        normalized_regrets = torch.where(
+            oracle_makespans > 0,
+            state.clock / safe_oracles - 1.0,
+            torch.zeros_like(state.clock))
         returns = (-normalized_regrets
                    - death_penalty * state.deaths.float()
                    - incomplete_penalty * remaining.float())

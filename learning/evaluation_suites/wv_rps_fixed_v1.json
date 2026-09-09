@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "suite_id": "wv_rps_fixed_v1",
+  "terrain_id": "wv_dem_64_v1",
+  "num_target_types": 3,
+  "source_position": [0, 0],
+  "agent_configurations": [
+    {
+      "id": "rps_agents",
+      "agent_count": 4,
+      "profile": "rps_specialists",
+      "capabilities": [[0], [1], [2], [3]]
+    }
+  ],
+  "target_configurations": [
+    {
+      "id": "rps_targets",
+      "target_count": 7,
+      "profile": "original_fixed_rps",
+      "targets": [
+        {"position": [14, 54], "type": 1},
+        {"position": [1, 29], "type": 2},
+        {"position": [33, 17], "type": 2},
+        {"position": [34, 35], "type": 1},
+        {"position": [63, 37], "type": 2},
+        {"position": [37, 5], "type": 3},
+        {"position": [49, 58], "type": 3}
+      ]
+    }
+  ]
+}
