@@ -17,7 +17,8 @@ positive integer types are initially hidden. Agent capabilities are integers:
 The simulator objective is mission makespan plus a configurable death penalty.
 The learning objective normalizes makespan by the executable FI-OPT
 heterogeneous min-max makespan and adds dimensionless death and incompletion
-penalties.
+penalties. Logs and result JSON retain `oracle_makespan` as a compatibility
+name and also expose the same value as `fi_opt_makespan`.
 
 The package is `heterogeneous-capability-planning`, requires Python 3.12 or
 3.13, and has a working root `main.py` for the real-map benchmark.
@@ -40,17 +41,24 @@ The package is `heterogeneous-capability-planning`, requires Python 3.12 or
   - `full_information.py`: exact heterogeneous min-max open-route solver. Its
     per-agent Dijkstra state is `(physical node, serviced-target mask)`, so it
     exposes consistent scalar and reconstructed assignment/order/path results.
+    `solve_full_information` returns a diagnostic plan (including infeasible
+    plans); `full_information_makespan` is the scalar training interface and
+    raises `FullInformationInfeasibleError` when no plan exists.
   - `policies/baseline1.py`: independent distance routing. Service agents
     prefer supported, unknown, then unsupported targets; pure scouts move to
     the tallest safe node.
   - `policies/baseline2.py` / `scout_wrp.py`: assigns the least
-    service-capable scout a Watchman Route Problem covering walk, then uses the
-    baseline-1 attacker layer. Exact A* is used through 12 scoutable unknown
-    targets, with weighted A* above that threshold.
+    service-capable scout a Watchman Route Problem covering walk while the
+    other agents use the PTSP-style claim/hedge/probe attacker layer. The
+    baseline-1 attacker layer remains an explicit ablation option. Exact A* is
+    used through 12 scoutable unknown targets, with weighted A* above that
+    threshold.
   - `policies/scout_then_execute.py`: strict cooperative two-phase benchmark.
     All scouts minimize the final reveal time while service-only agents wait;
     the execution phase then commits to FI-OPT, including transit release
-    offsets at the phase boundary.
+    offsets at the phase boundary. Cooperative coverage is exact through 12
+    unknown targets; larger cases use greedy scout assignment followed by
+    weighted-A* covering walks and report `exact=False`.
   - `finite_horizon.py`: older reward-driven Hungarian and sequential-greedy
     comparison planners; these are not benchmark defaults.
   - `legacy/`: retained comparison code, not an active entry point.
@@ -112,8 +120,12 @@ legacy.
 `env_map` is the planner's optimistic, partially observed graph;
 `ground_truth` contains true target types and traversable edges. Types start as
 `UNKNOWN_TYPE` (`-1`) in `env_map`. Only sensing and contact may copy facts from
-`ground_truth` into `env_map`. Never pass ground truth to a policy, candidate
-generator, or observation builder.
+`ground_truth` into `env_map`. Never pass ground truth to a learned or ordinary
+partially observed policy, candidate generator, or observation builder.
+FI-OPT is the deliberate exception: its normalization scalar and `fi-opt`
+benchmark receive the truth graph by definition. Strict Scout-Then-Execute may
+not use truth during scouting; its execution solver receives `env_map` only
+after every remaining target type has been revealed.
 
 Active graph conventions:
 
@@ -176,19 +188,38 @@ passed RNG where the API supports one.
 - `simulation_batch_size` controls simultaneous tensor episodes;
   `reinforce_batch_size` controls optimizer accumulation. Legacy configs with
   `batch_size` map it to both fields.
-- Evaluation accepts a checkpoint run directory or weights path and normally
-  uses the configuration saved beside the weights. It defaults to the
-  `development` suite; rendering is valid only after filters select one case.
-  Non-rendering CUDA evaluation batches cases only when they share a target
-  world and agent count, while reusing each target world across those batches.
+- Learned evaluation accepts a checkpoint run directory or weights path and
+  normally uses the configuration saved beside the weights. FI-OPT and
+  Scout-Then-Execute need no checkpoint and always use the CPU event-driven
+  simulator; `--device` and `--cuda` apply only to the learned policy.
+  Evaluation defaults to the `development` suite; rendering is valid only
+  after filters select one case. Non-rendering learned CUDA evaluation batches
+  cases only when they share a target world and agent count, while reusing each
+  target world across those batches.
 - FI-OPT routes are target-aware and independently executable: a supported
   target encountered on a route belongs to that agent, and a target outside
-  its assignment is never used as a transit node. Do not replace this with an
-  ordinary all-node shortest-path metric closure.
+  its assignment is never used as a transit node. It deliberately does not
+  model one agent clearing an unsupported target for another agent to cross
+  later. Do not replace this with an ordinary all-node shortest-path metric
+  closure or describe it as unrestricted joint temporal optimality.
+- FI-OPT is exponential in the number of live targets: the per-agent physical
+  product search scales with target masks and the outer assignment DP
+  enumerates compatible subsets. The built-in suites cap target counts at 9.
+  Preserve the scalar no-reconstruction path used once per training instance.
+- A targetless FI-OPT instance returns zero. Reward code permits a zero
+  denominator only when both the episode and oracle are targetless; other zero
+  oracle values are errors. `parallel_tsp` remains only as a compatibility
+  alias for `full_information_makespan`.
 - Strict Scout-Then-Execute uses only planner-visible state during scouting.
   Every scout-capable agent may participate, service-only agents wait, and the
   final reveal triggers one FI-OPT plan over remaining targets. Moving agents
   use committed destinations as starts and remaining edge times as releases.
+  Targets without a reachable safe visibility witness make scouting
+  explicitly infeasible; the policy never substitutes sacrificial contact.
+- Evaluation suite JSON is a validated Cartesian product of agent and target
+  configurations. Every agent configuration must contain a scout and cover
+  all positive target types. Filters preserve file order, and `--episodes N`
+  repeats each selected fixed case rather than sampling new layouts.
 
 ## Environment and commands
 
@@ -213,25 +244,37 @@ uv run python -m simulation.real_map_benchmark --policy baseline2 --render
 uv run python -m learning.train --config learning/config.yaml --episodes 100 --device cpu
 uv run python -m learning.test learning/checkpoints/<run-directory> --device cuda
 uv run python -m learning.test learning/checkpoints/<run-directory> --suite test --device cuda
-uv run python -m learning.test --policy fi-opt --suite test
-uv run python -m learning.test --policy scout-then-execute --suite test
-uv run python -m learning.analyze outputs/evaluation/<result>.json
 uv run python -m learning.test learning/checkpoints/<run-directory> --suite development --device cuda --render
+
+# Classical benchmark policies (CPU; no checkpoint)
+uv run python -m learning.test --policy fi-opt --suite test --output outputs/evaluation/fi-opt.json
+uv run python -m learning.test --policy scout-then-execute --suite test --output outputs/evaluation/scout-then-execute.json
+
+# Fixed-suite analysis and a filtered classical render
+uv run python -m learning.analyze outputs/evaluation/<result>.json
+uv run python -m learning.test --policy scout-then-execute --suite test --agent-config agents_04_b --target-config targets_08_c --render
 ```
 
 The default learning config currently uses 3 target types, 5-9 targets, and
 3-6 randomly generated agents whose capabilities collectively cover every
 target type and include at least one scout. It uses CUDA and Weights & Biases
-logging. `--num-agents` fixes the count for a run. For local smoke runs,
-override `--episodes` and `--device`; disable `training.wandb` in a temporary
-config when external logging is not intended. MP4 creation requires `ffmpeg`.
+logging. Pair staging and wait actions are enabled. `--num-agents` fixes the
+count for a run. For local smoke runs, override `--episodes` and `--device`;
+disable `training.wandb` in a temporary config when external logging is not
+intended. MP4 creation requires `ffmpeg`.
 
 ## Working conventions
 
 - Use module entry points (`python -m ...`) so imports resolve consistently.
 - Run both test modules after shared simulation/domain changes; run at least
   `tests.test_learning` after model, decoder, observation, config, routing,
-  return, or checkpoint changes.
+  return, oracle, benchmark-policy, evaluation-suite, or checkpoint changes.
+- Keep FI-OPT scalar and reconstructed results semantically identical. Validate
+  reconstructed routes through `run_simulation`; do not post-process an
+  optimal assignment with unrelated shortest paths.
+- Preserve the strict phase boundary in Scout-Then-Execute: service-only agents
+  wait for the final reveal, then one FI-OPT plan is installed. Keep
+  `replan_in_transit` and `set_runtime_state` handling aligned with the engine.
 - Preserve outputs/checkpoints; do not commit caches, frames, videos, or
   weights.
 - Check signatures before reviving old benchmarks/notebooks; retained scripts
