@@ -33,8 +33,9 @@ The package is `heterogeneous-capability-planning`, requires Python 3.12 or
     the active model is direct capability matching, not cyclic RPS.
   - `engine.py`: map-independent continuous-time discrete-event simulator and
     safe placeholder policy.
-  - `real_map_benchmark.py`: builds the WV DEM instance, selects a baseline,
-    runs it, and optionally writes JSON, CSV, PNG, and MP4 output.
+  - `real_map_benchmark.py`: loads a prepared real-terrain map, applies episode
+    overlays, selects a baseline, runs it, and optionally writes JSON, CSV,
+    PNG, and MP4 output.
   - `rendering.py`: visualization and ffmpeg integration, kept outside the core
     engine import path.
 - `planning/`
@@ -186,12 +187,24 @@ passed RNG where the API supports one.
 - Candidate staging geometry is scenario-static: compute target-directed safe
   distance maps, pair separation, and pair minimax locations once per sampled
   target layout, then only filter cached definitions as target beliefs change.
-- Real terrain is an explicit offline-built artifact. Simulation, training,
-  and evaluation load `Real_Life_Maps/WV_tobler_viewshed_64.pkl.gz`; they do
-  not resample the DEM or calculate visibility. Re-run
-  `python -m Real_Life_Maps.build_map` deliberately to replace or create a map.
-  Node visibility is primary, and visible edges are induced only when both
-  endpoints are visible.
+- Real terrain is an explicit offline-built artifact. The backward-compatible
+  default is `Real_Life_Maps/WV_tobler_viewshed_64.pkl.gz`; simulation,
+  training, and evaluation do not resample the DEM or calculate visibility.
+  Re-run `python -m Real_Life_Maps.build_map` deliberately to replace or create
+  a map. Node visibility is primary, and visible edges are induced only when
+  both endpoints are visible.
+- `learning.train` and `learning.test` must support selecting a prepared map
+  through both configuration and `--map-path`, with the CLI taking precedence.
+  Do not hard-code a 64x64 terrain size, WV-only identifier, or WV-only factory
+  in those paths. Derive valid nodes and dimensions from the validated artifact,
+  and validate suite source/target positions by graph membership.
+- Prepared maps may differ in size but must share one validated schema. Nodes
+  expose `pos`, `height`, `elevation_m`, `type`, `visible_nodes`, and
+  `visible_edges`; directed edges expose `distance`, `is_road`,
+  `observed_edge`, and `num_used`. Preserve additional diagnostic attributes.
+  A checkpoint records the selected map identity, content hash, and relevant
+  metadata. Evaluation must detect a checkpoint/map mismatch and require an
+  explicit override rather than silently using different terrain.
 - `simulation_batch_size` controls simultaneous tensor episodes;
   `reinforce_batch_size` controls optimizer accumulation. Legacy configs with
   `batch_size` map it to both fields.
@@ -252,8 +265,8 @@ uv run python -m simulation.real_map_benchmark --policy baseline1 --seed 0
 uv run python -m simulation.real_map_benchmark --policy baseline2 --render
 
 # Learned policy
-uv run python -m learning.train --config learning/config.yaml --episodes 100 --device cpu
-uv run python -m learning.test learning/checkpoints/<run-directory> --device cuda
+uv run python -m learning.train --config learning/config.yaml --map-path Real_Life_Maps/WV_tobler_viewshed_64.pkl.gz --episodes 100 --device cpu
+uv run python -m learning.test learning/checkpoints/<run-directory> --map-path Real_Life_Maps/WV_tobler_viewshed_64.pkl.gz --device cuda
 uv run python -m learning.test learning/checkpoints/<run-directory> --suite test --device cuda
 uv run python -m learning.test learning/checkpoints/<run-directory> --suite development --device cuda --render
 
