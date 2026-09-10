@@ -1,8 +1,8 @@
 """
 Real-DEM entry point for the generalized capability model.
 
-Builds the planner graph (clean) and the ground-truth graph (obstacles
-applied) from the WV DEM, assigns each target a random type in ``1..n``,
+Loads an offline-prepared planner graph and builds the ground-truth graph
+with episode obstacles applied, assigns each target a random type in ``1..n``,
 generates random agent capability subsets, and runs
 ``simulation.engine.run_simulation`` with a pluggable policy
 (defaults to the naive type-aware placeholder -- swap in your baseline).
@@ -24,7 +24,6 @@ import copy
 import json
 import csv
 import time
-import pickle
 import argparse
 import subprocess
 import random
@@ -34,7 +33,10 @@ import networkx as nx
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-from Real_Life_Maps.real_map_generation import RealTerrainGrid
+from Real_Life_Maps.prepared_map import (
+    DEFAULT_PREPARED_MAP_PATH,
+    load_prepared_map,
+)
 from Graph_Generation.target_graph import create_fully_connected_target_graph
 from simulation.agent import Agent
 from simulation.domain import (
@@ -58,30 +60,39 @@ DEFAULT_TARGETS = ((14, 54), (1, 29), (33, 17), (34, 35), (63, 37), (37, 5), (49
 
 
 # ---------------------------------------------------------------------------
-# DEM / road loading (small copies so we don't import the matplotlib-heavy
-# multi_agent_simulation driver).
+# Prepared terrain loading and episode overlays.
 # ---------------------------------------------------------------------------
 
-def _load_real_terrain(dem_path, n_size):
-    import rasterio
-    from rasterio.enums import Resampling
-    with rasterio.open(dem_path) as dataset:
-        data = dataset.read(1, out_shape=(n_size, n_size),
-                            resampling=Resampling.bilinear)
-        if dataset.nodata is not None:
-            data = np.where(data == dataset.nodata, np.nan, data)
-    return np.rot90(data, k=-1)
+def _apply_obstacles(graph, obstacle_specs, protected_nodes):
+    """Remove obstacle-incident edges from one prepared terrain graph."""
+    protected_nodes = set(protected_nodes)
+    obstacle_nodes = set()
+    for center, rx, ry in obstacle_specs:
+        if rx <= 0 or ry <= 0:
+            raise ValueError("obstacle radii must be positive")
+        center_x, center_y = center
+        for node in graph:
+            row, col = node
+            if (((col - center_x) ** 2 / rx ** 2)
+                    + ((row - center_y) ** 2 / ry ** 2) <= 1
+                    and node not in protected_nodes):
+                obstacle_nodes.add(node)
+    for node in obstacle_nodes:
+        graph.nodes[node]["type"] = "obstacle"
+    removed = {
+        (u, v) for u, v in graph.edges
+        if u in obstacle_nodes or v in obstacle_nodes
+    }
+    graph.remove_edges_from(removed)
+    if removed:
+        for node in graph:
+            graph.nodes[node]["visible_edges"] = tuple(
+                edge for edge in graph.nodes[node]["visible_edges"]
+                if edge not in removed
+            )
 
 
-def _load_roads(road_pkl):
-    if road_pkl is None or not os.path.exists(road_pkl):
-        return set(), set()
-    with open(road_pkl, "rb") as f:
-        data = pickle.load(f)
-    return data["road_nodes"], data["road_edges"]
-
-
-def build_graphs(dem_path, road_pkl=None, n_size=64, source=(0, 0),
+def build_graphs(map_path=DEFAULT_PREPARED_MAP_PATH, source=(0, 0),
                  targets=DEFAULT_TARGETS, obstacle_specs=None,
                  target_num_neighbors=3, target_recursion=2,
                  target_num_obstacles=3, target_obstacle_hop=4,
@@ -92,15 +103,18 @@ def build_graphs(dem_path, road_pkl=None, n_size=64, source=(0, 0),
     ground_truth has obstacles applied and the true rps_type on every target.
     Returns None if any target is unreachable after blocking.
     """
-    height_grid = _load_real_terrain(dem_path, n_size)
-    road_nodes, road_edges = _load_roads(road_pkl)
+    template, _metadata = load_prepared_map(map_path)
     targets = list(targets)
-
-    terrain = RealTerrainGrid(height_grid, source=source, targets=targets,
-                              k_up=1.0, k_down=2.0,
-                              road_nodes=road_nodes, road_edges=road_edges)
-    terrain.compute_all_visibilities()
-    env_graph = terrain.get_graph().copy()
+    if source not in template:
+        raise ValueError(f"source {source!r} is outside the prepared map")
+    if len(set(targets)) != len(targets):
+        raise ValueError("targets must be unique")
+    if source in targets or any(target not in template for target in targets):
+        raise ValueError("targets must be on-map and differ from the source")
+    env_graph = template.copy()
+    env_graph.nodes[source]["type"] = "source"
+    for target in targets:
+        env_graph.nodes[target]["type"] = "target_unreached"
 
     # Populate edge `num_used` (used by reward-driven policies) as a side
     # effect of target-graph construction.
@@ -110,23 +124,12 @@ def build_graphs(dem_path, road_pkl=None, n_size=64, source=(0, 0),
         num_obstacles=target_num_obstacles, obstacle_hop=target_obstacle_hop,
     )
 
-    # Ground truth: apply obstacles, strip obstacle-incident edges + visibility.
+    # Ground truth: apply episode blockages without changing the prepared map.
     if obstacle_specs is None:
         obstacle_specs = DEFAULT_OBSTACLE_SPECS
-    blocked = copy.deepcopy(terrain)
-    for center, rx, ry in obstacle_specs:
-        blocked.add_obstacle(center=center, rx=rx, ry=ry)
-    ground_truth = blocked.get_graph().copy()
-    obs_edges = [(u, v) for u, v in ground_truth.edges()
-                 if ground_truth.nodes[u].get("type") == "obstacle"
-                 or ground_truth.nodes[v].get("type") == "obstacle"]
-    ground_truth.remove_edges_from(obs_edges)
-    obs_set = set(obs_edges)
-    for node in ground_truth.nodes():
-        if "visible_edges" in ground_truth.nodes[node]:
-            ground_truth.nodes[node]["visible_edges"] = [
-                e for e in ground_truth.nodes[node]["visible_edges"] if e not in obs_set
-            ]
+    ground_truth = copy.deepcopy(env_graph)
+    _apply_obstacles(
+        ground_truth, obstacle_specs, protected_nodes={source, *targets})
 
     for t in targets:
         if not nx.has_path(ground_truth, source, t):
@@ -139,7 +142,7 @@ def build_graphs(dem_path, road_pkl=None, n_size=64, source=(0, 0),
     return env_graph, ground_truth, target_types
 
 
-def run(dem_path, road_pkl=None, n_size=64, source=(0, 0), targets=DEFAULT_TARGETS,
+def run(map_path=DEFAULT_PREPARED_MAP_PATH, source=(0, 0), targets=DEFAULT_TARGETS,
         num_target_types=3, num_agents=4, agent_capabilities=None,
         capability_probability=0.5, scout_probability=0.25,
         ensure_target_coverage=True, ensure_scout=True,
@@ -153,7 +156,8 @@ def run(dem_path, road_pkl=None, n_size=64, source=(0, 0), targets=DEFAULT_TARGE
 
     rng = random.Random(seed)
     built = build_graphs(
-        dem_path, road_pkl, n_size, source, targets, obstacle_specs,
+        map_path=map_path, source=source, targets=targets,
+        obstacle_specs=obstacle_specs,
         num_target_types=num_target_types, rng=rng)
     if built is None:
         return None
@@ -289,11 +293,10 @@ def _parse_agent_capabilities(value, num_target_types):
 def main():
     p = argparse.ArgumentParser(
         description="Capability-based multi-agent planning on the real DEM map")
-    real_maps = os.path.join(PROJECT_ROOT, "Real_Life_Maps")
     output_root = os.path.join(PROJECT_ROOT, "outputs", "my_policy_simulation")
-    p.add_argument("--dem-path", default=os.path.join(real_maps, "WV_DEM.tif"))
-    p.add_argument("--road-pkl", default=os.path.join(real_maps, "WV_roads.pkl"))
-    p.add_argument("--grid-size", type=int, default=64)
+    p.add_argument(
+        "--map-path", default=str(DEFAULT_PREPARED_MAP_PATH),
+        help="simulator-ready map produced by Real_Life_Maps.build_map")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--num-target-types", type=int, default=3,
                    help="target types are the integers 1..N")
@@ -328,10 +331,10 @@ def main():
                    default=os.path.join(output_root, "trajectory_per_agent.csv"))
     args = p.parse_args()
 
-    if not os.path.exists(args.dem_path):
-        print(f"DEM not found: {args.dem_path}")
+    if not os.path.exists(args.map_path):
+        print(f"Prepared map not found: {args.map_path}")
+        print("Build it with: uv run python -m Real_Life_Maps.build_map")
         sys.exit(1)
-    road_pkl = args.road_pkl if os.path.exists(args.road_pkl) else None
     try:
         explicit_capabilities = (
             _parse_agent_capabilities(
@@ -348,7 +351,7 @@ def main():
     else:
         policy = naive_type_aware_replan
 
-    run(args.dem_path, road_pkl=road_pkl, n_size=args.grid_size,
+    run(map_path=args.map_path,
         num_target_types=args.num_target_types, num_agents=args.num_agents,
         agent_capabilities=explicit_capabilities,
         capability_probability=args.capability_probability,

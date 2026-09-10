@@ -20,6 +20,8 @@ each positive agent capability identifies a target type it can service.
 
 ```bash
 uv sync
+uv run python -m Real_Life_Maps.build_map  # one-time; requires GRASS GIS
+uv run python -m tests.test_real_map_builder
 uv run python -m tests.test_simulation
 uv run python -m simulation.real_map_benchmark --help
 uv run python -m simulation.real_map_benchmark --policy baseline2 --seed 0 \

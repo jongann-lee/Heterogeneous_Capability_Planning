@@ -99,8 +99,12 @@ The package is `heterogeneous-capability-planning`, requires Python 3.12 or
     agent-count/target-count matrices and overall failure/death diagnostics.
 - `Graph_Generation/`: visibility, blockage, target-graph, and stochastic
   diverse-path helpers used by older planners.
-- `Real_Life_Maps/`: bundled `WV_DEM.tif`, `WV_roads.pkl`, terrain builder, and
-  retained older benchmark scripts.
+- `Real_Life_Maps/`: bundled `WV_DEM.tif` and `WV_roads.pkl`, the explicit
+  offline `build_map.py` compiler, prepared-map serialization, GRASS viewshed
+  worker, and retained older benchmark scripts. The compiler derives directed
+  Tobler travel times on a dense physical raster, computes node-first GRASS
+  viewsheds, induces edge visibility, and writes the target-independent map
+  consumed by simulation and learning.
 - `Single_Agent/`: original reward-driven implementation and TSP solver,
   retained as dependencies/comparisons.
 - `tests/`: executable synthetic regressions for simulation and learning.
@@ -182,9 +186,12 @@ passed RNG where the API supports one.
 - Candidate staging geometry is scenario-static: compute target-directed safe
   distance maps, pair separation, and pair minimax locations once per sampled
   target layout, then only filter cached definitions as target beliefs change.
-- Real-terrain visibility is content-addressed by normalized DEM heights and
-  sweep parameters under ignored `cache/visibility/`. Do not bypass or delete
-  that persistent preprocessing cache during normal runs.
+- Real terrain is an explicit offline-built artifact. Simulation, training,
+  and evaluation load `Real_Life_Maps/WV_tobler_viewshed_64.pkl.gz`; they do
+  not resample the DEM or calculate visibility. Re-run
+  `python -m Real_Life_Maps.build_map` deliberately to replace or create a map.
+  Node visibility is primary, and visible edges are induced only when both
+  endpoints are visible.
 - `simulation_batch_size` controls simultaneous tensor episodes;
   `reinforce_batch_size` controls optimizer accumulation. Legacy configs with
   `batch_size` map it to both fields.
@@ -231,9 +238,13 @@ need to run the CUDA backend.
 ```bash
 uv sync
 
+# Explicit offline map compilation (requires GRASS GIS)
+uv run python -m Real_Life_Maps.build_map
+
 # Fast regression suites
 uv run python -m tests.test_simulation
 uv run python -m tests.test_learning
+uv run python -m tests.test_real_map_builder
 
 # Real-map benchmark (equivalent root entry: uv run python main.py)
 uv run python -m simulation.real_map_benchmark --help
@@ -275,8 +286,9 @@ intended. MP4 creation requires `ffmpeg`.
 - Preserve the strict phase boundary in Scout-Then-Execute: service-only agents
   wait for the final reveal, then one FI-OPT plan is installed. Keep
   `replan_in_transit` and `set_runtime_state` handling aligned with the engine.
-- Preserve outputs/checkpoints; do not commit caches, frames, videos, or
-  weights.
+- Preserve outputs/checkpoints and prepared maps; do not overwrite a prepared
+  map without an explicit map-builder invocation, and do not commit caches,
+  frames, videos, or weights.
 - Check signatures before reviving old benchmarks/notebooks; retained scripts
   may predate the generalized capability API.
 - Keep rendering optional and outside the core simulation import path.

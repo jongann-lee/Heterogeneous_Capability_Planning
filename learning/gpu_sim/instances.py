@@ -13,23 +13,23 @@ from simulation.domain import (assign_agent_capabilities, assign_target_types,
 
 WV_GRID_SIZE = 64
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-WV_DEM_PATH = PROJECT_ROOT / "Real_Life_Maps" / "WV_DEM.tif"
-WV_ROADS_PATH = PROJECT_ROOT / "Real_Life_Maps" / "WV_roads.pkl"
+WV_PREPARED_MAP_PATH = (
+    PROJECT_ROOT / "Real_Life_Maps" / "WV_tobler_viewshed_64.pkl.gz"
+)
 
 
 @lru_cache(maxsize=1)
 def _wv_terrain_template():
-    """Build target-independent WV terrain and visibility exactly once."""
-    from Real_Life_Maps.real_map_generation import RealTerrainGrid
-    from simulation.real_map_benchmark import _load_real_terrain, _load_roads
+    """Load the target-independent offline-built WV terrain exactly once."""
+    from Real_Life_Maps.prepared_map import load_prepared_map
 
-    height_grid = _load_real_terrain(str(WV_DEM_PATH), WV_GRID_SIZE)
-    road_nodes, road_edges = _load_roads(str(WV_ROADS_PATH))
-    terrain = RealTerrainGrid(
-        height_grid, source=(0, 0), targets=[], k_up=1.0, k_down=2.0,
-        road_nodes=road_nodes, road_edges=road_edges)
-    terrain.compute_all_visibilities()
-    graph = terrain.get_graph().copy()
+    graph, metadata = load_prepared_map(WV_PREPARED_MAP_PATH)
+    if metadata["coarse_size"] != WV_GRID_SIZE:
+        raise ValueError(
+            f"prepared WV map is {metadata['coarse_size']}x"
+            f"{metadata['coarse_size']}, expected {WV_GRID_SIZE}x{WV_GRID_SIZE}"
+        )
+    graph = graph.copy()
     for node in graph:
         graph.nodes[node]["type"] = "intermediate"
     for _u, _v, data in graph.edges(data=True):

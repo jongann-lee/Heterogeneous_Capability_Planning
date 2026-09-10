@@ -94,8 +94,13 @@ def sensed_edges_assumed(env_map, agent):
 
 
 def sensed_nodes_truth(ground_truth, agent):
-    """Nodes the agent can see (endpoints of its truly-sensed edges + self)."""
+    """Nodes the agent sees, preferring an explicit node-first viewshed."""
     nodes = {agent.position}
+    explicit = ground_truth.nodes[agent.position].get("visible_nodes")
+    if explicit is not None:
+        nodes.update(node for node in explicit if node in ground_truth)
+        return nodes
+    # Compatibility for synthetic and legacy maps that only store edges.
     for u, v in sensed_edges_truth(ground_truth, agent):
         nodes.add(u)
         nodes.add(v)
