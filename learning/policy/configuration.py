@@ -1,6 +1,7 @@
 """Typed loading and validation for ``learning/config.yaml``."""
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,11 @@ import yaml
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
+
+RAW_DISTANCE_FEATURE_SCHEMA_VERSION = 1
+CURRENT_FEATURE_SCHEMA_VERSION = 2
+RAW_EDGE_NORMALIZATION = "none"
+PER_DECISION_EDGE_NORMALIZATION = "per_decision_zscore"
 
 
 @dataclass(frozen=True)
@@ -23,6 +29,11 @@ class ModelConfig:
     distance_embedding_dim: int = 32
     critic_hidden_dim: int = 128
     use_critic: bool = True
+    # Missing values in an old checkpoint intentionally select its original
+    # raw task-graph features. New configs explicitly opt into schema 2.
+    feature_schema_version: int = RAW_DISTANCE_FEATURE_SCHEMA_VERSION
+    edge_normalization: str = RAW_EDGE_NORMALIZATION
+    edge_normalization_epsilon: float = 1.0e-6
 
     def __post_init__(self):
         if self.num_target_types < 1:
@@ -48,6 +59,30 @@ class ModelConfig:
             raise ValueError("critic_hidden_dim must be positive")
         if not isinstance(self.use_critic, bool):
             raise ValueError("use_critic must be a boolean")
+        if self.feature_schema_version not in {
+                RAW_DISTANCE_FEATURE_SCHEMA_VERSION,
+                CURRENT_FEATURE_SCHEMA_VERSION}:
+            raise ValueError(
+                "model.feature_schema_version must be 1 or 2")
+        if self.edge_normalization not in {
+                RAW_EDGE_NORMALIZATION,
+                PER_DECISION_EDGE_NORMALIZATION}:
+            raise ValueError(
+                "model.edge_normalization must be 'none' or "
+                "'per_decision_zscore'")
+        expected_normalization = (
+            RAW_EDGE_NORMALIZATION
+            if self.feature_schema_version == RAW_DISTANCE_FEATURE_SCHEMA_VERSION
+            else PER_DECISION_EDGE_NORMALIZATION)
+        if self.edge_normalization != expected_normalization:
+            raise ValueError(
+                f"model feature schema {self.feature_schema_version} requires "
+                f"edge_normalization={expected_normalization!r}")
+        if (not isinstance(self.edge_normalization_epsilon, (int, float))
+                or not math.isfinite(self.edge_normalization_epsilon)
+                or self.edge_normalization_epsilon <= 0):
+            raise ValueError(
+                "model.edge_normalization_epsilon must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -56,6 +91,7 @@ class CandidateConfig:
     staging_capacity: int
     include_wait: bool
     include_pair_staging: bool = True
+    allow_unknown_target_actions: bool = True
 
     def __post_init__(self):
         if self.staging_per_target < 0:
@@ -64,6 +100,9 @@ class CandidateConfig:
             raise ValueError("staging_capacity must be positive")
         if not isinstance(self.include_pair_staging, bool):
             raise ValueError("include_pair_staging must be a boolean")
+        if not isinstance(self.allow_unknown_target_actions, bool):
+            raise ValueError(
+                "candidates.allow_unknown_target_actions must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -97,6 +136,7 @@ class InstanceConfig:
     max_targets: int = 7
     min_agents: int | None = None
     max_agents: int | None = None
+    map_path: str | None = None
 
     def __post_init__(self):
         if self.min_targets < 1:
@@ -113,6 +153,10 @@ class InstanceConfig:
             if self.max_agents < self.min_agents:
                 raise ValueError(
                     "instances.max_agents must be at least instances.min_agents")
+        if (self.map_path is not None
+                and (not isinstance(self.map_path, str)
+                     or not self.map_path.strip())):
+            raise ValueError("instances.map_path must be a non-empty string or null")
 
 
 @dataclass(frozen=True)
@@ -147,6 +191,16 @@ class LearningConfig:
     reinforce: ReinforceConfig
     training: TrainingConfig
     instances: InstanceConfig = InstanceConfig()
+
+
+def feature_schema_metadata(model_config: ModelConfig) -> dict[str, Any]:
+    """Return the checkpoint/evaluation identity of neural input features."""
+    return {
+        "version": int(model_config.feature_schema_version),
+        "edge_normalization": model_config.edge_normalization,
+        "edge_normalization_epsilon": float(
+            model_config.edge_normalization_epsilon),
+    }
 
 
 def _section(payload: dict[str, Any], name: str) -> dict[str, Any]:

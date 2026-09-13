@@ -26,7 +26,16 @@ uv run python -m tests.test_simulation
 uv run python -m simulation.real_map_benchmark --help
 uv run python -m simulation.real_map_benchmark --policy baseline2 --seed 0 \
   --agent-capabilities '0;1;2;3' --verbose --render
+uv run python -m learning.train --config learning/config.yaml \
+  --map-path Real_Life_Maps/WV_tobler_viewshed_64.pkl.gz --device cpu
+uv run python -m learning.test learning/checkpoints/<run-directory> \
+  --map-path Real_Life_Maps/WV_tobler_viewshed_64.pkl.gz --device cuda
 ```
 
 Use module entry points (`python -m ...`) so package imports resolve
 consistently. MP4 generation additionally requires the `ffmpeg` executable.
+Learning commands load only validated, offline-built prepared-map artifacts.
+The CLI map path overrides `instances.map_path` in YAML; the bundled WV map
+remains the default. New checkpoints record the artifact SHA-256 and metadata,
+and learned evaluation rejects a different map unless
+`--allow-map-mismatch` is supplied explicitly.

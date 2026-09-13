@@ -1,6 +1,8 @@
-"""Deterministic checkpoint evaluation on the 64x64 WV terrain."""
+"""Deterministic checkpoint evaluation on a selected prepared terrain."""
 
 import argparse
+from dataclasses import replace
+from datetime import datetime
 import json
 import math
 import random
@@ -11,13 +13,25 @@ from pathlib import Path
 import numpy as np
 import torch
 from tqdm.auto import tqdm
+import yaml
 
+from Real_Life_Maps.prepared_map import DEFAULT_PREPARED_MAP_PATH
 from learning.evaluation_suite import (
     load_evaluation_suite,
     select_evaluation_cases,
+    validate_evaluation_suite_locations,
 )
-from learning.policy.configuration import DEFAULT_CONFIG_PATH, load_config
-from learning.gpu_sim.instances import make_wv_dem_instance
+from learning.policy.configuration import (
+    CURRENT_FEATURE_SCHEMA_VERSION,
+    DEFAULT_CONFIG_PATH,
+    RAW_DISTANCE_FEATURE_SCHEMA_VERSION,
+    feature_schema_metadata,
+    load_config,
+)
+from learning.gpu_sim.instances import (
+    inspect_prepared_map,
+    make_prepared_map_instance,
+)
 from learning.policy.model import build_policy
 from learning.policy.oracle import full_information_makespan
 
@@ -26,6 +40,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RENDER_ROOT = PROJECT_ROOT / "outputs" / "my_policy_simulation"
 DEFAULT_RENDER_DIR = DEFAULT_RENDER_ROOT / "frames"
 DEFAULT_OUTPUT_MP4 = DEFAULT_RENDER_ROOT / "render_result.mp4"
+DEFAULT_EVALUATION_DIR = PROJECT_ROOT / "outputs" / "evaluation"
 
 
 def _resolve_checkpoint(path):
@@ -45,9 +60,18 @@ def _resolve_checkpoint(path):
     return weights, config if config.is_file() else None
 
 
-def _case_factory(case):
+def _evaluation_output_path(output=None, now=None):
+    """Resolve an explicit output or create a timestamped default JSON path."""
+    if output is not None:
+        return Path(output).expanduser().resolve()
+    timestamp = (now or datetime.now().astimezone()).strftime(
+        "%Y-%m-%d_%H-%M-%S_%f")
+    return DEFAULT_EVALUATION_DIR / f"{timestamp}.json"
+
+
+def _case_factory(case, map_path=DEFAULT_PREPARED_MAP_PATH):
     metadata = case.instance_metadata()
-    return make_wv_dem_instance(
+    return make_prepared_map_instance(
         seed=0,
         num_target_types=case.num_target_types,
         num_agents=case.agent.agent_count,
@@ -56,7 +80,44 @@ def _case_factory(case):
         target_types=metadata["target_types"],
         agent_capabilities=metadata["agent_capabilities"],
         min_targets=case.target.target_count,
-        max_targets=case.target.target_count)
+        max_targets=case.target.target_count,
+        map_path=map_path)
+
+
+def _checkpoint_prepared_map(config_path):
+    """Read map identity recorded beside checkpoint weights, if available."""
+    if config_path is None:
+        return None
+    with Path(config_path).open("r", encoding="utf-8") as stream:
+        payload = yaml.safe_load(stream)
+    if not isinstance(payload, dict):
+        raise ValueError("checkpoint configuration must be a YAML mapping")
+    prepared_map = payload.get("prepared_map")
+    if prepared_map is None:
+        return None
+    if not isinstance(prepared_map, dict):
+        raise ValueError("checkpoint prepared_map identity must be a mapping")
+    sha256 = prepared_map.get("sha256")
+    if (not isinstance(sha256, str) or len(sha256) != 64
+            or any(character not in "0123456789abcdefABCDEF"
+                   for character in sha256)):
+        raise ValueError(
+            "checkpoint prepared_map.sha256 must be a 64-character hex digest")
+    return dict(prepared_map)
+
+
+def _select_prepared_map_path(cli_map_path, explicit_config,
+                              checkpoint_config):
+    """Apply CLI, explicit-config, checkpoint-config, then default precedence."""
+    if cli_map_path is not None:
+        return cli_map_path
+    if (explicit_config is not None
+            and explicit_config.instances.map_path is not None):
+        return explicit_config.instances.map_path
+    if (checkpoint_config is not None
+            and checkpoint_config.instances.map_path is not None):
+        return checkpoint_config.instances.map_path
+    return DEFAULT_PREPARED_MAP_PATH
 
 
 def _encode_episode(world, truth, agents, num_target_types, device):
@@ -106,7 +167,10 @@ def _gpu_episode(model, config, env, truth, agents, device, terrain=None,
         model, state,
         TensorObservationBuilder(
             world, config.model.num_target_types,
-            task_graph=config.model.architecture == "task_graph"),
+            task_graph=config.model.architecture == "task_graph",
+            edge_normalization=config.model.edge_normalization,
+            edge_normalization_epsilon=(
+                config.model.edge_normalization_epsilon)),
         config.reinforce.death_penalty,
         config.reinforce.incomplete_penalty,
         training=False,
@@ -156,7 +220,8 @@ def _agents_for_case(case):
     ]
 
 
-def _gpu_suite_records(model, config, cases, device, progress=None):
+def _gpu_suite_records(model, config, cases, device, progress=None,
+                       map_path=None):
     """Evaluate compatible fixed-suite cases in CUDA tensor batches."""
     from learning.gpu_sim.observation_gpu import TensorObservationBuilder
     from learning.gpu_sim.rollout_gpu import collect_tensor_episodes
@@ -168,13 +233,18 @@ def _gpu_suite_records(model, config, cases, device, progress=None):
     batch_id = 0
     for _target_id, agent_batches in _cuda_batch_plan(cases):
         first_case = agent_batches[0][0][1]
-        env, truth, _agents = _case_factory(first_case)
+        env, truth, _agents = (
+            _case_factory(first_case) if map_path is None
+            else _case_factory(first_case, map_path=map_path))
         world = TensorWorld.from_networkx(
             env, config.candidates, device=device, terrain=terrain)
         terrain = world.terrain
         builder = TensorObservationBuilder(
             world, config.model.num_target_types,
-            task_graph=config.model.architecture == "task_graph")
+            task_graph=config.model.architecture == "task_graph",
+            edge_normalization=config.model.edge_normalization,
+            edge_normalization_epsilon=(
+                config.model.edge_normalization_epsilon))
         source = world.node_index[first_case.source_position]
         target_types = torch.tensor([
             truth.nodes[target]["rps_type"] for target in world.targets
@@ -492,7 +562,9 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
              device=None, agent_config=None, target_config=None,
              agent_count=None, target_count=None, limit=None,
              render=False, render_dir=None, output_mp4=None, mp4_fps=4,
-             render_dt=1.0, policy="learned", episodes=1, progress=False):
+             render_dt=1.0, policy="learned", episodes=1, progress=False,
+             map_path=None, allow_map_mismatch=False,
+             allow_feature_schema_mismatch=False):
     if policy not in {"learned", "fi-opt", "scout-then-execute"}:
         raise ValueError(f"unknown evaluation policy: {policy}")
     if episodes < 1:
@@ -518,8 +590,69 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
     checkpoint_config = None
     if checkpoint is not None:
         weights_path, checkpoint_config = _resolve_checkpoint(checkpoint)
-    selected_config = config_path or checkpoint_config or DEFAULT_CONFIG_PATH
-    config = load_config(selected_config)
+    explicit_config = load_config(config_path) if config_path is not None else None
+    saved_config = (
+        load_config(checkpoint_config) if checkpoint_config is not None else None)
+    config = explicit_config or saved_config or load_config(DEFAULT_CONFIG_PATH)
+    selected_feature_schema = feature_schema_metadata(config.model)
+    checkpoint_feature_schema = (
+        feature_schema_metadata(saved_config.model)
+        if saved_config is not None else {
+            "version": RAW_DISTANCE_FEATURE_SCHEMA_VERSION,
+            "edge_normalization": "none",
+            "edge_normalization_epsilon": None,
+        })
+    feature_schema_issue = bool(
+        policy == "learned" and (
+            checkpoint_feature_schema["version"]
+            != CURRENT_FEATURE_SCHEMA_VERSION
+            or checkpoint_feature_schema != selected_feature_schema))
+    if feature_schema_issue and not allow_feature_schema_mismatch:
+        raise ValueError(
+            "checkpoint feature schema is incompatible with the selected "
+            "neural input schema: checkpoint "
+            f"{checkpoint_feature_schema!r}, selected "
+            f"{selected_feature_schema!r}. Retrain the policy or pass "
+            "--allow-feature-schema-mismatch for an explicit compatibility "
+            "override.")
+    feature_schema = dict(selected_feature_schema)
+    feature_schema.update({
+        "checkpoint": checkpoint_feature_schema if policy == "learned" else None,
+        "allow_mismatch": bool(allow_feature_schema_mismatch),
+        "compatibility_override_used": bool(
+            feature_schema_issue and allow_feature_schema_mismatch),
+    })
+    configured_map_path = _select_prepared_map_path(
+        map_path, explicit_config, saved_config)
+    (resolved_map_path, terrain_template, _map_metadata,
+     prepared_map) = inspect_prepared_map(configured_map_path)
+    validate_evaluation_suite_locations(suite_definition, terrain_template)
+    checkpoint_map = (
+        _checkpoint_prepared_map(checkpoint_config)
+        if policy == "learned" else None)
+    checkpoint_sha256 = (
+        None if checkpoint_map is None else checkpoint_map["sha256"].lower())
+    hash_matches = (
+        None if checkpoint_sha256 is None
+        else prepared_map["sha256"].lower() == checkpoint_sha256)
+    mismatch_override_used = bool(
+        policy == "learned" and hash_matches is False and allow_map_mismatch)
+    if (policy == "learned" and hash_matches is False
+            and not allow_map_mismatch):
+        raise ValueError(
+            "selected prepared map does not match the checkpoint: "
+            f"checkpoint SHA-256 {checkpoint_sha256}, selected SHA-256 "
+            f"{prepared_map['sha256']}. Pass --allow-map-mismatch to "
+            "evaluate deliberately on different terrain.")
+    prepared_map.update({
+        "checkpoint_sha256": checkpoint_sha256,
+        "hash_matches_checkpoint": hash_matches,
+        "allow_map_mismatch": bool(allow_map_mismatch),
+        "mismatch_override_used": mismatch_override_used,
+    })
+    config = replace(
+        config,
+        instances=replace(config.instances, map_path=str(resolved_map_path)))
     if (policy == "learned"
             and config.model.num_target_types != suite_definition.num_target_types):
         raise ValueError(
@@ -562,7 +695,7 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
         if policy == "learned" and resolved_device == "cuda" and not render:
             records = _gpu_suite_records(
                 model, config, evaluation_cases, resolved_device,
-                progress=progress_bar)
+                progress=progress_bar, map_path=resolved_map_path)
             records = [
                 _attach_case_metadata(record, suite_definition, case)
                 for record, case in zip(records, evaluation_cases)
@@ -574,7 +707,8 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
             random.seed(episode_seed)
             np.random.seed(episode_seed)
             torch.manual_seed(episode_seed)
-            env, truth, agents = _case_factory(case)
+            env, truth, agents = _case_factory(
+                case, map_path=resolved_map_path)
             if render:
                 from simulation.rendering import make_mp4_from_frames
                 episode_frames = (
@@ -642,13 +776,17 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
                 "seed": seed + episode_index,
                 "policy": policy,
             })
+    evaluate.last_prepared_map = prepared_map
+    evaluate.last_feature_schema = feature_schema
     return (records, summarize(records), config, weights_path,
             suite_definition, suite_path)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate learned or classical policies on the fixed WV suites")
+        description=(
+            "Evaluate learned or classical policies on a prepared map and "
+            "fixed suite"))
     parser.add_argument(
         "checkpoint", nargs="?",
         help="timestamped checkpoint directory or weights file (learned policy only)")
@@ -660,6 +798,16 @@ def main():
         "--episodes", type=int, default=1,
         help="repeat every selected fixed-suite case N times")
     parser.add_argument("--config", help="config override; defaults to checkpoint config")
+    parser.add_argument(
+        "--map-path",
+        help="prepared-map artifact; overrides config and checkpoint map paths")
+    parser.add_argument(
+        "--allow-map-mismatch", action="store_true",
+        help="allow learned evaluation when selected and checkpoint map hashes differ")
+    parser.add_argument(
+        "--allow-feature-schema-mismatch", action="store_true",
+        help=("allow an older or otherwise incompatible checkpoint feature "
+              "schema; retraining is recommended"))
     parser.add_argument(
         "--suite", default="development",
         help="development, test, or a factorized suite JSON path")
@@ -684,7 +832,10 @@ def main():
     parser.add_argument(
         "--cuda", action="store_true",
         help="shortcut for --device cuda (learned only; classical policies remain CPU)")
-    parser.add_argument("--output", help="optional JSON result path")
+    parser.add_argument(
+        "--output",
+        help=("JSON result path; defaults to a timestamped file under "
+              "outputs/evaluation"))
     parser.add_argument("--render", action="store_true",
                         help="write one PNG per turn and compile an MP4")
     parser.add_argument("--render-dir",
@@ -724,9 +875,16 @@ def main():
             render=args.render, render_dir=args.render_dir,
             output_mp4=args.output_mp4, mp4_fps=args.mp4_fps,
             render_dt=args.render_dt, policy=args.policy,
-            episodes=args.episodes, progress=not args.no_progress)
-    except ValueError as error:
+            episodes=args.episodes, progress=not args.no_progress,
+            map_path=args.map_path,
+            allow_map_mismatch=args.allow_map_mismatch,
+            allow_feature_schema_mismatch=(
+                args.allow_feature_schema_mismatch))
+    except (FileNotFoundError, ValueError) as error:
         parser.error(str(error))
+    prepared_map = evaluate.last_prepared_map
+    feature_schema = evaluate.last_feature_schema
+    output = _evaluation_output_path(args.output)
     payload = {
         "schema_version": 1,
         "checkpoint": str(weights) if weights is not None else None,
@@ -735,6 +893,12 @@ def main():
         "suite_id": suite_definition.suite_id,
         "suite_path": str(suite_path),
         "terrain_id": suite_definition.terrain_id,
+        "output_path": str(output),
+        "prepared_map": prepared_map,
+        "allow_map_mismatch": args.allow_map_mismatch,
+        "feature_schema": feature_schema,
+        "allow_unknown_target_actions": (
+            config.candidates.allow_unknown_target_actions),
         "scenario_ids": [record["scenario_id"] for record in records],
         "selection": {
             "agent_config": args.agent_config,
@@ -749,11 +913,9 @@ def main():
         "scenarios": records,
     }
     rendered = json.dumps(payload, indent=2)
-    if args.output:
-        output = Path(args.output).expanduser().resolve()
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(rendered + "\n", encoding="utf-8")
-    print(rendered)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(rendered + "\n", encoding="utf-8")
+    print(f"saved evaluation: {output}")
 
 
 if __name__ == "__main__":

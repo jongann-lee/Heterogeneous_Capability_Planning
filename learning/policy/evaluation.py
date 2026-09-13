@@ -6,14 +6,20 @@ from pathlib import Path
 import torch
 import yaml
 
-from learning.policy.configuration import CandidateConfig, ModelConfig, load_config
+from learning.policy.configuration import (
+    CURRENT_FEATURE_SCHEMA_VERSION,
+    CandidateConfig,
+    ModelConfig,
+    load_config,
+)
 from learning.policy.model import build_policy
 from learning.gpu_sim.instances import make_wv_dem_instance
 from learning.policy.adapter import LearnedPolicyAdapter
 from simulation.engine import run_simulation
 
 
-def load_policy(checkpoint, device="cpu"):
+def load_policy(checkpoint, device="cpu",
+                allow_feature_schema_mismatch=False):
     checkpoint = Path(checkpoint)
     if checkpoint.is_dir():
         weights_path = next((candidate for candidate in (
@@ -40,6 +46,11 @@ def load_policy(checkpoint, device="cpu"):
         candidate_payload.pop("include_continue", None)
         candidate_config = (CandidateConfig(**candidate_payload)
                             if candidate_payload else load_config().candidates)
+    if (config.feature_schema_version != CURRENT_FEATURE_SCHEMA_VERSION
+            and not allow_feature_schema_mismatch):
+        raise ValueError(
+            "checkpoint uses an older raw-distance feature schema; retrain "
+            "the policy or explicitly set allow_feature_schema_mismatch=True")
     model = build_policy(config).to(device)
     model.load_state_dict(state_dict)
     model.eval()
@@ -49,8 +60,11 @@ def load_policy(checkpoint, device="cpu"):
 
 
 def evaluate_instance(checkpoint, env_map, ground_truth, agents,
-                      device="cpu", **simulation_kwargs):
-    _model, policy = load_policy(checkpoint, device)
+                      device="cpu", allow_feature_schema_mismatch=False,
+                      **simulation_kwargs):
+    _model, policy = load_policy(
+        checkpoint, device,
+        allow_feature_schema_mismatch=allow_feature_schema_mismatch)
     return run_simulation(env_map, ground_truth, agents, policy=policy,
                           **simulation_kwargs)
 
@@ -62,8 +76,12 @@ def main():
     parser.add_argument("--num-agents", type=int, default=4)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available()
                         else "cpu")
+    parser.add_argument(
+        "--allow-feature-schema-mismatch", action="store_true")
     args = parser.parse_args()
-    model, _policy = load_policy(args.checkpoint, "cpu")
+    model, _policy = load_policy(
+        args.checkpoint, "cpu",
+        allow_feature_schema_mismatch=args.allow_feature_schema_mismatch)
     ntypes = model.config.num_target_types
     checkpoint = Path(args.checkpoint)
     instance = {}
@@ -77,7 +95,8 @@ def main():
         target_types=instance.get("target_types"),
         agent_capabilities=instance.get("agent_capabilities"))
     result = evaluate_instance(
-        args.checkpoint, env, truth, agents, device=args.device)
+        args.checkpoint, env, truth, agents, device=args.device,
+        allow_feature_schema_mismatch=args.allow_feature_schema_mismatch)
     print({key: result[key] for key in (
         "completed", "makespan", "num_deaths", "remaining_targets")})
 

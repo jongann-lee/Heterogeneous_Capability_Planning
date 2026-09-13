@@ -121,6 +121,7 @@ class TensorWorld:
     physical_group_representative: torch.Tensor
     physical_group_mask: torch.Tensor
     target_candidate_mask: torch.Tensor
+    allow_unknown_target_actions: bool
     distance_scale: float
     target_distances: torch.Tensor
     target_incoming_nodes: torch.Tensor
@@ -266,6 +267,8 @@ class TensorWorld:
             physical_group_representative=physical_group_representative,
             physical_group_mask=physical_group_mask,
             target_candidate_mask=target_candidate_mask,
+            allow_unknown_target_actions=(
+                candidate_config.allow_unknown_target_actions),
             distance_scale=distance_scale,
             target_distances=target_sssp.distances,
             target_incoming_nodes=target_incoming_nodes,

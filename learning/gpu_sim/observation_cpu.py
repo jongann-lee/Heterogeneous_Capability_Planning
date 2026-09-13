@@ -11,7 +11,12 @@ from learning.policy.candidates import (
     generate_candidates,
     physical_group_metadata,
 )
-from learning.policy.configuration import CandidateConfig, load_config
+from learning.policy.configuration import (
+    CandidateConfig,
+    PER_DECISION_EDGE_NORMALIZATION,
+    RAW_EDGE_NORMALIZATION,
+    load_config,
+)
 from simulation.domain import UNKNOWN_TYPE
 
 
@@ -61,6 +66,97 @@ def feature_dimensions(num_target_types: int) -> tuple[int, int, int, int, int, 
     return (9 + num_target_types, 8 + num_target_types, 11, 6, 6, 7)
 
 
+def normalize_task_graph_travel_times(
+        observation: PlannerObservation,
+        agent_remaining_times: torch.Tensor,
+        method: str,
+        epsilon: float,
+        ) -> PlannerObservation:
+    """Normalize all valid task-graph travel edges per batch item.
+
+    The three edge families share one population mean and standard deviation.
+    Masks are authoritative: unreachable, inactive, padded, and wait relations
+    neither affect the statistics nor receive a nonzero feature.
+    """
+    if method == RAW_EDGE_NORMALIZATION:
+        return observation
+    if method != PER_DECISION_EDGE_NORMALIZATION:
+        raise ValueError(f"unsupported task-graph edge normalization: {method!r}")
+    if epsilon <= 0:
+        raise ValueError("edge normalization epsilon must be positive")
+
+    distances = (
+        observation.agent_target_distances,
+        observation.agent_action_distances,
+        observation.action_target_distances,
+    )
+    masks = tuple(
+        mask & torch.isfinite(value.squeeze(-1))
+        for value, mask in zip(distances, (
+            observation.agent_target_distance_mask,
+            observation.agent_action_distance_mask,
+            observation.action_target_distance_mask,
+        )))
+    (observation.agent_target_distance_mask,
+     observation.agent_action_distance_mask,
+     observation.action_target_distance_mask) = masks
+    batch = observation.agent_features.shape[0]
+    flat_values = torch.cat([
+        value.squeeze(-1).reshape(batch, -1) for value in distances
+    ], dim=1)
+    flat_masks = torch.cat([
+        mask.reshape(batch, -1) for mask in masks
+    ], dim=1)
+    safe_values = torch.where(
+        flat_masks, flat_values, torch.zeros_like(flat_values))
+    counts = flat_masks.sum(dim=1)
+    count_scale = counts.clamp_min(1).to(flat_values.dtype)
+    means = safe_values.sum(dim=1) / count_scale
+    centered = safe_values - means[:, None]
+    variances = (
+        torch.where(flat_masks, centered.square(), torch.zeros_like(centered))
+    ).sum(dim=1) / count_scale
+    standard_deviations = variances.clamp_min(0).sqrt()
+    denominators = standard_deviations.clamp_min(float(epsilon))
+    has_edges = counts > 0
+
+    normalized = []
+    for value, mask in zip(distances, masks):
+        view_shape = (batch,) + (1,) * (value.ndim - 1)
+        transformed = (
+            value - means.view(view_shape)
+        ) / denominators.view(view_shape)
+        normalized.append(torch.where(
+            mask[..., None] & has_edges.view(view_shape),
+            transformed,
+            torch.zeros_like(value)))
+    (observation.agent_target_distances,
+     observation.agent_action_distances,
+     observation.action_target_distances) = normalized
+
+    moving = observation.agent_features[..., 5].bool() & observation.agent_mask
+    normalized_remaining = (
+        agent_remaining_times - means[:, None]
+    ) / denominators[:, None]
+    normalized_remaining = torch.where(
+        moving & has_edges[:, None], normalized_remaining,
+        torch.zeros_like(agent_remaining_times))
+    observation.task_agent_features[..., 1] = normalized_remaining
+    # The Transformer consumes this legacy slot. Under schema 2 it represents
+    # the same per-decision normalized remaining time as the task graph.
+    observation.agent_features[..., 8] = normalized_remaining
+
+    normalized_at = observation.agent_target_distances.squeeze(-1)
+    normalized_aa = observation.agent_action_distances.squeeze(-1)
+    normalized_ct = observation.action_target_distances.squeeze(-1)
+    observation.agent_target_relations[..., 0] = normalized_at
+    observation.agent_target_relations[..., 1] = normalized_at
+    observation.agent_action_relations[..., 0] = normalized_aa
+    observation.agent_action_relations[..., 1] = normalized_aa
+    observation.action_target_relations[..., 3] = normalized_ct
+    return observation
+
+
 def attach_task_graph_fields(observation: PlannerObservation,
                              agent_target_reachable: torch.Tensor,
                              action_target_reachable: torch.Tensor,
@@ -68,10 +164,13 @@ def attach_task_graph_fields(observation: PlannerObservation,
                              agent_action_distances: torch.Tensor | None = None,
                              action_target_distances: torch.Tensor | None = None,
                              agent_remaining_times: torch.Tensor | None = None,
+                             edge_normalization: str = RAW_EDGE_NORMALIZATION,
+                             edge_normalization_epsilon: float = 1.0e-6,
                              ) -> PlannerObservation:
     """Attach the geometry-free heterogeneous task-graph view in-place.
 
-    The legacy observation remains intact for the Transformer control policy.
+    The legacy observation remains available for the Transformer control policy;
+    schema 2 updates its travel-time slots to the shared normalized values.
     Task-graph callers provide raw traversal times for both the agent node
     feature and distance relations. The fallbacks preserve compatibility for
     callers that only construct the legacy normalized view. Explicit masks
@@ -85,8 +184,8 @@ def attach_task_graph_fields(observation: PlannerObservation,
     remaining_feature = (
         agent[..., 8:9] if agent_remaining_times is None else
         agent_remaining_times[..., None])
-    # alive, raw remaining transit time, scout capability, then every positive
-    # service capability.
+    # Alive, remaining transit time, scout capability, then every positive
+    # service capability. Schema 2 normalizes the remaining-time slot below.
     observation.task_agent_features = torch.cat(
         (agent[..., 2:3], remaining_feature, agent[..., 3:4], agent[..., 9:]),
         dim=-1)
@@ -116,8 +215,10 @@ def attach_task_graph_fields(observation: PlannerObservation,
     ct_nodes = observation.action_mask[:, :, None] & observation.target_mask[:, None]
     observation.agent_target_distance_mask = (
         agent_target_reachable.bool() & at_nodes)
+    physical_action = ~observation.task_action_features[..., 3].bool()
     observation.agent_action_distance_mask = (
-        observation.agent_action_relations[..., 2].bool() & aa_nodes)
+        observation.agent_action_relations[..., 2].bool() & aa_nodes
+        & physical_action[:, None])
     observation.action_target_distance_mask = (
         action_target_reachable.bool() & ct_nodes)
     observation.serves_mask = (
@@ -126,7 +227,12 @@ def attach_task_graph_fields(observation: PlannerObservation,
         observation.action_target_relations[..., 1].bool() & ct_nodes)
     observation.stages_for_mask = (
         observation.action_target_relations[..., 2].bool() & ct_nodes)
-    return observation
+    remaining = (
+        observation.task_agent_features[..., 1]
+        if agent_remaining_times is None else agent_remaining_times)
+    return normalize_task_graph_travel_times(
+        observation, remaining, edge_normalization,
+        edge_normalization_epsilon)
 
 
 def _positions(graph):
@@ -186,11 +292,24 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
                       committed_targets: dict[Any, Any] | None = None,
                       candidate_config: CandidateConfig | None = None,
                       replan_transit: bool = False,
+                      edge_normalization: str | None = None,
+                      edge_normalization_epsilon: float | None = None,
                       ) -> PlannerObservation:
     """Build one observation using only ``graph`` (the planner's view)."""
+    defaults = None
+    if (candidate_config is None or edge_normalization is None
+            or edge_normalization_epsilon is None):
+        defaults = load_config()
+    candidate_config = candidate_config or defaults.candidates
+    edge_normalization = (
+        defaults.model.edge_normalization
+        if edge_normalization is None else edge_normalization)
+    edge_normalization_epsilon = (
+        defaults.model.edge_normalization_epsilon
+        if edge_normalization_epsilon is None
+        else edge_normalization_epsilon)
     if candidates is None:
-        candidates = generate_candidates(
-            graph, candidate_config or load_config().candidates)
+        candidates = generate_candidates(graph, candidate_config)
     agents = list(agents)
     transit = list(transit) if transit is not None else [None] * len(agents)
     if len(transit) != len(agents):
@@ -313,7 +432,13 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
             compatible = True
             if candidate.is_target and candidate.node in graph:
                 kind = int(graph.nodes[candidate.node].get("rps_type", UNKNOWN_TYPE))
-                compatible = kind == UNKNOWN_TYPE or agent.can_service(kind)
+                if kind == UNKNOWN_TYPE:
+                    compatible = bool(
+                        candidate_config.allow_unknown_target_actions
+                        and any(capability > 0
+                                for capability in agent.capabilities))
+                else:
+                    compatible = agent.can_service(kind)
             valid = bool(agent.alive and reachable and category_ok and compatible)
             if travel is not None and not replan_transit:
                 valid = False
@@ -388,7 +513,9 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
         agent_target_distances=task_at_distance.unsqueeze(0),
         agent_action_distances=task_ac_distance.unsqueeze(0),
         action_target_distances=task_ct_distance.unsqueeze(0),
-        agent_remaining_times=raw_remaining.unsqueeze(0))
+        agent_remaining_times=raw_remaining.unsqueeze(0),
+        edge_normalization=edge_normalization,
+        edge_normalization_epsilon=edge_normalization_epsilon)
 
 
 def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:

@@ -1,4 +1,4 @@
-"""Training utilities and CLI for WV-terrain experiments."""
+"""Training utilities and CLI for prepared-terrain experiments."""
 
 import argparse
 from dataclasses import asdict, replace
@@ -16,10 +16,15 @@ from learning.policy.configuration import (
     LearningConfig,
     ModelConfig,
     ReinforceConfig,
+    feature_schema_metadata,
     load_config,
 )
 from learning.policy.model import build_policy
-from learning.gpu_sim.instances import make_wv_dem_instance
+from Real_Life_Maps.prepared_map import DEFAULT_PREPARED_MAP_PATH
+from learning.gpu_sim.instances import (
+    inspect_prepared_map,
+    make_prepared_map_instance,
+)
 from learning.policy.oracle import full_information_makespan
 from learning.policy.adapter import LearnedPolicyAdapter
 from learning.policy.reinforce import (EMABaseline, batched_optimization_step,
@@ -84,12 +89,22 @@ def _atomic_yaml_save(payload, path: Path):
     temporary.replace(path)
 
 
-def _save_run_config(run_directory: Path, run_config: LearningConfig,
-                     backend=None):
+def _serialized_run_config(run_config: LearningConfig, backend=None,
+                           prepared_map=None):
     saved_config = asdict(run_config)
+    saved_config["feature_schema"] = feature_schema_metadata(run_config.model)
     saved_config["instance"] = _instance_config()
     if backend is not None:
         saved_config["backend"] = backend
+    if prepared_map is not None:
+        saved_config["prepared_map"] = prepared_map
+    return saved_config
+
+
+def _save_run_config(run_directory: Path, run_config: LearningConfig,
+                     backend=None, prepared_map=None):
+    saved_config = _serialized_run_config(
+        run_config, backend=backend, prepared_map=prepared_map)
     _atomic_yaml_save(saved_config, run_directory / "config.yaml")
 
 
@@ -119,7 +134,8 @@ def train(instance_factory, num_target_types, episodes=100,
           model_config: ModelConfig | None = None,
           candidate_config: CandidateConfig | None = None,
           reinforce_config: ReinforceConfig | None = None, device="cpu",
-          checkpoint=None, run_config: LearningConfig | None = None):
+          checkpoint=None, run_config: LearningConfig | None = None,
+          prepared_map=None):
     """Train on fresh instances returned as ``(env, truth, agents)``."""
     defaults = load_config()
     model_config = model_config or replace(
@@ -139,8 +155,18 @@ def train(instance_factory, num_target_types, episodes=100,
         run_config = LearningConfig(
             model_config, candidate_config, reinforce_config, training_config,
             defaults.instances)
+    else:
+        # Persist the feature schema and feasibility toggle actually used by
+        # this run even when a programmatic caller supplied stale metadata.
+        run_config = replace(
+            run_config, model=model_config, candidates=candidate_config,
+            reinforce=reinforce_config)
+    if prepared_map is None and run_config.instances.map_path is not None:
+        prepared_map = inspect_prepared_map(
+            run_config.instances.map_path)[3]
     if run_directory is not None:
-        _save_run_config(run_directory, run_config)
+        _save_run_config(
+            run_directory, run_config, prepared_map=prepared_map)
 
     wandb_run = None
     if run_config.training.wandb:
@@ -149,8 +175,8 @@ def train(instance_factory, num_target_types, episodes=100,
         except ImportError as error:
             raise RuntimeError(
                 "training.wandb is enabled, but wandb is not installed") from error
-        logged_config = asdict(run_config)
-        logged_config["instance"] = _instance_config()
+        logged_config = _serialized_run_config(
+            run_config, prepared_map=prepared_map)
         wandb_run = wandb.init(
             project="heterogeneous-capability-planning",
             name=timestamp,
@@ -227,8 +253,8 @@ def train(instance_factory, num_target_types, episodes=100,
 def train_gpu(env, truth, agents, episodes, simulation_batch_size,
               reinforce_batch_size, model_config,
               candidate_config, reinforce_config, run_config, device,
-              checkpoint=None, instance_factory=None):
-    """Train with parallel CUDA tensor episodes on one immutable WV world."""
+              checkpoint=None, instance_factory=None, prepared_map=None):
+    """Train with parallel CUDA tensor episodes on one immutable terrain."""
     from learning.gpu_sim.observation_gpu import TensorObservationBuilder
     from learning.gpu_sim.rollout_gpu import (collect_tensor_episodes,
                                               replay_tensor_gradients)
@@ -236,16 +262,23 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
     from learning.gpu_sim.world import TensorWorld
 
     timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S_%f")
+    run_config = replace(
+        run_config, model=model_config, candidates=candidate_config,
+        reinforce=reinforce_config)
     run_directory = Path(checkpoint) / timestamp if checkpoint else None
+    if prepared_map is None and run_config.instances.map_path is not None:
+        prepared_map = inspect_prepared_map(
+            run_config.instances.map_path)[3]
     if run_directory is not None:
         run_directory.mkdir(parents=True, exist_ok=False)
-        _save_run_config(run_directory, run_config, backend="cuda_tensor")
+        _save_run_config(
+            run_directory, run_config, backend="cuda_tensor",
+            prepared_map=prepared_map)
     wandb_run = None
     if run_config.training.wandb:
         import wandb
-        logged_config = asdict(run_config)
-        logged_config["instance"] = _instance_config()
-        logged_config["backend"] = "cuda_tensor"
+        logged_config = _serialized_run_config(
+            run_config, backend="cuda_tensor", prepared_map=prepared_map)
         wandb_run = wandb.init(
             project="heterogeneous-capability-planning", name=timestamp,
             config=logged_config,
@@ -255,7 +288,10 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
     terrain = world.terrain
     builder = TensorObservationBuilder(
         world, model_config.num_target_types,
-        task_graph=model_config.architecture == "task_graph")
+        task_graph=model_config.architecture == "task_graph",
+        edge_normalization=model_config.edge_normalization,
+        edge_normalization_epsilon=(
+            model_config.edge_normalization_epsilon))
     model = build_policy(model_config).to(device)
     optimizer = torch.optim.Adam(model.parameters(),
                                  lr=reinforce_config.learning_rate)
@@ -318,7 +354,11 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                         builder = TensorObservationBuilder(
                             world, model_config.num_target_types,
                             task_graph=(
-                                model_config.architecture == "task_graph"))
+                                model_config.architecture == "task_graph"),
+                            edge_normalization=(
+                                model_config.edge_normalization),
+                            edge_normalization_epsilon=(
+                                model_config.edge_normalization_epsilon))
                         source, caps, types = encode_episode(
                             world, batch_truth, batch_agents)
                         oracle_makespan = full_information_makespan(
@@ -488,8 +528,11 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train the configured learned policy on the 64x64 WV DEM")
+        description="Train the configured learned policy on a prepared map")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    parser.add_argument(
+        "--map-path",
+        help="prepared-map artifact; overrides instances.map_path")
     parser.add_argument("--episodes", type=int)
     parser.add_argument("--simulation-batch-size", type=int)
     parser.add_argument("--reinforce-batch-size", type=int)
@@ -532,6 +575,14 @@ def main():
     device = ("cuda" if torch.cuda.is_available() else "cpu") \
         if requested_device == "auto" else requested_device
     checkpoint = args.checkpoint or training.checkpoint
+    configured_map_path = (
+        args.map_path or config.instances.map_path
+        or str(DEFAULT_PREPARED_MAP_PATH))
+    try:
+        resolved_map_path, _terrain, _map_metadata, prepared_map = (
+            inspect_prepared_map(configured_map_path))
+    except (FileNotFoundError, ValueError) as error:
+        parser.error(str(error))
     model_config = replace(config.model, num_target_types=num_target_types)
     resolved_training = replace(
         training, episodes=episodes,
@@ -541,7 +592,7 @@ def main():
         device=requested_device, checkpoint=checkpoint)
     resolved_config = LearningConfig(
         model_config, config.candidates, config.reinforce, resolved_training,
-        config.instances)
+        replace(config.instances, map_path=str(resolved_map_path)))
     torch.manual_seed(seed)
 
     def factory(episode):
@@ -550,14 +601,15 @@ def main():
             episode_seed, training.num_agents, config.instances,
             requested_num_agents=args.num_agents,
             agent_capabilities=agent_capabilities)
-        return make_wv_dem_instance(
+        return make_prepared_map_instance(
             episode_seed, num_target_types, episode_num_agents,
             source_position=globals().get("SOURCE_POSITION"),
             target_positions=globals().get("TARGET_POSITIONS"),
             target_types=globals().get("TARGET_TYPES"),
             agent_capabilities=agent_capabilities,
             min_targets=config.instances.min_targets,
-            max_targets=config.instances.max_targets)
+            max_targets=config.instances.max_targets,
+            map_path=resolved_map_path)
 
     if device == "cuda":
         env, truth, agents = factory(0)
@@ -565,14 +617,16 @@ def main():
             env, truth, agents, episodes, simulation_batch_size,
             reinforce_batch_size, model_config,
             config.candidates, config.reinforce, resolved_config, device,
-            checkpoint=checkpoint, instance_factory=factory)
+            checkpoint=checkpoint, instance_factory=factory,
+            prepared_map=prepared_map)
         train.last_run_directory = run_directory
     else:
         _model, history = train(
             factory, num_target_types, episodes,
             model_config=model_config, candidate_config=config.candidates,
             reinforce_config=config.reinforce, device=device,
-            checkpoint=checkpoint, run_config=resolved_config)
+            checkpoint=checkpoint, run_config=resolved_config,
+            prepared_map=prepared_map)
     last = history[-1] if history else {}
     print(f"run_directory={train.last_run_directory} episodes={episodes} "
           f"last_return={last.get('return')} completed={last.get('completed')}")

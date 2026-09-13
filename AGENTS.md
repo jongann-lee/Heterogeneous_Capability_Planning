@@ -212,6 +212,11 @@ passed RNG where the API supports one.
   normally uses the configuration saved beside the weights. FI-OPT and
   Scout-Then-Execute need no checkpoint and always use the CPU event-driven
   simulator; `--device` and `--cuda` apply only to the learned policy.
+  A relocated prepared map is accepted when its content hash matches the
+  checkpoint; `--allow-map-mismatch` is required and recorded for deliberate
+  learned-policy evaluation on different map content.
+  Evaluation JSON is written by default to a timestamped file under
+  `outputs/evaluation`; `--output` selects an explicit path.
   Evaluation defaults to the `development` suite; rendering is valid only
   after filters select one case. Non-rendering learned CUDA evaluation batches
   cases only when they share a target world and agent count, while reusing each

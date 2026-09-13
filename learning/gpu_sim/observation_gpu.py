@@ -7,13 +7,18 @@ from learning.gpu_sim.observation_cpu import (
     attach_task_graph_fields,
     feature_dimensions,
 )
+from learning.policy.configuration import PER_DECISION_EDGE_NORMALIZATION
 
 
 class TensorObservationBuilder:
-    def __init__(self, world, num_target_types, task_graph=True):
+    def __init__(self, world, num_target_types, task_graph=True,
+                 edge_normalization=PER_DECISION_EDGE_NORMALIZATION,
+                 edge_normalization_epsilon=1.0e-6):
         self.world = world
         self.num_target_types = int(num_target_types)
         self.task_graph = bool(task_graph)
+        self.edge_normalization = edge_normalization
+        self.edge_normalization_epsilon = float(edge_normalization_epsilon)
 
     def candidate_roles(self, state):
         live = state.target_live
@@ -232,8 +237,11 @@ class TensorObservationBuilder:
         at_rel[..., 1] = normalized_at
         at_rel[..., 2] = state.target_known[:, None]
         at_rel[..., 3] = ~state.target_known[:, None]
+        visible_type_indices = torch.where(
+            state.target_known, state.target_types,
+            torch.zeros_like(state.target_types))
         target_capability = state.capabilities.gather(
-            2, state.target_types[:, None, :].expand(-1, agents, -1))
+            2, visible_type_indices[:, None, :].expand(-1, agents, -1))
         at_rel[..., 4] = target_capability & state.target_known[:, None]
 
         # Standard routes block all live targets. Target-action columns select
@@ -265,15 +273,23 @@ class TensorObservationBuilder:
                         ~state.capabilities[..., 0, None])
         compatible = torch.ones((batch, agents, actions), dtype=torch.bool,
                                 device=device)
+        has_service_capability = state.capabilities[..., 1:].any(dim=2)
         for target in range(targets):
             columns = world.target_candidate_mask[:, target]
-            type_index = state.target_types[:, target, None].expand(
-                -1, agents).unsqueeze(2)
+            known = state.target_known[:, target, None]
+            type_index = torch.where(
+                known, state.target_types[:, target, None],
+                torch.zeros_like(state.target_types[:, target, None]))
+            type_index = type_index.expand(-1, agents).unsqueeze(2)
             has_capability = state.capabilities.gather(
                 2, type_index).squeeze(2)
-            compatible[..., columns] = (
-                ~state.target_known[:, None, target, None] |
-                has_capability[..., None])
+            unknown_compatible = (
+                has_service_capability
+                if world.allow_unknown_target_actions
+                else torch.zeros_like(has_service_capability))
+            target_compatible = torch.where(
+                known, has_capability, unknown_compatible)
+            compatible[..., columns] = target_compatible[..., None]
         ac_rel[..., 4] = category_ok
         ac_rel[..., 5] = compatible
         feasible = state.alive[..., None] & active[:, None] & reachable & category_ok & compatible
@@ -282,12 +298,13 @@ class TensorObservationBuilder:
         ct_rel[..., 0] = world.target_candidate_mask
         ct_rel[..., 1] = observed_links
         ct_rel[..., 2] = staging_links
-        if self.task_graph:
+        if (self.task_graph
+                or self.edge_normalization == PER_DECISION_EDGE_NORMALIZATION):
             base_distance = self._action_target_distances(
                 state, planning_episode_mask)
         else:
-            # Preserve the original Transformer's static relation tensor and
-            # avoid constructing reverse cuGraph route banks it never consumes.
+            # Preserve schema-1 Transformer's static relation tensor and avoid
+            # constructing reverse cuGraph route banks it never consumes.
             target_region_options = world.target_distances[
                 :, region_nodes].permute(1, 0, 2)
             target_region_options = target_region_options.masked_fill(
@@ -339,7 +356,9 @@ class TensorObservationBuilder:
             agent_target_distances=task_at_distance,
             agent_action_distances=task_ac_distance,
             action_target_distances=task_ct_distance,
-            agent_remaining_times=remaining)
+            agent_remaining_times=remaining,
+            edge_normalization=self.edge_normalization,
+            edge_normalization_epsilon=self.edge_normalization_epsilon)
         return (observation, route_distances, predecessors,
                 target_route_distances, target_entries,
                 candidate_entry_nodes)

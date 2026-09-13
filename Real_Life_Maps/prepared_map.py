@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import math
 from pathlib import Path
 import pickle
@@ -15,6 +16,13 @@ PREPARED_MAP_SCHEMA = 1
 DEFAULT_PREPARED_MAP_PATH = (
     Path(__file__).resolve().parent / "WV_tobler_viewshed_64.pkl.gz"
 )
+REQUIRED_NODE_ATTRIBUTES = frozenset({
+    "pos", "height", "elevation_m", "type", "visible_nodes",
+    "visible_edges",
+})
+REQUIRED_EDGE_ATTRIBUTES = frozenset({
+    "distance", "is_road", "observed_edge", "num_used",
+})
 
 
 def _validate_graph(graph: nx.DiGraph, coarse_size: int) -> None:
@@ -32,9 +40,7 @@ def _validate_graph(graph: nx.DiGraph, coarse_size: int) -> None:
         )
     graph_edges = set(graph.edges)
     for node, data in graph.nodes(data=True):
-        missing = {
-            "pos", "height", "elevation_m", "visible_nodes", "visible_edges"
-        } - data.keys()
+        missing = REQUIRED_NODE_ATTRIBUTES - data.keys()
         if missing:
             raise ValueError(
                 f"prepared map node {node!r} is missing {sorted(missing)}"
@@ -55,16 +61,51 @@ def _validate_graph(graph: nx.DiGraph, coarse_size: int) -> None:
                 "with visible_nodes"
             )
     for u, v, data in graph.edges(data=True):
+        missing = REQUIRED_EDGE_ATTRIBUTES - data.keys()
+        if missing:
+            raise ValueError(
+                f"prepared map edge {(u, v)!r} is missing {sorted(missing)}"
+            )
         distance = data.get("distance")
         if (not isinstance(distance, (int, float))
                 or not math.isfinite(float(distance)) or distance <= 0):
             raise ValueError(
                 f"prepared map edge {(u, v)!r} has invalid distance"
             )
-        if "is_road" not in data:
-            raise ValueError(
-                f"prepared map edge {(u, v)!r} is missing is_road"
-            )
+
+
+def resolve_prepared_map_path(path=DEFAULT_PREPARED_MAP_PATH) -> Path:
+    """Return the canonical artifact path used for loading and cache keys."""
+    return Path(path).expanduser().resolve()
+
+
+def prepared_map_sha256(path=DEFAULT_PREPARED_MAP_PATH) -> str:
+    """Hash the serialized prepared-map content without modifying it."""
+    resolved = resolve_prepared_map_path(path)
+    digest = hashlib.sha256()
+    with resolved.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def prepared_map_identity(path, graph: nx.DiGraph, metadata: dict,
+                          configured_path=None) -> dict:
+    """Return portable identity and descriptive metadata for one artifact."""
+    resolved = resolve_prepared_map_path(path)
+    coarse_size = int(metadata["coarse_size"])
+    return {
+        "configured_path": str(
+            path if configured_path is None else configured_path),
+        "resolved_path": str(resolved),
+        "schema_version": PREPARED_MAP_SCHEMA,
+        "sha256": prepared_map_sha256(resolved),
+        "dimensions": [coarse_size, coarse_size],
+        "coarse_size": coarse_size,
+        "node_count": int(graph.number_of_nodes()),
+        "edge_count": int(graph.number_of_edges()),
+        "metadata": dict(metadata),
+    }
 
 
 def validate_prepared_map(payload: dict) -> tuple[nx.DiGraph, dict]:
@@ -90,7 +131,7 @@ def validate_prepared_map(payload: dict) -> tuple[nx.DiGraph, dict]:
 
 def load_prepared_map(path=DEFAULT_PREPARED_MAP_PATH) -> tuple[nx.DiGraph, dict]:
     """Load a map produced by ``Real_Life_Maps.build_map``."""
-    path = Path(path)
+    path = resolve_prepared_map_path(path)
     if not path.is_file():
         raise FileNotFoundError(
             f"prepared terrain map not found: {path}. Build it with "
@@ -133,7 +174,12 @@ def save_prepared_map(graph: nx.DiGraph, metadata: dict, path) -> Path:
 __all__ = [
     "DEFAULT_PREPARED_MAP_PATH",
     "PREPARED_MAP_SCHEMA",
+    "REQUIRED_EDGE_ATTRIBUTES",
+    "REQUIRED_NODE_ATTRIBUTES",
     "load_prepared_map",
+    "prepared_map_identity",
+    "prepared_map_sha256",
+    "resolve_prepared_map_path",
     "save_prepared_map",
     "validate_prepared_map",
 ]

@@ -42,10 +42,25 @@ single-source helper may persist. This dynamic route bank is separate from the
 scenario-static staging-geometry cache described above.
 
 `learning/policy/configuration.py` loads and validates experiment settings. The
-task-graph policy consumes only capabilities, raw remaining transit time,
-completion/type beliefs, action categories, raw safe-route distances, and
-typed action-target semantic relations. It receives no absolute coordinates,
-heights, or ground truth.
+task-graph policy consumes only capabilities, normalized remaining transit
+time, completion/type beliefs, action categories, normalized safe-route
+distances, and typed action-target semantic relations. For every decision,
+`model.edge_normalization: per_decision_zscore` computes one population mean
+and standard deviation over all finite, reachable agent-target, agent-action,
+and action-target edges in that episode. CUDA batches compute those statistics
+independently per episode. Wait, unreachable, and padded relations are excluded.
+The normalization changes neural features only; terrain edges, routing,
+makespan, FI-OPT, and reports continue to use real seconds.
+
+`candidates.allow_unknown_target_actions` controls risky direct contact with
+unrevealed targets. The default `false` requires scouting first. When enabled,
+only agents with a positive service capability may contact an unknown target;
+pure scouts are never eligible. Known targets always require the matching
+service capability. Both this toggle and the model feature-schema metadata are
+saved in checkpoints, W&B configuration, and evaluation JSON. Schema-1 raw
+distance checkpoints require retraining or the explicit
+`--allow-feature-schema-mismatch` evaluation override. No observation path
+receives absolute coordinates, heights, or ground truth.
 
 Training returns are normalized against
 `planning.full_information.full_information_makespan`, the exact FI-OPT
@@ -57,13 +72,19 @@ assignment cannot be transit nodes. The logged `normalized_regret` is
 penalties are dimensionless and applied directly after makespan normalization,
 so an incomplete episode cannot exploit the oracle credit by stopping early.
 
-Training and greedy evaluation use the clockwise-rotated 64x64 WV DEM:
+Training and evaluation load a validated offline-built prepared map. The
+clockwise-rotated 64x64 WV artifact remains the backward-compatible default,
+but `instances.map_path` or `--map-path` may select another artifact size:
 
 ```bash
 uv run python -m learning.train --episodes 100
 uv run python -m learning.train --config learning/config.yaml
 uv run python -m learning.train --config learning/config_transformer.yaml
+uv run python -m learning.train \
+  --map-path Real_Life_Maps/WV_tobler_viewshed_64.pkl.gz
 uv run python -m learning.test learning/checkpoints/<run-timestamp> --device cuda
+uv run python -m learning.test learning/checkpoints/<run-timestamp> \
+  --map-path Real_Life_Maps/WV_tobler_viewshed_64.pkl.gz --device cuda
 uv run python -m learning.test --policy fi-opt --suite test
 uv run python -m learning.test --policy scout-then-execute --suite test
 uv run python -m learning.test learning/checkpoints/<run-timestamp> \
@@ -96,6 +117,12 @@ the complete suite. `--agent-config`,
 Cartesian product. An explicit suite JSON path can replace either alias.
 Rendering is accepted only when the final filtered selection contains exactly
 one scenario. Every result records both its resolved suite ID and scenario ID.
+Suite coordinates are checked against actual nodes in the selected graph, not
+a fixed coordinate bound. `terrain_id` remains descriptive suite metadata.
+Every evaluation writes its full JSON result to
+`outputs/evaluation/<current-date-and-time>.json` by default. Pass
+`--output <path>` to choose the filename or destination explicitly. The CLI
+prints only the saved path instead of echoing the complete JSON payload.
 
 `learning.analyze` keeps the full evaluation JSON as the raw reproducible
 artifact and prints a compact report derived from it. The report contains
@@ -131,6 +158,15 @@ configuration and one aggregate record per optimizer update are logged to the
 mean return, mean policy loss, mean makespan, and completion rate across the
 update's episode batch. Failure diagnostics include mean deaths, mean remaining
 targets, stalled rate, and all-agents-dead rate.
+
+The saved run configuration also records the resolved artifact path, prepared
+map schema, serialized-content SHA-256, dimensions, node/edge counts, and build
+metadata. Evaluation map precedence is explicit `--map-path`, an explicitly
+selected config, the checkpoint config, then the default WV artifact. This
+allows an rsynced map to be relocated with `--map-path`: matching content is
+accepted by hash. A different hash fails learned evaluation by default;
+`--allow-map-mismatch` is the deliberate override and is recorded in result
+JSON. Classical policies have no checkpoint-map hash requirement.
 
 For research runs, import `learning.train.train` and supply an
 `instance_factory(episode)` returning fresh `(env_map, ground_truth, agents)`
@@ -202,7 +238,7 @@ and pull only its checkpoint results. The W&B directory is excluded because it
 may be large and may still be receiving writes during an active run.
 
 ```bash
-RUN=2026-08-26_17-02-11_300431
+RUN=2026-09-11_14-58-56_040053
 mkdir -p "learning/checkpoints/${RUN}"
 
 rsync -avP \

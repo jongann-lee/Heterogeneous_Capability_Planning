@@ -2,10 +2,12 @@
 
 import copy
 from collections import OrderedDict
-from dataclasses import replace
+from dataclasses import asdict, replace
+from datetime import datetime
 from itertools import combinations, permutations, product
 import json
 from pathlib import Path
+import shutil
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,6 +18,7 @@ import torch
 import yaml
 
 from Real_Life_Maps.real_map_generation import RealTerrainGrid
+from Real_Life_Maps.prepared_map import save_prepared_map
 from learning.analyze import analyze_evaluation, format_analysis
 from learning.evaluation_suite import (
     AgentConfiguration,
@@ -24,6 +27,7 @@ from learning.evaluation_suite import (
     TargetDefinition,
     load_evaluation_suite,
     select_evaluation_cases,
+    validate_evaluation_suite_locations,
 )
 from learning.policy.candidates import (
     Candidate,
@@ -34,20 +38,33 @@ from learning.policy.candidates import (
 )
 import learning.policy.candidates as candidate_module
 from learning.policy.configuration import (
+    CURRENT_FEATURE_SCHEMA_VERSION,
     InstanceConfig,
     LearningConfig,
+    PER_DECISION_EDGE_NORMALIZATION,
+    RAW_DISTANCE_FEATURE_SCHEMA_VERSION,
+    RAW_EDGE_NORMALIZATION,
     load_config,
 )
 from learning.gpu_sim.routing import GridRouter
+from learning.gpu_sim.instances import (
+    _prepared_terrain_template_cached,
+    inspect_prepared_map,
+    make_prepared_map_instance,
+)
 from learning.gpu_sim.cugraph_router import CuGraphRouter
 from learning.gpu_sim.state import TensorEpisodeState
+from learning.gpu_sim.world import TensorWorld
 from learning.policy.model import (
     HeterogeneousGraphPolicy,
     VanillaTransformerPolicy,
     build_policy,
 )
 from learning.modules import AssignmentDecoder, DecoderOutput
-from learning.gpu_sim.observation_cpu import batch_observations, build_observation
+from learning.gpu_sim.observation_cpu import (
+    batch_observations,
+    build_observation,
+)
 from learning.gpu_sim.observation_gpu import TensorObservationBuilder
 from learning.policy.oracle import parallel_tsp
 from planning.full_information import (
@@ -67,8 +84,13 @@ from learning.gpu_sim.rollout_gpu import (
     collect_tensor_episodes,
     replay_tensor_gradients,
 )
-from learning.train import _episode_agent_count, train
-from learning.test import _cuda_batch_plan, evaluate as evaluate_suite
+from learning.train import _episode_agent_count, _serialized_run_config, train
+from learning.test import (
+    _cuda_batch_plan,
+    _evaluation_output_path,
+    _select_prepared_map_path,
+    evaluate as evaluate_suite,
+)
 import learning.test as evaluation_module
 from simulation.agent import Agent
 from simulation.domain import UNKNOWN_TYPE, init_target_types
@@ -86,6 +108,53 @@ def _line(length=5):
             graph.add_edge(u, v, distance=1.0, observed_edge=False)
     graph.nodes[0]["type"] = "source"
     return graph
+
+
+def _prepared_grid(size, height_offset=0.0):
+    graph = nx.grid_2d_graph(size, size, create_using=nx.DiGraph)
+    for node in graph:
+        height = float(height_offset + node[0] + node[1])
+        graph.nodes[node].update(
+            pos=node, height=height, elevation_m=height,
+            type="intermediate", visible_nodes=(node,), visible_edges=(),
+            diagnostic_label=f"node-{node[0]}-{node[1]}")
+    for u, v in graph.edges:
+        graph.edges[u, v].update(
+            distance=1.0, is_road=False, observed_edge=False,
+            num_used=1.0, diagnostic_label=f"edge-{u}-{v}")
+    return graph
+
+
+def _save_prepared_grid(directory, name, size, height_offset=0.0):
+    path = Path(directory) / name
+    graph = _prepared_grid(size, height_offset=height_offset)
+    save_prepared_map(
+        graph,
+        {"coarse_size": size, "distance_units": "seconds",
+         "terrain_label": name},
+        path)
+    return path
+
+
+def _write_single_case_suite(directory, source=(0, 0), target=(1, 1),
+                             terrain_id="temporary_terrain"):
+    path = Path(directory) / "suite.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "suite_id": "temporary_suite",
+        "terrain_id": terrain_id,
+        "num_target_types": 1,
+        "source_position": list(source),
+        "agent_configurations": [{
+            "id": "agents", "agent_count": 1, "profile": "hybrid",
+            "capabilities": [[0, 1]],
+        }],
+        "target_configurations": [{
+            "id": "targets", "target_count": 1, "profile": "single",
+            "targets": [{"position": list(target), "type": 1}],
+        }],
+    }))
+    return path
 
 
 def _instance(two_agents=True):
@@ -193,6 +262,90 @@ def test_development_evaluation_suite_preserves_original_rps_case():
     ]
     assert [target.target_type for target in case.target.targets] == [
         1, 2, 2, 1, 2, 3, 3]
+
+
+def test_evaluation_output_defaults_to_timestamp_and_honors_override():
+    timestamp = datetime(2026, 9, 10, 16, 42, 3, 123456)
+    default = _evaluation_output_path(now=timestamp)
+    assert default.parent.name == "evaluation"
+    assert default.name == "2026-09-10_16-42-03_123456.json"
+    explicit = _evaluation_output_path("named-result.json")
+    assert explicit == Path("named-result.json").resolve()
+
+
+def test_prepared_map_selection_factory_and_cache_are_map_aware():
+    with tempfile.TemporaryDirectory() as directory:
+        first_path = _save_prepared_grid(directory, "first.pkl.gz", 2)
+        second_path = _save_prepared_grid(directory, "second.pkl.gz", 3, 10.0)
+        _prepared_terrain_template_cached.cache_clear()
+        first_resolved, first_graph, _metadata, first_info = (
+            inspect_prepared_map(first_path))
+        second_resolved, second_graph, _metadata, second_info = (
+            inspect_prepared_map(second_path))
+        assert len(first_graph) == 4
+        assert len(second_graph) == 9
+        assert first_info["dimensions"] == [2, 2]
+        assert second_info["dimensions"] == [3, 3]
+        assert first_info["sha256"] != second_info["sha256"]
+        assert second_graph.nodes[(2, 2)]["diagnostic_label"] == "node-2-2"
+        assert second_graph.edges[(2, 2), (2, 1)]["diagnostic_label"].startswith(
+            "edge-")
+
+        base = load_config()
+        config_payload = asdict(base)
+        config_payload["instances"]["map_path"] = str(second_path)
+        config_path = Path(directory) / "learning.yaml"
+        config_path.write_text(yaml.safe_dump(config_payload))
+        selected_config = load_config(config_path)
+        assert selected_config.instances.map_path == str(second_path)
+        checkpoint_config = replace(
+            base, instances=replace(base.instances, map_path=str(first_path)))
+        explicit_config = replace(
+            base, instances=replace(base.instances, map_path=str(second_path)))
+        assert _select_prepared_map_path(
+            None, explicit_config, checkpoint_config) == str(second_path)
+        assert _select_prepared_map_path(
+            str(first_path), explicit_config, checkpoint_config) == str(first_path)
+
+        env, truth, agents = make_prepared_map_instance(
+            seed=0, num_target_types=1, num_agents=1,
+            source_position=(2, 2), target_positions=[(2, 1)],
+            target_types=[1], agent_capabilities=[{0, 1}],
+            map_path=selected_config.instances.map_path)
+        assert len(env) == len(truth) == 9
+        assert agents[0].position == (2, 2)
+        assert truth.nodes[(2, 1)]["rps_type"] == 1
+        assert str(first_resolved) != str(second_resolved)
+
+        try:
+            make_prepared_map_instance(
+                seed=0, num_target_types=1, num_agents=1,
+                source_position=(2, 2), target_positions=[(3, 0)],
+                target_types=[1], agent_capabilities=[{0, 1}],
+                map_path=second_path)
+        except ValueError as error:
+            assert "not present in the prepared map" in str(error)
+        else:
+            raise AssertionError("an absent prepared-map target was accepted")
+
+
+def test_suite_coordinates_use_selected_graph_membership_not_wv_bounds():
+    with tempfile.TemporaryDirectory() as directory:
+        suite_path = _write_single_case_suite(
+            directory, source=(64, 64), target=(64, 63),
+            terrain_id="not_wv_and_not_whitelisted")
+        suite, _path = load_evaluation_suite(suite_path)
+        assert suite.terrain_id == "not_wv_and_not_whitelisted"
+        graph = nx.DiGraph()
+        graph.add_nodes_from(((64, 64), (64, 63)))
+        validate_evaluation_suite_locations(suite, graph)
+        graph.remove_node((64, 63))
+        try:
+            validate_evaluation_suite_locations(suite, graph)
+        except ValueError as error:
+            assert "not present in the selected prepared map" in str(error)
+        else:
+            raise AssertionError("a suite target absent from the graph was accepted")
 
 
 def test_factorial_evaluation_suite_has_180_filterable_cases():
@@ -475,6 +628,18 @@ def _graph_model(num_target_types=2, use_critic=True):
     model = HeterogeneousGraphPolicy(config)
     model.eval()
     return model
+
+
+def _valid_task_distances(observation, batch_index=0):
+    values = []
+    for distance_name, mask_name in (
+            ("agent_target_distances", "agent_target_distance_mask"),
+            ("agent_action_distances", "agent_action_distance_mask"),
+            ("action_target_distances", "action_target_distance_mask")):
+        distances = getattr(observation, distance_name)[batch_index].squeeze(-1)
+        mask = getattr(observation, mask_name)[batch_index]
+        values.append(distances[mask])
+    return torch.cat(values)
 
 
 def test_tensor_router_matches_masked_networkx_shortest_paths():
@@ -950,7 +1115,7 @@ def test_classical_evaluation_needs_no_checkpoint_or_model_load():
     env = truth.copy()
     env.nodes[2]["rps_type"] = UNKNOWN_TYPE
 
-    def factory(_case):
+    def factory(_case, map_path=None):
         return env.copy(), truth.copy(), [Agent(0, capabilities={1})]
 
     with patch.object(evaluation_module, "_case_factory", side_effect=factory), \
@@ -966,7 +1131,7 @@ def test_classical_evaluation_needs_no_checkpoint_or_model_load():
     scout_truth = scout_env.copy()
     init_target_types(scout_env, scout_truth, {"tl": 1, "tr": 1})
 
-    def scout_factory(_case):
+    def scout_factory(_case, map_path=None):
         return (
             scout_env.copy(), scout_truth.copy(),
             [Agent("s", capabilities={0}), Agent("s", capabilities={1})],
@@ -1075,8 +1240,12 @@ def test_tensor_episode_transition_matches_cpu_line_episode():
 def test_yaml_configuration_loads_and_validates():
     config = load_config()
     assert config.model.model_dim % config.model.num_heads == 0
+    assert config.model.feature_schema_version == CURRENT_FEATURE_SCHEMA_VERSION
+    assert config.model.edge_normalization == PER_DECISION_EDGE_NORMALIZATION
+    assert config.model.edge_normalization_epsilon > 0
     assert config.candidates.include_wait
     assert config.candidates.include_pair_staging
+    assert not config.candidates.allow_unknown_target_actions
     assert config.instances.min_targets == 5
     assert config.instances.max_targets == 9
     assert config.instances.min_agents == 3
@@ -1097,7 +1266,8 @@ def test_training_writes_latest_best_and_final_weights():
         distance_embedding_dim=4,
     )
     candidate_config = replace(
-        config.candidates, staging_per_target=0, include_wait=False)
+        config.candidates, staging_per_target=0, include_wait=False,
+        allow_unknown_target_actions=True)
 
     def instance_factory(_episode):
         truth = _line(3)
@@ -1145,6 +1315,115 @@ def test_training_writes_latest_best_and_final_weights():
         assert isinstance(best_model, HeterogeneousGraphPolicy)
 
 
+def test_checkpoint_map_identity_relocation_and_mismatch_override():
+    with tempfile.TemporaryDirectory() as directory:
+        directory = Path(directory)
+        original_map = _save_prepared_grid(
+            directory, "original.pkl.gz", 2)
+        mismatched_map = _save_prepared_grid(
+            directory, "mismatched.pkl.gz", 2, height_offset=5.0)
+        relocated_map = directory / "relocated.pkl.gz"
+        shutil.copyfile(original_map, relocated_map)
+        suite_path = _write_single_case_suite(directory)
+        resolved_map, _graph, _metadata, map_info = inspect_prepared_map(
+            original_map)
+
+        base = load_config()
+        model_config = replace(
+            base.model, num_target_types=1, model_dim=16, num_heads=4,
+            num_world_blocks=1, message_passing_blocks=1,
+            distance_embedding_dim=4)
+        candidate_config = replace(
+            base.candidates, staging_per_target=0,
+            include_pair_staging=False, include_wait=False,
+            allow_unknown_target_actions=True)
+        training_config = replace(
+            base.training, episodes=1, simulation_batch_size=1,
+            reinforce_batch_size=1, num_agents=1, seed=0, device="cpu",
+            checkpoint=str(directory / "checkpoints"), wandb=False)
+        instance_config = replace(
+            base.instances, min_targets=1, max_targets=1,
+            min_agents=None, max_agents=None, map_path=str(resolved_map))
+        run_config = LearningConfig(
+            model_config, candidate_config, base.reinforce,
+            training_config, instance_config)
+
+        def instance_factory(_episode):
+            return make_prepared_map_instance(
+                seed=0, num_target_types=1, num_agents=1,
+                source_position=(0, 0), target_positions=[(1, 1)],
+                target_types=[1], agent_capabilities=[{0, 1}],
+                map_path=resolved_map)
+
+        _model, history = train(
+            instance_factory, 1, episodes=1,
+            model_config=model_config, candidate_config=candidate_config,
+            reinforce_config=base.reinforce, device="cpu",
+            checkpoint=training_config.checkpoint, run_config=run_config,
+            prepared_map=map_info)
+        assert len(history) == 1
+        run_directory = train.last_run_directory
+        saved = yaml.safe_load(
+            (run_directory / "config.yaml").read_text(encoding="utf-8"))
+        assert saved["instances"]["map_path"] == str(resolved_map)
+        assert saved["prepared_map"]["sha256"] == map_info["sha256"]
+        assert saved["prepared_map"]["schema_version"] == 1
+        assert saved["prepared_map"]["dimensions"] == [2, 2]
+        assert saved["prepared_map"]["metadata"]["terrain_label"] == (
+            "original.pkl.gz")
+        assert saved["model"]["feature_schema_version"] == (
+            CURRENT_FEATURE_SCHEMA_VERSION)
+        assert saved["model"]["edge_normalization"] == (
+            PER_DECISION_EDGE_NORMALIZATION)
+        assert saved["feature_schema"]["version"] == (
+            CURRENT_FEATURE_SCHEMA_VERSION)
+        assert saved["candidates"]["allow_unknown_target_actions"]
+
+        explicit_config_path = directory / "explicit-config.yaml"
+        explicit_payload = dict(saved)
+        explicit_payload["instances"] = dict(saved["instances"])
+        explicit_payload["instances"]["map_path"] = str(mismatched_map)
+        explicit_config_path.write_text(yaml.safe_dump(explicit_payload))
+        try:
+            evaluate_suite(
+                run_directory, config_path=explicit_config_path,
+                suite=suite_path, device="cpu")
+        except ValueError as error:
+            assert "does not match the checkpoint" in str(error)
+        else:
+            raise AssertionError(
+                "checkpoint map took precedence over the explicit config")
+
+        records, *_rest = evaluate_suite(
+            run_directory, config_path=explicit_config_path,
+            suite=suite_path, device="cpu",
+            map_path=relocated_map)
+        assert len(records) == 1
+        assert evaluation_module.evaluate.last_prepared_map[
+            "hash_matches_checkpoint"] is True
+        assert evaluation_module.evaluate.last_prepared_map[
+            "resolved_path"] == str(relocated_map.resolve())
+
+        try:
+            evaluate_suite(
+                run_directory, suite=suite_path, device="cpu",
+                map_path=mismatched_map)
+        except ValueError as error:
+            assert "does not match the checkpoint" in str(error)
+            assert "--allow-map-mismatch" in str(error)
+        else:
+            raise AssertionError("a mismatched checkpoint map was accepted")
+
+        mismatch_records, *_rest = evaluate_suite(
+            run_directory, suite=suite_path, device="cpu",
+            map_path=mismatched_map, allow_map_mismatch=True)
+        assert len(mismatch_records) == 1
+        evaluation_map = evaluation_module.evaluate.last_prepared_map
+        assert evaluation_map["hash_matches_checkpoint"] is False
+        assert evaluation_map["allow_map_mismatch"] is True
+        assert evaluation_map["mismatch_override_used"] is True
+
+
 def test_graph_and_transformer_configs_select_separate_policies():
     graph_config = load_config()
     transformer_path = Path(__file__).parents[1] / "learning" / "config_transformer.yaml"
@@ -1168,6 +1447,10 @@ def test_task_graph_schema_uses_beliefs_semantics_and_effective_distances():
         graph, [agent], 2,
         transit=[(0, 1, 0.0, 1.0)], clock=0.25,
         replan_transit=True)
+    raw_observation = build_observation(
+        graph, [agent], 2,
+        transit=[(0, 1, 0.0, 1.0)], clock=0.25,
+        replan_transit=True, edge_normalization=RAW_EDGE_NORMALIZATION)
 
     assert observation.task_agent_features.shape[-1] == 5
     assert observation.task_target_features.shape[-1] == 3
@@ -1187,23 +1470,254 @@ def test_task_graph_schema_uses_beliefs_semantics_and_effective_distances():
         i for i, item in enumerate(observation.candidates[0])
         if item.is_observation)
     target_index = 0
-    distance_scale = sum(float(data["distance"])
-                         for _u, _v, data in graph.edges(data=True))
-    assert abs(float(observation.task_agent_features[0, 0, 1]) - 0.75) < 1e-6
-    # The Transformer keeps its original normalized remaining-time feature.
-    assert abs(float(observation.agent_features[0, 0, 8])
-               - 0.75 / distance_scale) < 1e-6
-    expected = 0.75 + 3.0
-    assert abs(float(observation.agent_action_distances[
-        0, 0, target_action, 0]) - expected) < 1e-6
-    # The preserved Transformer relation still uses its original normalized
-    # route feature; only task-graph edge inputs were rolled back to raw time.
-    assert abs(float(observation.agent_action_relations[
-        0, 0, target_action, 0]) - 3.0 / distance_scale) < 1e-6
+    raw_values = _valid_task_distances(raw_observation)
+    mean = raw_values.mean()
+    std = raw_values.std(correction=0)
+    expected_remaining = (torch.tensor(0.75) - mean) / std.clamp_min(1.0e-6)
+    assert torch.allclose(
+        observation.task_agent_features[0, 0, 1], expected_remaining)
+    assert torch.allclose(
+        observation.agent_features[0, 0, 8], expected_remaining)
+    raw_target_distance = raw_observation.agent_action_distances[
+        0, 0, target_action, 0]
+    expected_target_distance = (
+        raw_target_distance - mean) / std.clamp_min(1.0e-6)
+    assert torch.allclose(
+        observation.agent_action_distances[0, 0, target_action, 0],
+        expected_target_distance)
+    assert torch.allclose(
+        observation.agent_action_relations[0, 0, target_action, 0],
+        expected_target_distance)
+    normalized_values = _valid_task_distances(observation)
+    assert abs(float(normalized_values.mean())) < 1e-6
+    assert abs(float(normalized_values.std(correction=0)) - 1.0) < 1e-6
     assert observation.serves_mask[0, target_action, target_index]
     assert observation.reveals_mask[0, observation_action, target_index]
     assert not observation.action_target_distance_mask[
         0, wait_action, target_index]
+
+
+def test_task_graph_distance_normalization_is_per_observation_and_shared():
+    first_graph = _line(5)
+    first_graph.nodes[4].update(type="target_unreached", rps_type=1)
+    second_graph = first_graph.copy()
+    second_graph.edges[0, 1]["distance"] = 7.0
+    first = build_observation(
+        first_graph, [Agent(0, capabilities={1})], 2)
+    second = build_observation(
+        second_graph,
+        [Agent(0, capabilities={1}), Agent(1, capabilities={2})], 2)
+    batched = batch_observations([first, second])
+    for row in range(2):
+        values = _valid_task_distances(batched, row)
+        assert values.numel() > 1
+        assert abs(float(values.mean())) < 1.0e-6
+        assert abs(float(values.std(correction=0)) - 1.0) < 1.0e-6
+
+
+def test_task_graph_normalization_has_zero_variance_and_no_edge_fallbacks():
+    singleton = nx.DiGraph()
+    singleton.add_node(
+        "t", pos=(0, 0), height=0.0,
+        type="target_unreached", rps_type=1, visible_edges=[])
+    zero_variance = build_observation(
+        singleton, [Agent("t", capabilities={1})], 1)
+    values = _valid_task_distances(zero_variance)
+    assert values.numel() == 3
+    assert torch.equal(values, torch.zeros_like(values))
+
+    targetless = _line(2)
+    no_edges = build_observation(
+        targetless, [Agent(0, capabilities={1})], 1,
+        transit=[(0, 1, 0.0, 1.0)], clock=0.5,
+        replan_transit=True)
+    assert _valid_task_distances(no_edges).numel() == 0
+    assert not no_edges.agent_action_distance_mask.any()
+    assert not no_edges.agent_action_distances.any()
+    # With no edge statistics there is no scale for a moving ETA either.
+    assert no_edges.task_agent_features[0, 0, 1] == 0
+
+
+def test_task_graph_normalization_excludes_unreachable_wait_and_padding():
+    graph = nx.DiGraph()
+    for node, kind in (("s", "source"), ("r", "target_unreached"),
+                       ("u", "target_unreached")):
+        graph.add_node(
+            node, pos=(len(graph), 0), height=0.0, type=kind,
+            rps_type=1 if kind == "target_unreached" else UNKNOWN_TYPE,
+            visible_edges=[])
+    graph.add_edge("s", "r", distance=2.0, observed_edge=False)
+    graph.add_edge("r", "s", distance=2.0, observed_edge=False)
+    observation = build_observation(
+        graph, [Agent("s", capabilities={1})], 1)
+    unreachable_target = observation.targets[0].index("u")
+    unreachable_action = next(
+        index for index, candidate in enumerate(observation.candidates[0])
+        if candidate.is_target and candidate.node == "u")
+    wait_action = next(
+        index for index, candidate in enumerate(observation.candidates[0])
+        if candidate.is_wait)
+    assert not observation.agent_target_distance_mask[
+        0, 0, unreachable_target]
+    assert observation.agent_target_distances[
+        0, 0, unreachable_target, 0] == 0
+    assert not observation.agent_action_distance_mask[
+        0, 0, unreachable_action]
+    assert observation.agent_action_distances[
+        0, 0, unreachable_action, 0] == 0
+    assert not observation.agent_action_distance_mask[0, 0, wait_action]
+    assert observation.agent_action_distances[0, 0, wait_action, 0] == 0
+
+    targetless = build_observation(
+        _line(2), [Agent(0, capabilities={1})], 1)
+    padded = batch_observations([targetless, observation])
+    assert not padded.target_mask[0].any()
+    assert not padded.agent_target_distance_mask[0].any()
+    assert not padded.action_target_distance_mask[0].any()
+    assert not padded.agent_target_distances[0].any()
+    assert not padded.action_target_distances[0].any()
+    original_actions = targetless.action_mask.shape[1]
+    assert not padded.action_mask[0, original_actions:].any()
+    assert not padded.agent_action_distance_mask[
+        0, :, original_actions:].any()
+    assert not padded.agent_action_distances[
+        0, :, original_actions:].any()
+
+
+def test_uniform_travel_time_scaling_preserves_features_and_policy_logits():
+    graph = _line(5)
+    graph.nodes[4].update(type="target_unreached", rps_type=1)
+    scaled = graph.copy()
+    for source, target in scaled.edges:
+        scaled.edges[source, target]["distance"] *= 80.0
+    original_distances = {
+        edge: graph.edges[edge]["distance"] for edge in graph.edges}
+    agent = Agent(0, capabilities={1})
+    scaled_agent = Agent(0, capabilities={1})
+    base = build_observation(
+        graph, [agent], 2,
+        transit=[(0, 1, 0.0, 1.0)], clock=0.25,
+        replan_transit=True)
+    enlarged = build_observation(
+        scaled, [scaled_agent], 2,
+        transit=[(0, 1, 0.0, 80.0)], clock=20.0,
+        replan_transit=True)
+    for name in (
+            "agent_target_distances", "agent_action_distances",
+            "action_target_distances", "task_agent_features",
+            "agent_target_relations", "agent_action_relations",
+            "action_target_relations"):
+        assert torch.allclose(
+            getattr(base, name), getattr(enlarged, name), atol=1.0e-6)
+    for name in (
+            "agent_target_distance_mask", "agent_action_distance_mask",
+            "action_target_distance_mask", "feasible_action_mask"):
+        assert torch.equal(getattr(base, name), getattr(enlarged, name))
+    model = _graph_model()
+    assert torch.allclose(model(base), model(enlarged), atol=1.0e-6)
+    assert {
+        edge: graph.edges[edge]["distance"] for edge in graph.edges
+    } == original_distances
+
+
+def test_unknown_target_action_toggle_and_agent_roles_use_visible_beliefs():
+    graph = _line(3)
+    graph.nodes[2].update(
+        type="target_unreached", rps_type=UNKNOWN_TYPE)
+    base = replace(
+        load_config().candidates, staging_per_target=0,
+        include_pair_staging=False)
+    agents = [
+        Agent(0, capabilities={0}),
+        Agent(0, capabilities={1}),
+        Agent(0, capabilities={0, 2}),
+    ]
+
+    def target_feasibility(allow_unknown, belief):
+        graph.nodes[2]["rps_type"] = belief
+        config = replace(
+            base, allow_unknown_target_actions=allow_unknown)
+        candidates = generate_candidates(graph, config)
+        observation = build_observation(
+            graph, agents, 2, candidates=candidates,
+            candidate_config=config)
+        target_action = next(
+            index for index, candidate in enumerate(candidates)
+            if candidate.is_target)
+        return observation.feasible_action_mask[0, :, target_action]
+
+    assert target_feasibility(True, UNKNOWN_TYPE).tolist() == [False, True, True]
+    assert target_feasibility(False, UNKNOWN_TYPE).tolist() == [False, False, False]
+    assert target_feasibility(True, 1).tolist() == [False, True, False]
+    assert target_feasibility(False, 1).tolist() == [False, True, False]
+    assert target_feasibility(True, 2).tolist() == [False, False, True]
+
+
+def test_cpu_cuda_observation_parity_for_normalization_and_unknown_actions():
+    if not torch.cuda.is_available():
+        return
+    graph = _line(3)
+    graph.nodes[2].update(
+        type="target_unreached", rps_type=UNKNOWN_TYPE)
+    candidate_config = replace(
+        load_config().candidates, staging_per_target=0,
+        include_pair_staging=False, allow_unknown_target_actions=True)
+    cpu = build_observation(
+        graph, [Agent(0, capabilities={1})], 1,
+        candidate_config=candidate_config)
+    world = TensorWorld.from_networkx(
+        graph, candidate_config, device="cuda")
+    state = TensorEpisodeState.create(
+        world, [world.node_index[0]], [[[False, True]]], [[1]])
+    config = load_config().model
+    gpu = TensorObservationBuilder(
+        world, 1, edge_normalization=config.edge_normalization,
+        edge_normalization_epsilon=(
+            config.edge_normalization_epsilon)).build(state)[0]
+    assert [candidate.key for candidate in cpu.candidates[0]] == [
+        candidate.key for candidate in gpu.candidates[0]]
+    for name in (
+            "agent_target_distances", "agent_action_distances",
+            "action_target_distances"):
+        assert torch.allclose(
+            getattr(cpu, name), getattr(gpu, name).cpu(), atol=1.0e-5)
+    for name in (
+            "agent_target_distance_mask", "agent_action_distance_mask",
+            "action_target_distance_mask", "feasible_action_mask"):
+        assert torch.equal(getattr(cpu, name), getattr(gpu, name).cpu())
+
+
+def test_checkpoint_feature_schema_requires_explicit_compatibility_override():
+    from learning.policy.evaluation import load_policy
+
+    base = load_config()
+    legacy_model_config = replace(
+        base.model,
+        feature_schema_version=RAW_DISTANCE_FEATURE_SCHEMA_VERSION,
+        edge_normalization=RAW_EDGE_NORMALIZATION)
+    legacy_config = replace(base, model=legacy_model_config)
+    serialized = _serialized_run_config(legacy_config)
+    assert serialized["feature_schema"]["version"] == (
+        RAW_DISTANCE_FEATURE_SCHEMA_VERSION)
+    with tempfile.TemporaryDirectory() as directory:
+        directory = Path(directory)
+        (directory / "config.yaml").write_text(
+            yaml.safe_dump(serialized, sort_keys=False), encoding="utf-8")
+        torch.save(
+            build_policy(legacy_model_config).state_dict(),
+            directory / "latest_weights.pt")
+        try:
+            load_policy(directory, device="cpu")
+        except ValueError as error:
+            assert "older raw-distance feature schema" in str(error)
+        else:
+            raise AssertionError("a legacy feature schema was accepted silently")
+        model, adapter = load_policy(
+            directory, device="cpu",
+            allow_feature_schema_mismatch=True)
+        assert model.config.feature_schema_version == (
+            RAW_DISTANCE_FEATURE_SCHEMA_VERSION)
+        assert adapter.edge_normalization == RAW_EDGE_NORMALIZATION
 
 
 def test_task_graph_policy_is_permutation_equivariant_and_has_finite_critic():
@@ -1705,11 +2219,11 @@ def test_masks_enforce_dead_transit_scout_and_compatibility_rules():
                         if item.is_target)
     assert future.feasible_action_mask[0, 0, target_index]
     # The future route begins at committed arrival node 1, three edges from
-    # target 4, rather than being scored from the current edge's source 0.
-    distance_scale = sum(
-        float(data["distance"]) for _u, _v, data in graph.edges(data=True))
-    assert abs(float(future.agent_action_relations[0, 0, target_index, 0])
-               - 3.0 / distance_scale) < 1e-6
+    # target 4. The normalized Transformer relation and task-graph edge share
+    # the new per-decision value.
+    assert torch.equal(
+        future.agent_action_relations[0, 0, target_index, 0],
+        future.agent_action_distances[0, 0, target_index, 0])
 
     graph.nodes[4]["rps_type"] = UNKNOWN_TYPE
     pure_observe = [Candidate(2, is_observation=True, observed_targets={4}),
@@ -1980,7 +2494,9 @@ def test_cpu_rollout_executes_grouped_alias_location_winner():
             source, target, distance=float(distance), observed_edge=False)
     env = truth.copy()
     init_target_types(env, truth, {"p": 1, "q": 2})
-    config = _candidate_config(staging_per_target=1)
+    config = replace(
+        _candidate_config(staging_per_target=1),
+        allow_unknown_target_actions=True)
     model = _GroupedAliasesThenTargets("v")
     policy = LearnedPolicyAdapter(
         model, 2, candidate_config=config, training=False)

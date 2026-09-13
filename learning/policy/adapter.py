@@ -18,7 +18,12 @@ class LearnedPolicyAdapter:
         self.model = model
         self.num_target_types = num_target_types
         self.training = training
-        self.candidate_config = candidate_config or load_config().candidates
+        defaults = load_config()
+        self.candidate_config = candidate_config or defaults.candidates
+        model_config = getattr(model, "config", defaults.model)
+        self.edge_normalization = model_config.edge_normalization
+        self.edge_normalization_epsilon = (
+            model_config.edge_normalization_epsilon)
         self.device = device or next(model.parameters()).device
         self.decision_log_probs = []
         self.decision_entropies = []
@@ -61,7 +66,11 @@ class LearnedPolicyAdapter:
         observation = build_observation(
             env_map, all_agents, self.num_target_types,
             candidates=candidates, transit=transit, clock=self._clock,
-            replan_transit=True).to(self.device)
+            candidate_config=self.candidate_config,
+            replan_transit=True,
+            edge_normalization=self.edge_normalization,
+            edge_normalization_epsilon=(
+                self.edge_normalization_epsilon)).to(self.device)
         self.model.train(self.training)
         with torch.set_grad_enabled(self.training):
             if hasattr(self.model, "decode_with_value"):

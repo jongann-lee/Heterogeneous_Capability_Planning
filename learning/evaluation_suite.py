@@ -102,10 +102,7 @@ def _position(value, context):
             or any(isinstance(item, bool) or not isinstance(item, int)
                    for item in value)):
         raise ValueError(f"{context} must be a two-integer list")
-    position = tuple(value)
-    if any(coordinate < 0 or coordinate >= 64 for coordinate in position):
-        raise ValueError(f"{context} must lie inside the 64x64 WV terrain")
-    return position
+    return tuple(value)
 
 
 def _parse_agent_configuration(payload, num_target_types):
@@ -183,9 +180,6 @@ def load_evaluation_suite(suite="development"):
         raise ValueError("evaluation suite schema_version must be 1")
     suite_id = _identifier(payload.get("suite_id"), "suite_id")
     terrain_id = _identifier(payload.get("terrain_id"), "terrain_id")
-    if terrain_id != "wv_dem_64_v1":
-        raise ValueError(
-            f"unsupported evaluation terrain_id {terrain_id!r}")
     num_target_types = _count(
         payload.get("num_target_types"), "num_target_types")
     source_position = _position(payload.get("source_position"),
@@ -215,6 +209,21 @@ def load_evaluation_suite(suite="development"):
         num_target_types=num_target_types, source_position=source_position,
         agent_configurations=agents, target_configurations=targets,
     ), path
+
+
+def validate_evaluation_suite_locations(suite, graph):
+    """Validate all syntactically parsed suite coordinates by membership."""
+    if suite.source_position not in graph:
+        raise ValueError(
+            f"evaluation suite source_position {suite.source_position!r} "
+            "is not present in the selected prepared map")
+    for configuration in suite.target_configurations:
+        for index, target in enumerate(configuration.targets):
+            if target.position not in graph:
+                raise ValueError(
+                    f"{configuration.id}.targets[{index}].position "
+                    f"{target.position!r} is not present in the selected "
+                    "prepared map")
 
 
 def _selected_ids(value):
