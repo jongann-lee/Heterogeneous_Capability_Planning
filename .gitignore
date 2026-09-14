@@ -32,3 +32,6 @@ logs/
 
 # Cluster stuff
 cluster/
+
+# Figures
+analysis_figures/

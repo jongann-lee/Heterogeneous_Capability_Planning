@@ -19,7 +19,7 @@ candidates:
   staging_capacity: 1
   include_pair_staging: True
   include_wait: True
-  allow_unknown_target_actions: False
+  allow_unknown_target_actions: True
 
 instances:
   map_path: Real_Life_Maps/WV_tobler_viewshed_64.pkl.gz

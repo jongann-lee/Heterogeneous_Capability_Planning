@@ -93,6 +93,7 @@ def make_prepared_map_instance(seed=0, num_target_types=3, num_agents=4,
             f"{missing_targets!r}")
 
     env, truth = terrain.copy(), terrain.copy()
+
     env.nodes[source]["type"] = "source"
     truth.nodes[source]["type"] = "source"
     for target in targets:
