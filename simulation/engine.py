@@ -39,6 +39,7 @@ placeholder so the loop runs; replace it with the real baseline.
 
 import os
 import heapq
+from time import perf_counter
 
 import networkx as nx
 
@@ -326,7 +327,8 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
                        sample_recursion=0, sample_num_obstacle=0,
                        sample_obstacle_hop=0, death_penalty=100.0,
                        max_events=100000, verbose=False,
-                       render_dir=None, render_dt=1.0):
+                       render_dir=None, render_dt=1.0,
+                       measure_policy_time=False):
     """Run the simulation in continuous time until all targets are cleared
     or the team stalls.
 
@@ -350,6 +352,8 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
         max_events: safety cap on processed arrivals.
         render_dir: if set, write interpolated PNG frames spaced ``render_dt``
             apart in time.
+        measure_policy_time: record wall-clock time spent in each policy replan,
+            including its optional runtime-state hook.
 
     Returns a result dict including ``makespan`` (clock of the last elimination,
     or of termination if incomplete), ``objective`` (= makespan +
@@ -365,10 +369,12 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
     pending_replan = set()          # learned new truth while still in transit
     clock = 0.0
     policy_calls = 0
+    policy_time_seconds = 0.0
     pos = nx.get_node_attributes(ground_truth, "pos")
 
     def do_replan():
-        nonlocal policy_calls
+        nonlocal policy_calls, policy_time_seconds
+        start = perf_counter() if measure_policy_time else None
         # Learned centralized policies need the observable state of the whole
         # team.  The legacy callable interface remains unchanged for baselines.
         runtime_hook = getattr(policy, "set_runtime_state", None)
@@ -386,6 +392,8 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
                sample_recursion=sample_recursion,
                sample_num_obstacle=sample_num_obstacle,
                sample_obstacle_hop=sample_obstacle_hop, verbose=verbose)
+        if start is not None:
+            policy_time_seconds += perf_counter() - start
 
     def schedule(i):
         """Commit at-a-node agent i to the next edge of its plan (push an
@@ -508,6 +516,8 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
         "agent_capabilities": [sorted(a.capabilities) for a in agents],
         "events": events,
         "policy_calls": policy_calls,
+        "policy_time_seconds": (
+            policy_time_seconds if measure_policy_time else None),
     }
 
 

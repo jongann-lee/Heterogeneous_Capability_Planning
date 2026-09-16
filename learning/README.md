@@ -238,7 +238,7 @@ and pull only its checkpoint results. The W&B directory is excluded because it
 may be large and may still be receiving writes during an active run.
 
 ```bash
-RUN=2026-09-11_14-58-56_040053
+RUN=2026-09-15_00-49-29_918864
 mkdir -p "learning/checkpoints/${RUN}"
 
 rsync -avP \

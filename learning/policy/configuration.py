@@ -169,6 +169,7 @@ class TrainingConfig:
     device: str
     checkpoint: str
     wandb: bool
+    replay_batch_size: int = 64
 
     def __post_init__(self):
         if (self.episodes < 1 or self.simulation_batch_size < 1 or
@@ -182,6 +183,8 @@ class TrainingConfig:
             raise ValueError("checkpoint must not be empty")
         if not isinstance(self.wandb, bool):
             raise ValueError("wandb must be a boolean")
+        if self.replay_batch_size < 1:
+            raise ValueError("replay_batch_size must be positive")
 
 
 @dataclass(frozen=True)

@@ -224,9 +224,12 @@ def test_committed_path_does_not_replan_at_intermediate_nodes():
             agent.planned_path = list(range(agent.position, 6))
 
     agent = Agent(0, capabilities={1})
-    result = run_simulation(env, truth, [agent], policy=committed_policy)
+    result = run_simulation(
+        env, truth, [agent], policy=committed_policy,
+        measure_policy_time=True)
     assert result["completed"]
     assert result["policy_calls"] == 1
+    assert result["policy_time_seconds"] >= 0.0
     assert calls == [(0,)]
 
 

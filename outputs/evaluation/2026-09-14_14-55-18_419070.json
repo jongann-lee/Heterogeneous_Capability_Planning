@@ -1,0 +1,200 @@
+{
+  "schema_version": 1,
+  "checkpoint": "/home/jongannlee/Code/Heterogeneous_Capability_Planning/learning/checkpoints/2026-09-11_14-58-56_040053/best_weights.pt",
+  "policy": "learned",
+  "deterministic": true,
+  "suite_id": "wv_rps_fixed_v1",
+  "suite_path": "/home/jongannlee/Code/Heterogeneous_Capability_Planning/learning/evaluation_suites/wv_rps_fixed_v1.json",
+  "terrain_id": "wv_dem_64_v1",
+  "output_path": "/home/jongannlee/Code/Heterogeneous_Capability_Planning/outputs/evaluation/2026-09-14_14-55-18_419070.json",
+  "prepared_map": {
+    "configured_path": "./Real_Life_Maps/WA_tobler_viewshed_64.pkl.gz",
+    "resolved_path": "/home/jongannlee/Code/Heterogeneous_Capability_Planning/Real_Life_Maps/WA_tobler_viewshed_64.pkl.gz",
+    "schema_version": 1,
+    "sha256": "9e6fa689531008fe67cbb317bbe3ace444d7257511bc5e44afe74a21eaa8c606",
+    "dimensions": [
+      64,
+      64
+    ],
+    "coarse_size": 64,
+    "node_count": 4096,
+    "edge_count": 16128,
+    "metadata": {
+      "schema_version": 1,
+      "builder": "Real_Life_Maps.build_map",
+      "coarse_size": 64,
+      "dense_shape": [
+        367,
+        424
+      ],
+      "dense_cell_width_m": 10.0,
+      "dense_cell_height_m": 10.0,
+      "crs": "EPSG:26910",
+      "bounds": [
+        471817.999999997,
+        5237605.0001,
+        476054.999999997,
+        5241270.0001
+      ],
+      "height_units": "meters",
+      "distance_units": "seconds",
+      "dem_sha256": "61d849b92ada2da5505cee5e94d9919ea5682c4c18a830ccad2c2b0956d9874a",
+      "roads_sha256": "27b898d971e0edfaeabf7e48042ff18cf3e2705a982095baaf0b3a6fe5b34cf7",
+      "tobler_base_kph": 6.0,
+      "tobler_slope_decay": 3.5,
+      "tobler_slope_offset": 0.05,
+      "rough_terrain_factor": 0.6,
+      "road_factor": 1.0,
+      "dense_movement_neighbors": 8,
+      "corridor_halo_dense_cells": 1,
+      "visibility_backend": "GRASS r.viewshed",
+      "visibility_node_first": true,
+      "visibility_edge_rule": "both endpoints visible",
+      "visibility_distance_m": 1500.0,
+      "observer_height_m": 1.7,
+      "target_height_m": 0.0,
+      "earth_curvature": false,
+      "atmospheric_refraction": false,
+      "build_seconds": 590.5514237920288
+    },
+    "checkpoint_sha256": "dd99d08ca13f73a176b8f34e88819672c3c84f77070f5c6d4c1c4206229eb198",
+    "hash_matches_checkpoint": false,
+    "allow_map_mismatch": true,
+    "mismatch_override_used": true
+  },
+  "allow_map_mismatch": true,
+  "feature_schema": {
+    "version": 2,
+    "edge_normalization": "per_decision_zscore",
+    "edge_normalization_epsilon": 1e-06,
+    "checkpoint": {
+      "version": 2,
+      "edge_normalization": "per_decision_zscore",
+      "edge_normalization_epsilon": 1e-06
+    },
+    "allow_mismatch": false,
+    "compatibility_override_used": false
+  },
+  "allow_unknown_target_actions": false,
+  "scenario_ids": [
+    "rps_agents__rps_targets"
+  ],
+  "selection": {
+    "agent_config": null,
+    "target_config": null,
+    "agent_count": null,
+    "target_count": null,
+    "limit": null,
+    "episodes": 1,
+    "seed": 0
+  },
+  "summary": {
+    "scenario_count": 1,
+    "episodes": 1,
+    "rollout_batch_count": 1,
+    "max_rollout_batch_size": 1,
+    "completion_rate": 1.0,
+    "mean_return": -0.3334702253341675,
+    "return_std": 0.0,
+    "mean_makespan": 29794.9453125,
+    "makespan_std": 0.0,
+    "mean_oracle_makespan": 22343.9140625,
+    "mean_fi_opt_makespan": 22343.9140625,
+    "mean_normalized_regret": 0.3334702253341675,
+    "normalized_regret_std": 0.0,
+    "mean_deaths": 0.0,
+    "death_std": 0.0,
+    "mean_remaining_targets": 0.0,
+    "stalled_rate": 0.0,
+    "all_agents_dead_rate": 0.0
+  },
+  "scenarios": [
+    {
+      "return": -0.3334702253341675,
+      "makespan": 29794.9453125,
+      "oracle_makespan": 22343.9140625,
+      "fi_opt_makespan": 22343.9140625,
+      "normalized_regret": 0.3334702253341675,
+      "completed": true,
+      "deaths": 0,
+      "remaining_targets": 0,
+      "stalled": false,
+      "all_agents_dead": false,
+      "simulation_backend": "cuda_tensor",
+      "video": "/home/jongannlee/Code/Heterogeneous_Capability_Planning/outputs/my_policy_simulation/render_result.mp4",
+      "frames": "/home/jongannlee/Code/Heterogeneous_Capability_Planning/outputs/my_policy_simulation/frames",
+      "evaluation_batch_id": 0,
+      "evaluation_batch_size": 1,
+      "episode_index": 0,
+      "seed": 0,
+      "policy": "learned",
+      "suite_id": "wv_rps_fixed_v1",
+      "scenario_id": "rps_agents__rps_targets",
+      "agent_configuration_id": "rps_agents",
+      "target_configuration_id": "rps_targets",
+      "agent_count": 4,
+      "target_count": 7,
+      "agent_profile": "rps_specialists",
+      "target_profile": "original_fixed_rps",
+      "instance": {
+        "source_position": [
+          0,
+          0
+        ],
+        "agent_capabilities": [
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ],
+          [
+            3
+          ]
+        ],
+        "target_positions": [
+          [
+            14,
+            54
+          ],
+          [
+            1,
+            29
+          ],
+          [
+            33,
+            17
+          ],
+          [
+            34,
+            35
+          ],
+          [
+            63,
+            37
+          ],
+          [
+            37,
+            5
+          ],
+          [
+            49,
+            58
+          ]
+        ],
+        "target_types": [
+          1,
+          2,
+          2,
+          1,
+          2,
+          3,
+          3
+        ]
+      }
+    }
+  ]
+}

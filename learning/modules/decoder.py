@@ -12,6 +12,7 @@ class DecoderOutput:
     selected_group_indices: list[list[int]]
     log_probabilities: torch.Tensor
     entropies: torch.Tensor
+    action_indices: torch.Tensor | None = None
 
     @property
     def selected_pair_indices(self):
@@ -65,17 +66,17 @@ class AssignmentDecoder:
     def grouped_logits(pair_logits, valid, candidate_physical_group,
                        physical_group_mask):
         """Aggregate semantic aliases with a masked differentiable logsumexp."""
-        num_agents = pair_logits.shape[0]
-        num_groups = physical_group_mask.numel()
-        group_index = candidate_physical_group[None].expand(num_agents, -1)
+        num_groups = physical_group_mask.shape[-1]
+        group_index = candidate_physical_group.unsqueeze(-2).expand_as(pair_logits)
         semantic_logits = pair_logits.masked_fill(~valid, -torch.inf)
-        maxima = pair_logits.new_full((num_agents, num_groups), -torch.inf)
+        maxima = pair_logits.new_full(
+            (*pair_logits.shape[:-1], num_groups), -torch.inf)
         maxima.scatter_reduce_(
-            1, group_index, semantic_logits, reduce="amax",
+            -1, group_index, semantic_logits, reduce="amax",
             include_self=True)
         # The maximum is only a numerical-stability offset. Detaching it keeps
         # the exact logsumexp gradient while avoiding scatter max tie details.
-        gathered_maxima = maxima.detach().gather(1, group_index)
+        gathered_maxima = maxima.detach().gather(-1, group_index)
         usable = valid & torch.isfinite(gathered_maxima)
         safe_semantic_logits = torch.where(
             usable, semantic_logits, torch.zeros_like(semantic_logits))
@@ -83,15 +84,26 @@ class AssignmentDecoder:
             usable, gathered_maxima, torch.zeros_like(gathered_maxima))
         offsets = safe_semantic_logits - safe_gathered_maxima
         exponentials = torch.exp(offsets) * usable
-        sums = pair_logits.new_zeros((num_agents, num_groups))
-        sums.scatter_add_(1, group_index, exponentials)
+        sums = torch.zeros_like(maxima)
+        sums.scatter_add_(-1, group_index, exponentials)
         has_valid = sums > 0
         result = torch.where(
             has_valid,
             maxima.detach() + torch.log(sums.clamp_min(
                 torch.finfo(pair_logits.dtype).tiny)),
             pair_logits.new_full((), -torch.inf))
-        return result.masked_fill(~physical_group_mask[None], -torch.inf)
+        return result.masked_fill(~physical_group_mask.unsqueeze(-2), -torch.inf)
+
+    @staticmethod
+    def _distribution(group_logits, available_agents, remaining):
+        valid = (torch.isfinite(group_logits) & available_agents[..., None]
+                 & (remaining > 0)[:, None])
+        active = valid.flatten(1).any(dim=1)
+        logits = group_logits.masked_fill(~valid, -torch.inf).flatten(1)
+        # Finished/padded episodes get a harmless dummy distribution. Mask its
+        # contribution below; no GPU scalar read is needed to stop those rows.
+        logits = torch.where(active[:, None], logits, torch.zeros_like(logits))
+        return Categorical(logits=logits, validate_args=False), active
 
     def __call__(self, pair_logits, feasible_mask, capacities,
                  training: bool = False, generator=None,
@@ -99,57 +111,58 @@ class AssignmentDecoder:
                  physical_group_capacity=None,
                  physical_group_representative=None,
                  physical_group_mask=None) -> DecoderOutput:
-        batch, _num_agents, _num_actions = pair_logits.shape
+        batch, num_agents, _num_actions = pair_logits.shape
         (candidate_groups, group_capacities, group_representatives,
          group_masks) = self._resolve_group_metadata(
              pair_logits, capacities, candidate_physical_group,
              physical_group_capacity, physical_group_representative,
              physical_group_mask)
-        assignments, flat_indices = [], []
-        joint_logps, joint_entropies = [], []
-        for b in range(batch):
-            valid = feasible_mask[b].clone()
-            remaining = group_capacities[b].clone()
-            num_groups = remaining.numel()
-            chosen, chosen_flat = [], []
-            logp = pair_logits.new_zeros(())
-            entropy = pair_logits.new_zeros(())
-            while valid.any():
-                step_logits = self.grouped_logits(
-                    pair_logits[b], valid, candidate_groups[b],
-                    group_masks[b])
-                step_valid = (
-                    torch.isfinite(step_logits)
-                    & (remaining > 0).unsqueeze(0)
-                    & group_masks[b].unsqueeze(0))
-                if not step_valid.any():
-                    break
-                flat_logits = step_logits.flatten().masked_fill(
-                    ~step_valid.flatten(), -torch.inf)
-                distribution = Categorical(logits=flat_logits)
-                if training:
-                    # Categorical.sample has no generator argument in PyTorch.
-                    selected = distribution.sample()
-                else:
-                    selected = flat_logits.argmax()
-                agent = int(selected.item()) // num_groups
-                group = int(selected.item()) % num_groups
-                action = int(group_representatives[b, group].item())
-                chosen.append((agent, action))
-                chosen_flat.append(int(selected.item()))
-                logp = logp + distribution.log_prob(selected)
-                entropy = entropy + distribution.entropy()
-                valid[agent, :] = False
-                remaining[group] -= (
-                    remaining[group] < torch.iinfo(remaining.dtype).max).to(
-                        remaining.dtype)
-            assignments.append(chosen)
-            flat_indices.append(chosen_flat)
-            joint_logps.append(logp)
-            joint_entropies.append(entropy)
-        return DecoderOutput(assignments, flat_indices,
-                             torch.stack(joint_logps),
-                             torch.stack(joint_entropies))
+        action_indices = torch.full(
+            (batch, num_agents), -1, dtype=torch.long, device=pair_logits.device)
+        logp = pair_logits.new_zeros(batch)
+        entropy = pair_logits.new_zeros(batch)
+        num_groups = group_capacities.shape[1]
+        if not num_agents or not num_groups:
+            return DecoderOutput([[] for _ in range(batch)],
+                                 [[] for _ in range(batch)], logp, entropy,
+                                 action_indices)
+        # Only whole agents and physical groups are removed during assignment,
+        # so semantic marginalization is invariant across autoregressive steps.
+        group_logits = self.grouped_logits(
+            pair_logits, feasible_mask, candidate_groups, group_masks)
+        available = torch.ones((batch, num_agents), dtype=torch.bool,
+                               device=pair_logits.device)
+        remaining = group_capacities.clone()
+        rows = torch.arange(batch, device=pair_logits.device)
+        records = []
+        for _ in range(num_agents):
+            distribution, active = self._distribution(
+                group_logits, available, remaining)
+            selected = (torch.multinomial(distribution.probs, 1,
+                                          generator=generator).squeeze(1)
+                        if training else distribution.logits.argmax(dim=1))
+            agent = selected // num_groups
+            group = selected % num_groups
+            action = group_representatives[rows, group]
+            records.append(torch.stack((
+                agent, action, selected.masked_fill(~active, -1)), dim=1))
+            action_indices[rows, agent] = torch.where(
+                active, action, action_indices[rows, agent])
+            logp = logp + distribution.log_prob(selected) * active
+            entropy = entropy + distribution.entropy() * active
+            available[rows, agent] &= ~active
+            remaining[rows, group] -= (
+                active & (remaining[rows, group] < torch.iinfo(remaining.dtype).max)
+            ).to(remaining.dtype)
+        # One bulk transfer preserves the legacy Python API. Tensor simulation
+        # uses action_indices directly instead of copying each action back.
+        host_records = torch.stack(records, dim=1).detach().cpu().tolist()
+        assignments = [[(agent, action) for agent, action, index in row
+                        if index >= 0] for row in host_records]
+        flat_indices = [[index for _agent, _action, index in row if index >= 0]
+                        for row in host_records]
+        return DecoderOutput(assignments, flat_indices, logp, entropy,
+                             action_indices)
 
     def evaluate_selected(self, pair_logits, feasible_mask, capacities,
                           selected_pair_indices,
@@ -158,40 +171,41 @@ class AssignmentDecoder:
                           physical_group_representative=None,
                           physical_group_mask=None):
         """Evaluate recorded autoregressive choices without resampling."""
-        batch, _num_agents, _num_actions = pair_logits.shape
+        batch, num_agents, _num_actions = pair_logits.shape
         (candidate_groups, group_capacities, _group_representatives,
          group_masks) = self._resolve_group_metadata(
              pair_logits, capacities, candidate_physical_group,
              physical_group_capacity, physical_group_representative,
              physical_group_mask)
-        joint_logps, joint_entropies = [], []
-        for b in range(batch):
-            valid = feasible_mask[b].clone()
-            remaining = group_capacities[b].clone()
-            num_groups = remaining.numel()
-            logp = pair_logits.new_zeros(())
-            entropy = pair_logits.new_zeros(())
-            for flat_index in selected_pair_indices[b]:
-                step_logits = self.grouped_logits(
-                    pair_logits[b], valid, candidate_groups[b],
-                    group_masks[b])
-                step_valid = (
-                    torch.isfinite(step_logits)
-                    & (remaining > 0).unsqueeze(0)
-                    & group_masks[b].unsqueeze(0))
-                flat_logits = step_logits.flatten().masked_fill(
-                    ~step_valid.flatten(), -torch.inf)
-                distribution = Categorical(logits=flat_logits)
-                selected = torch.as_tensor(
-                    flat_index, device=pair_logits.device)
-                logp = logp + distribution.log_prob(selected)
-                entropy = entropy + distribution.entropy()
-                agent = int(flat_index) // num_groups
-                group = int(flat_index) % num_groups
-                valid[agent, :] = False
-                remaining[group] -= (
-                    remaining[group] < torch.iinfo(remaining.dtype).max).to(
-                        remaining.dtype)
-            joint_logps.append(logp)
-            joint_entropies.append(entropy)
-        return torch.stack(joint_logps), torch.stack(joint_entropies)
+        logp = pair_logits.new_zeros(batch)
+        entropy = pair_logits.new_zeros(batch)
+        steps = max(map(len, selected_pair_indices), default=0)
+        if not steps:
+            return logp, entropy
+        selected_indices = torch.tensor(
+            [list(indices) + [-1] * (steps - len(indices))
+             for indices in selected_pair_indices],
+            dtype=torch.long, device=pair_logits.device)
+        group_logits = self.grouped_logits(
+            pair_logits, feasible_mask, candidate_groups, group_masks)
+        available = torch.ones((batch, num_agents), dtype=torch.bool,
+                               device=pair_logits.device)
+        remaining = group_capacities.clone()
+        num_groups = remaining.shape[1]
+        rows = torch.arange(batch, device=pair_logits.device)
+        for step in range(steps):
+            active = selected_indices[:, step] >= 0
+            selected = selected_indices[:, step].clamp_min(0)
+            # Rows with shorter traces may still have feasible actions. Give
+            # those rows dummy distributions too, avoiding masked 0 * -inf.
+            distribution, _ = self._distribution(
+                group_logits, available & active[:, None], remaining)
+            logp = logp + distribution.log_prob(selected) * active
+            entropy = entropy + distribution.entropy() * active
+            agent = selected // num_groups
+            group = selected % num_groups
+            available[rows, agent] &= ~active
+            remaining[rows, group] -= (
+                active & (remaining[rows, group] < torch.iinfo(remaining.dtype).max)
+            ).to(remaining.dtype)
+        return logp, entropy

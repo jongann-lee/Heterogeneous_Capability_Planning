@@ -76,7 +76,7 @@ def _validate_records(payload):
         if remaining_targets > target_count:
             raise ValueError(
                 f"scenario {scenario_id!r} has too many remaining targets")
-        validated.append({
+        item = {
             "scenario_id": scenario_id,
             "agent_count": agent_count,
             "target_count": target_count,
@@ -89,7 +89,12 @@ def _validate_records(payload):
             "remaining_targets": remaining_targets,
             "stalled": stalled,
             "all_agents_dead": all_agents_dead,
-        })
+        }
+        if record.get("mean_planning_time_seconds") is not None:
+            item["mean_planning_time_seconds"] = _require_number(
+                record, "mean_planning_time_seconds", scenario_id,
+                minimum=0.0)
+        validated.append(item)
     return suite_id, validated
 
 
@@ -135,6 +140,15 @@ def _group_summary(records):
 def analyze_evaluation(payload, source=None):
     """Aggregate one fixed-suite evaluation result by problem size."""
     suite_id, records = _validate_records(payload)
+    overall = _group_summary(records)
+    planning_means = [
+        record["mean_planning_time_seconds"] for record in records
+        if "mean_planning_time_seconds" in record
+    ]
+    if planning_means:
+        overall["mean_planning_time_seconds"] = (
+            sum(planning_means) / len(planning_means))
+        overall["planning_timed_rollouts"] = len(planning_means)
     grouped = defaultdict(list)
     for record in records:
         grouped[(record["agent_count"], record["target_count"])].append(record)
@@ -151,7 +165,7 @@ def analyze_evaluation(payload, source=None):
         "analysis_type": "fixed_evaluation_summary",
         "source_result": None if source is None else str(source),
         "suite_id": suite_id,
-        "overall": _group_summary(records),
+        "overall": overall,
         "by_agent_and_target_count": by_size,
     }
 
@@ -251,6 +265,12 @@ def format_analysis(analysis):
         "  Mean remaining targets: "
         f"{overall['mean_remaining_targets']:.3f}",
     ))
+    if "mean_planning_time_seconds" in overall:
+        lines.append(
+            "  Average planning time per replan: "
+            f"{overall['mean_planning_time_seconds'] * 1000:.3f} ms "
+            "(mean of per-rollout averages; "
+            f"{overall['planning_timed_rollouts']} timed rollouts)")
     return "\n".join(lines)
 
 

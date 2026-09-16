@@ -1,6 +1,8 @@
 """Batched tensorized GPU episodic rollout."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from contextlib import nullcontext
+from time import perf_counter
 
 import torch
 
@@ -30,15 +32,26 @@ class TensorRollout:
     target_counts: torch.Tensor
     decision_traces: list[DecisionTrace]
     events: int
+    planning_times_seconds: list[float] | None = None
+    planning_call_counts: list[int] | None = None
 
 
+@torch.no_grad()
 def collect_tensor_episodes(model, state, observation_builder,
                             death_penalty=100.0, incomplete_penalty=1000.0,
                             max_events=100000, training=True,
-                            state_callback=None, oracle_makespans=None):
-    """Roll out a batch while retaining the differentiable policy trace."""
+                            state_callback=None, oracle_makespans=None,
+                            diagnostics=None, measure_planning_time=False):
+    """Roll out without autograd; retain only CPU observations for replay."""
     decision_traces = []
     events = 0
+    planning_times = ([0.0] * state.batch_size
+                      if measure_planning_time else None)
+    planning_counts = ([0] * state.batch_size
+                       if measure_planning_time else None)
+    phase = diagnostics.phase if diagnostics is not None else lambda _: nullcontext()
+    if model is not None:
+        model.train(training)
     while events < max_events:
         unfinished = ~state.completed() & ~state.stalled
         if not unfinished.any():
@@ -48,31 +61,43 @@ def collect_tensor_episodes(model, state, observation_builder,
                            & unfinished[:, None])
         planning_episodes = planning_agents.any(dim=1)
         if planning_episodes.any():
-            (observation, distances, predecessors, target_distances,
-             target_entries, candidate_entries) = observation_builder.build(
-                 state, planning_episodes)
+            if measure_planning_time:
+                # A batched decision has one shared wall-clock latency. Charge
+                # it to each active episode, then average per episode later.
+                planning_rows = planning_episodes.tolist()
+                if state.positions.device.type == "cuda":
+                    torch.cuda.synchronize(state.positions.device)
+                planning_start = perf_counter()
+            with phase("observation_and_routing"):
+                (observation, distances, predecessors, target_distances,
+                 target_entries, candidate_entries) = observation_builder.build(
+                     state, planning_episodes)
             observation.feasible_action_mask &= planning_agents[..., None]
-            model.train(training)
             # Sampling does not need gradients. Observations and selected
             # actions are retained on CPU and replayed after returns are known.
-            with torch.no_grad():
+            with phase("policy_decode"):
                 decoded = model.decode(observation, training=training)
             if training:
-                decision_traces.append(DecisionTrace(
-                    observation.to("cpu"), decoded.selected_group_indices))
+                with phase("trace_to_cpu"):
+                    decision_traces.append(DecisionTrace(
+                        observation.to("cpu"), decoded.selected_group_indices))
 
-            action_indices = torch.full_like(state.positions, -1)
-            for b, assignments in enumerate(decoded.assignments):
-                for agent, action in assignments:
-                    action_indices[b, agent] = action
+            action_indices = getattr(decoded, "action_indices", None)
+            if action_indices is None:
+                # Compatibility with custom/testing policies.
+                action_indices = torch.full_like(state.positions, -1)
+                for b, assignments in enumerate(decoded.assignments):
+                    for agent, action in assignments:
+                        action_indices[b, agent] = action
             assigned = action_indices >= 0
             safe_actions = action_indices.clamp_min(0)
             physical = (
                 observation_builder.world.candidate_nodes[safe_actions] >= 0)
-            (next_hops, reachable, route_next,
-             destinations) = observation_builder.next_hops(
-                 state, safe_actions, distances, predecessors,
-                 target_distances, target_entries, candidate_entries)
+            with phase("route_reconstruction"):
+                (next_hops, reachable, route_next,
+                 destinations) = observation_builder.next_hops(
+                     state, safe_actions, distances, predecessors,
+                     target_distances, target_entries, candidate_entries)
             committed = planning_agents & assigned & physical & reachable
             cleared_routes = torch.full_like(state.route_next, -1)
             state.route_next = torch.where(
@@ -90,6 +115,14 @@ def collect_tensor_episodes(model, state, observation_builder,
             state.needs_replan &= ~planning_agents
             del observation, distances, predecessors, target_distances
             del target_entries, candidate_entries, route_next
+            if measure_planning_time:
+                if state.positions.device.type == "cuda":
+                    torch.cuda.synchronize(state.positions.device)
+                elapsed = perf_counter() - planning_start
+                for row, active in enumerate(planning_rows):
+                    if active:
+                        planning_times[row] += elapsed
+                        planning_counts[row] += 1
 
         rows = torch.arange(state.batch_size,
                             device=state.positions.device)[:, None]
@@ -127,9 +160,6 @@ def collect_tensor_episodes(model, state, observation_builder,
         completed = state.completed()
         state.route_active &= ~completed[:, None] & state.alive
         state.needs_replan &= ~completed[:, None] & state.alive
-        if not active.any():
-            # The next loop either plans newly-idle agents or marks them stalled.
-            continue
 
     if state_callback is not None:
         state_callback(state)
@@ -171,35 +201,73 @@ def collect_tensor_episodes(model, state, observation_builder,
         returns, state.clock, completed, state.deaths, remaining,
         stalled, all_agents_dead, oracle_makespans, normalized_regrets,
         torch.full_like(remaining, state.target_live.shape[1]),
-        decision_traces, events)
+        decision_traces, events, planning_times, planning_counts)
+
+
+def _replay_observation_batch(traces, batch_size, start, end):
+    """Concatenate bounded slices of CPU traces without padding new entities."""
+    parts, selected = [], []
+    while start < end:
+        trace = traces[start // batch_size]
+        row = start % batch_size
+        count = min(end - start, batch_size - row)
+        selection = slice(row, row + count)
+        parts.append((trace.observation, selection))
+        selected.extend(trace.selected_group_indices[selection])
+        start += count
+    first = parts[0][0]
+    values = {}
+    for field in fields(first):
+        value = getattr(first, field.name)
+        if torch.is_tensor(value):
+            tensors = [getattr(observation, field.name)[selection]
+                       for observation, selection in parts]
+            value = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+        elif isinstance(value, list):
+            value = [item for observation, selection in parts
+                     for item in getattr(observation, field.name)[selection]]
+        values[field.name] = value
+    return type(first)(**values), selected
 
 
 def replay_tensor_gradients(model, rollout, episode_signals,
                             entropy_coefficient, update_size, device,
-                            critic_coefficient=0.5):
+                            critic_coefficient=0.5, replay_batch_size=64):
     """Replay decisions using EMA advantages or graph-critic residuals.
 
     Each episode is averaged over the number of times the policy was queried.
     Makespan therefore affects the return, but a long trajectory does not also
     receive an incidental multiplier merely because it contains more events.
     """
+    if replay_batch_size < 1:
+        raise ValueError("replay_batch_size must be positive")
     episode_signals = episode_signals.detach().to(device)
-    decision_counts = torch.zeros_like(episode_signals)
-    for trace in rollout.decision_traces:
-        decision_counts += torch.tensor(
-            [bool(selected) for selected in trace.selected_group_indices],
-            dtype=episode_signals.dtype, device=device)
+    batch_size = episode_signals.numel()
+    decision_counts = torch.tensor([
+        sum(bool(trace.selected_group_indices[row])
+            for trace in rollout.decision_traces)
+        for row in range(batch_size)],
+        dtype=episode_signals.dtype, device=device)
     loss_divisors = decision_counts.clamp_min(1.0)
     totals = torch.zeros_like(episode_signals)
     critic_totals = torch.zeros_like(episode_signals)
     entropy_totals = torch.zeros_like(episode_signals)
     value_totals = torch.zeros_like(episode_signals)
-    for trace in rollout.decision_traces:
-        observation = trace.observation.to(device)
+    examples = batch_size * len(rollout.decision_traces)
+    for start in range(0, examples, replay_batch_size):
+        end = min(start + replay_batch_size, examples)
+        observation, selected = _replay_observation_batch(
+            rollout.decision_traces, batch_size, start, end)
+        if not any(selected):
+            continue
+        observation = observation.to(device)
+        rows = torch.arange(start, end, device=device) % batch_size
+        signals = episode_signals[rows]
+        divisors = loss_divisors[rows]
         logits, values = model.actor_critic(observation)
         logp, entropy = model.decoder.evaluate_selected(
             logits, observation.feasible_action_mask,
-            observation.action_capacities, trace.selected_group_indices,
+            observation.action_capacities, selected,
             candidate_physical_group=(
                 observation.candidate_physical_group),
             physical_group_capacity=observation.physical_group_capacity,
@@ -207,24 +275,23 @@ def replay_tensor_gradients(model, rollout, episode_signals,
                 observation.physical_group_representative),
             physical_group_mask=observation.physical_group_mask)
         active = torch.tensor(
-            [bool(selected) for selected in trace.selected_group_indices],
+            [bool(indices) for indices in selected],
             dtype=episode_signals.dtype, device=device)
         if values is None:
-            advantages = episode_signals
-            critic_losses = torch.zeros_like(episode_signals)
+            advantages = signals
+            critic_losses = torch.zeros_like(signals)
         else:
-            advantages = episode_signals - values.detach()
-            critic_losses = (values - episode_signals).square() * active
-            value_totals += values.detach() * active / loss_divisors
+            advantages = signals - values.detach()
+            critic_losses = (values - signals).square() * active
+            value_totals.index_add_(0, rows, values.detach() * active / divisors)
         actor_losses = (-(advantages * logp)
                         - entropy_coefficient * entropy) * active
         losses = (actor_losses + critic_coefficient * critic_losses) \
-            / loss_divisors
-        if active.any():
-            (losses.sum() / update_size).backward()
-        totals += losses.detach()
-        critic_totals += critic_losses.detach() / loss_divisors
-        entropy_totals += entropy.detach() * active / loss_divisors
+            / divisors
+        (losses.sum() / update_size).backward()
+        totals.index_add_(0, rows, losses.detach())
+        critic_totals.index_add_(0, rows, critic_losses.detach() / divisors)
+        entropy_totals.index_add_(0, rows, entropy.detach() * active / divisors)
         del observation, logits, logp, entropy, losses
     return (totals, decision_counts, critic_totals,
             entropy_totals, value_totals)

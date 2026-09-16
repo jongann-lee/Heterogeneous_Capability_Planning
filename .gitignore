@@ -23,7 +23,7 @@ cache/
 *.DS_Store
 
 # Simulation Results
-outputs/
+outputs/my_policy_simulation/
 
 # Learned checkpoints
 learning/checkpoints/

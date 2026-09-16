@@ -88,8 +88,10 @@ from learning.train import _episode_agent_count, _serialized_run_config, train
 from learning.test import (
     _cuda_batch_plan,
     _evaluation_output_path,
+    _planning_metrics,
     _select_prepared_map_path,
     evaluate as evaluate_suite,
+    summarize as summarize_evaluation,
 )
 import learning.test as evaluation_module
 from simulation.agent import Agent
@@ -602,6 +604,51 @@ def test_evaluation_analysis_aggregates_size_and_failure_metrics():
     assert "Completion by problem size" in rendered
     assert "Scenarios with a death: 2/3 (66.67%)" in rendered
     assert "Agent deaths: 3/10 deployed (30.00%)" in rendered
+    assert "mean_planning_time_seconds" not in overall
+    assert "Average planning time per replan" not in rendered
+
+    timed_payload = copy.deepcopy(payload)
+    timed_payload["scenarios"][0].update(
+        mean_planning_time_seconds=0.2, planning_call_count=2)
+    timed_payload["scenarios"][1].update(
+        mean_planning_time_seconds=0.4, planning_call_count=8)
+    timed_payload["scenarios"][2]["mean_planning_time_seconds"] = None
+    timed = analyze_evaluation(timed_payload)
+    assert abs(timed["overall"]["mean_planning_time_seconds"] - 0.3) < 1e-12
+    assert timed["overall"]["planning_timed_rollouts"] == 2
+    assert "Average planning time per replan: 300.000 ms" in format_analysis(timed)
+
+    timed_payload["scenarios"][1]["mean_planning_time_seconds"] = -1.0
+    try:
+        analyze_evaluation(timed_payload)
+    except ValueError as error:
+        assert "invalid mean_planning_time_seconds" in str(error)
+    else:
+        raise AssertionError("negative planning time was accepted")
+
+
+def test_evaluation_planning_time_averages_scenario_means_equally():
+    def record(total, calls):
+        return {
+            "return": 0.0,
+            "makespan": 1.0,
+            "oracle_makespan": 1.0,
+            "fi_opt_makespan": 1.0,
+            "normalized_regret": 0.0,
+            "completed": True,
+            "deaths": 0,
+            "remaining_targets": 0,
+            "stalled": False,
+            "all_agents_dead": False,
+            **_planning_metrics(total, calls),
+        }
+
+    summary = summarize_evaluation([
+        record(0.4, 2), record(1.2, 4),
+    ])
+    assert abs(summary["mean_planning_time_seconds"] - 0.25) < 1e-12
+    assert summary["planning_timed_rollouts"] == 2
+    assert _planning_metrics(0.0, 0)["mean_planning_time_seconds"] is None
 
 
 def test_rendering_uses_distinct_agent_colors_and_stacks_shared_labels():
@@ -716,6 +763,115 @@ def test_cugraph_batched_sssp_is_exact_for_independent_blockers_when_cuda():
     assert torch.allclose(result.distances[:, 3], torch.tensor(
         [3.0, 11.0, 1.0], device="cuda"))
     assert result.predecessors[:, 3].tolist() == [2, 4, 2]
+
+    # Force separate chunks; row ordering, source unblocking, asymmetric costs
+    # and unreachable nodes must agree with the single-traversal route bank.
+    router.max_batch_vertices = 5
+    chunked = router.sssp_batch(sources, blocked)
+    assert torch.equal(chunked.distances, result.distances)
+    assert torch.equal(chunked.predecessors, result.predecessors)
+    assert not router._base_sssp_cache
+
+
+def test_cugraph_query_chunks_bound_both_edges_and_vertices():
+    router = object.__new__(CuGraphRouter)
+    router.num_nodes = 4096
+    router._edges = range(32_768)
+    router.max_batch_edges = 1_000_000
+    router.max_batch_vertices = 262_144
+    assert router._query_batch_size() == 30
+    router.max_batch_vertices = 8192
+    assert router._query_batch_size() == 2
+    router.max_batch_vertices = 1
+    assert router._query_batch_size() == 1
+
+
+def test_cugraph_temporary_allocations_do_not_accumulate_when_cuda():
+    if not torch.cuda.is_available():
+        return
+    from rmm.statistics import enable_statistics, get_statistics
+
+    enable_statistics()
+    nodes = 64
+    sources = list(range(nodes - 1)) + list(range(1, nodes))
+    destinations = list(range(1, nodes)) + list(range(nodes - 1))
+    router = CuGraphRouter(
+        nodes, sources, destinations, [1.0] * len(sources),
+        max_batch_vertices=8 * nodes)
+
+    def exercise():
+        for count in (1, 7, 16, 3, 11):
+            query_sources = torch.arange(count, device="cuda")
+            blocked = torch.zeros((count, nodes), dtype=torch.bool, device="cuda")
+            blocked[:, count + 1] = True
+            result = router.sssp_batch(query_sources, blocked)
+            assert (result.distances[
+                torch.arange(count, device="cuda"), query_sources] == 0).all()
+
+    exercise()  # Warm up CUDA/library state before comparing live allocations.
+    torch.cuda.synchronize()
+    torch_before = torch.cuda.memory_allocated()
+    rmm_before = get_statistics().current_bytes
+    rmm_count_before = get_statistics().current_count
+    for _ in range(4):
+        exercise()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() <= torch_before + 1024 ** 2
+    # Even a one-byte native membership result leaked per call is a regression.
+    assert get_statistics().current_bytes == rmm_before
+    assert get_statistics().current_count == rmm_count_before
+    assert not router._base_sssp_cache
+
+
+def test_training_diagnostics_are_optional_and_keep_only_scalars():
+    from learning.gpu_sim.diagnostics import TrainingDiagnostics
+
+    disabled = TrainingDiagnostics("cuda", enabled=False)
+    # Disabled diagnostics work without a driver and do not synchronize CUDA.
+    with patch("torch.cuda.synchronize", side_effect=AssertionError):
+        disabled.reset()
+        with disabled.phase("work"):
+            pass
+        assert disabled.report(1) == {}
+    enabled = TrainingDiagnostics("cpu", enabled=True)
+    with enabled.phase("work"):
+        pass
+    assert enabled.metrics["time/work_seconds"] >= 0
+    assert all(isinstance(value, float) for value in enabled.metrics.values())
+    enabled.reset()
+    assert not enabled.metrics
+
+
+def test_cuda_relation_cache_matches_direct_queries_and_ignores_reveals():
+    if not torch.cuda.is_available():
+        return
+    graph = _line(5)
+    graph.edges[3, 2]["distance"] = 4.0
+    for node in (2, 4):
+        graph.nodes[node].update(type="target_unreached", rps_type=UNKNOWN_TYPE)
+    world = TensorWorld.from_networkx(graph, load_config().candidates, device="cuda")
+    builder = TensorObservationBuilder(world, 2)
+    state = TensorEpisodeState.create(
+        world, torch.tensor([0, 0], device="cuda"),
+        torch.ones((2, 1, 3), dtype=torch.bool, device="cuda"),
+        torch.tensor([[1, 2], [1, 2]], device="cuda"))
+    planning = torch.ones(2, dtype=torch.bool, device="cuda")
+    for live in ((True, True), (True, False), (False, True), (False, False)):
+        state.target_live[:] = torch.tensor(live, device="cuda")
+        expected = builder._compute_action_target_distances(state, planning)
+        with patch.object(world.reverse_router, "sssp_batch",
+                          wraps=world.reverse_router.sssp_batch) as routes:
+            actual = builder._action_target_distances(state, planning)
+            assert torch.equal(actual, expected)
+            assert routes.call_count == 1
+            # Revelation and agent positions affect other features, not these
+            # directed region minima. No second reverse SSSP bank is needed.
+            state.target_known.logical_not_()
+            state.positions[:] = 1
+            again = builder._action_target_distances(state, planning)
+            assert torch.equal(again, expected)
+            assert routes.call_count == 1
+    assert builder._relation_distances.numel() * 4 <= 8 * 1024 ** 2
 
 
 def test_legacy_batch_size_config_is_split():
@@ -1120,12 +1276,16 @@ def test_classical_evaluation_needs_no_checkpoint_or_model_load():
 
     with patch.object(evaluation_module, "_case_factory", side_effect=factory), \
             patch.object(torch, "load", side_effect=AssertionError("loaded weights")):
-        records, _summary, _config, weights, _suite, _path = evaluate_suite(
+        records, summary, _config, weights, _suite, _path = evaluate_suite(
             None, suite="development", limit=1, policy="fi-opt", device="cuda")
     assert weights is None
     assert records[0]["completed"]
     assert abs(records[0]["normalized_regret"]) < 1e-12
     assert records[0]["simulation_backend"] == "cpu_classical"
+    assert records[0]["planning_call_count"] == 1
+    assert records[0]["mean_planning_time_seconds"] >= 0.0
+    assert summary["mean_planning_time_seconds"] == (
+        records[0]["mean_planning_time_seconds"])
 
     scout_env = _cooperative_visibility_graph()
     scout_truth = scout_env.copy()
@@ -1144,6 +1304,7 @@ def test_classical_evaluation_needs_no_checkpoint_or_model_load():
             policy="scout-then-execute", episodes=2)
     assert len(scout_records) == 2
     assert all(record["completed"] for record in scout_records)
+    assert all(record["planning_call_count"] >= 1 for record in scout_records)
 
     try:
         evaluate_suite(None, suite="development", limit=1, policy="learned")
@@ -1313,6 +1474,75 @@ def test_training_writes_latest_best_and_final_weights():
         best_model, _policy = load_policy(
             run_directory / "best_weights.pt", device="cpu")
         assert isinstance(best_model, HeterogeneousGraphPolicy)
+
+
+def test_tensor_training_accumulates_microbatches_and_handles_partial_update():
+    from learning.train import train_gpu
+
+    class ReferenceRouter:
+        """CPU exact routes let the complete tensor training loop run in CI."""
+
+        def __init__(self, num_nodes, sources, destinations, costs):
+            self.graph = nx.DiGraph()
+            self.graph.add_nodes_from(range(num_nodes))
+            self.graph.add_weighted_edges_from(zip(sources, destinations, costs))
+
+        def sssp(self, sources, blocked_nodes=()):
+            sources = torch.as_tensor(sources).flatten()
+            blocked = torch.zeros((len(sources), len(self.graph)), dtype=torch.bool)
+            blocked[:, list(blocked_nodes)] = True
+            return self.sssp_batch(sources, blocked)
+
+        def sssp_batch(self, sources, blocked):
+            distances = torch.full((len(sources), len(self.graph)), torch.inf)
+            predecessors = torch.full(distances.shape, -1, dtype=torch.long)
+            for row, source in enumerate(sources.tolist()):
+                excluded = set(torch.where(blocked[row])[0].tolist()) - {source}
+                graph = nx.subgraph_view(
+                    self.graph, filter_node=lambda node: node not in excluded)
+                lengths, paths = nx.single_source_dijkstra(graph, source)
+                for node, length in lengths.items():
+                    distances[row, node] = length
+                    if len(paths[node]) > 1:
+                        predecessors[row, node] = paths[node][-2]
+            return SimpleNamespace(distances=distances, predecessors=predecessors)
+
+    config = load_config()
+    config = replace(
+        config,
+        model=replace(config.model, num_target_types=1, model_dim=16,
+                      num_heads=4, message_passing_blocks=1,
+                      distance_embedding_dim=4, use_critic=True),
+        candidates=replace(config.candidates, staging_per_target=0,
+                           include_pair_staging=False, include_wait=False,
+                           allow_unknown_target_actions=True),
+        training=replace(config.training, wandb=False, device="cpu"),
+        instances=replace(config.instances, map_path=None))
+
+    # All overlays share one physical terrain; vary the target to exercise
+    # rebuilding a world while reusing its immutable terrain.
+    def shared_terrain_factory(episode):
+        truth = _line(4)
+        target = 2 + episode % 2
+        truth.nodes[target].update(type="target_unreached", rps_type=1)
+        env = truth.copy()
+        env.nodes[target]["rps_type"] = UNKNOWN_TYPE
+        return env, truth, [Agent(0, capabilities={1})]
+
+    torch.manual_seed(73)
+    with patch("learning.gpu_sim.world.CuGraphRouter", ReferenceRouter):
+        model, history, _world, run_directory = train_gpu(
+            *shared_terrain_factory(0), episodes=5, simulation_batch_size=2,
+            reinforce_batch_size=3, model_config=config.model,
+            candidate_config=config.candidates, reinforce_config=config.reinforce,
+            run_config=config, device="cpu", instance_factory=shared_terrain_factory)
+    assert run_directory is None
+    assert [record["episode"] for record in history] == list(range(5))
+    assert all(record["completed"] for record in history)
+    assert all(record["decisions"] == 1 for record in history)
+    assert all(np.isfinite(record["loss"]) for record in history)
+    assert all(not torch.is_tensor(value) for record in history for value in record.values())
+    assert any(parameter.grad is not None for parameter in model.critic.parameters())
 
 
 def test_checkpoint_map_identity_relocation_and_mismatch_override():
@@ -1859,6 +2089,50 @@ def test_task_graph_without_critic_replays_actor_only():
                for parameter in model.actor.parameters())
 
 
+def _assert_replay_batching_preserves_episode_weighting_and_gradients(device):
+    graph, agents = _instance()
+    observation = batch_observations([
+        build_observation(graph, agents, 2), build_observation(graph, agents, 2)])
+    for use_critic in (False, True):
+        model = _graph_model(use_critic=use_critic).to(device)
+        with torch.no_grad():
+            decoded = model.decode(observation.to(device), training=False)
+        traces = [DecisionTrace(observation, [
+            decoded.selected_group_indices[0] if step % 3 else [],
+            decoded.selected_group_indices[1] if step % 2 else [],
+        ]) for step in range(6)]
+        rollout = SimpleNamespace(decision_traces=traces)
+        expected_outputs = expected_gradients = None
+        for replay_batch_size in (1, 2, 5, 64):
+            model.zero_grad(set_to_none=True)
+            outputs = replay_tensor_gradients(
+                model, rollout, torch.tensor([-2.0, 0.5]),
+                entropy_coefficient=0.01, update_size=5, device=device,
+                replay_batch_size=replay_batch_size)
+            gradients = [None if parameter.grad is None else parameter.grad.clone()
+                         for parameter in model.parameters()]
+            assert outputs[1].tolist() == [4.0, 3.0]
+            if expected_outputs is None:
+                expected_outputs, expected_gradients = outputs, gradients
+                continue
+            assert all(torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+                       for actual, expected in zip(outputs, expected_outputs))
+            for actual, expected in zip(gradients, expected_gradients):
+                if expected is None:
+                    assert actual is None
+                else:
+                    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_replay_batching_preserves_episode_weighting_and_gradients():
+    _assert_replay_batching_preserves_episode_weighting_and_gradients("cpu")
+
+
+def test_replay_batching_preserves_episode_weighting_and_gradients_when_cuda():
+    if torch.cuda.is_available():
+        _assert_replay_batching_preserves_episode_weighting_and_gradients("cuda")
+
+
 def test_cached_candidate_generation_matches_uncached_generation():
     graph, _agents = _instance(False)
     config = load_config().candidates
@@ -2366,6 +2640,47 @@ def test_grouped_decoder_cpu_cuda_parity_when_cuda():
     assert torch.allclose(cpu.entropies, cuda.entropies.cpu(), atol=1e-6)
 
 
+def test_batched_decoder_handles_padding_and_replays_the_same_gradients():
+    decoder = AssignmentDecoder()
+    torch.manual_seed(71)
+    logits = torch.randn(3, 4, 5, requires_grad=True)
+    valid = torch.ones_like(logits, dtype=torch.bool)
+    valid[1, 1:] = False
+    valid[2] = False
+    metadata = {
+        "candidate_physical_group": torch.tensor([[0, 0, 1, 2, 2]]).expand(3, -1),
+        "physical_group_capacity": torch.tensor([[1, 2, 0]]).expand(3, -1),
+        "physical_group_representative": torch.tensor([[0, 2, 3]]).expand(3, -1),
+        "physical_group_mask": torch.tensor([[True, True, False]]).expand(3, -1),
+    }
+    decoded = decoder(logits, valid, None, **metadata)
+    assert list(map(len, decoded.assignments)) == [3, 1, 0]
+    assert torch.equal(decoded.action_indices[2], torch.full((4,), -1))
+    assert decoded.log_probabilities[2] == decoded.entropies[2] == 0
+    for row in range(3):
+        single = decoder(
+            logits[row:row+1], valid[row:row+1], None,
+            **{name: value[row:row+1] for name, value in metadata.items()})
+        assert single.assignments[0] == decoded.assignments[row]
+        assert torch.allclose(single.log_probabilities[0], decoded.log_probabilities[row])
+        assert torch.allclose(single.entropies[0], decoded.entropies[row])
+        for agent, action in decoded.assignments[row]:
+            assert decoded.action_indices[row, agent] == action
+    sampled = decoder(
+        logits, valid, None, training=True,
+        generator=torch.Generator().manual_seed(17), **metadata)
+    logp, entropy = decoder.evaluate_selected(
+        logits, valid, None, sampled.selected_group_indices, **metadata)
+    assert torch.allclose(logp, sampled.log_probabilities)
+    assert torch.allclose(entropy, sampled.entropies)
+    replay_gradient = torch.autograd.grad((logp + 0.03 * entropy).sum(), logits)[0]
+    sample_gradient = torch.autograd.grad(
+        (sampled.log_probabilities + 0.03 * sampled.entropies).sum(), logits)[0]
+    assert torch.isfinite(replay_gradient).all()
+    assert torch.allclose(replay_gradient, sample_gradient, atol=1e-6)
+    assert not replay_gradient[2].any()
+
+
 def test_physical_group_capacity_conflicts_are_rejected():
     aliases = [
         Candidate(
@@ -2532,9 +2847,11 @@ def test_learning_rollout_forwards_rendering():
     policy = LearnedPolicyAdapter(_TargetFirst(), 1)
     with tempfile.TemporaryDirectory() as directory:
         rollout = collect_episode(
-            env, truth, agents, policy, render_dir=directory, render_dt=1.0)
+            env, truth, agents, policy, render_dir=directory, render_dt=1.0,
+            measure_policy_time=True)
         frames = sorted(Path(directory).glob("frame_*.png"))
     assert rollout.result["completed"]
+    assert rollout.result["policy_time_seconds"] >= 0.0
     assert len(frames) == 3
 
 

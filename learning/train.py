@@ -250,16 +250,48 @@ def train(instance_factory, num_target_types, episodes=100,
     return model, history
 
 
+def _tensor_rollout_records(rollout, replay_outputs):
+    """Copy batch metrics once instead of synchronizing for every scalar."""
+    losses, counts, critic_losses, entropies, values = replay_outputs
+    columns = [
+        ("return", rollout.returns, float),
+        ("loss", losses, float),
+        ("makespan", rollout.makespans, float),
+        ("oracle_makespan", rollout.oracle_makespans, float),
+        ("fi_opt_makespan", rollout.oracle_makespans, float),
+        ("normalized_regret", rollout.normalized_regrets, float),
+        ("completed", rollout.completed, bool),
+        ("deaths", rollout.deaths, int),
+        ("remaining_targets", rollout.remaining_targets, int),
+        ("stalled", rollout.stalled, bool),
+        ("all_agents_dead", rollout.all_agents_dead, bool),
+        ("decisions", counts, int),
+        ("critic_loss", critic_losses, float),
+        ("entropy", entropies, float),
+        ("state_value", values, float),
+        ("target_count", rollout.target_counts, int),
+    ]
+    rows = torch.stack([value for _name, value, _cast in columns], dim=1)
+    return [{name: cast(value) for (name, _tensor, cast), value in zip(columns, row)}
+            for row in rows.detach().cpu().tolist()]
+
+
 def train_gpu(env, truth, agents, episodes, simulation_batch_size,
               reinforce_batch_size, model_config,
               candidate_config, reinforce_config, run_config, device,
-              checkpoint=None, instance_factory=None, prepared_map=None):
+              checkpoint=None, instance_factory=None, prepared_map=None,
+              profile=False):
     """Train with parallel CUDA tensor episodes on one immutable terrain."""
     from learning.gpu_sim.observation_gpu import TensorObservationBuilder
     from learning.gpu_sim.rollout_gpu import (collect_tensor_episodes,
                                               replay_tensor_gradients)
     from learning.gpu_sim.state import TensorEpisodeState
     from learning.gpu_sim.world import TensorWorld
+    from learning.gpu_sim.diagnostics import (
+        TrainingDiagnostics, prepare_cuda_allocator)
+
+    prepare_cuda_allocator(device)
+    diagnostics = TrainingDiagnostics(device, enabled=profile)
 
     timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S_%f")
     run_config = replace(
@@ -304,12 +336,10 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
             best_mean_return, best_episodes_seen)
     def encode_episode(episode_world, episode_truth, episode_agents):
         episode_source = episode_world.node_index[episode_agents[0].position]
-        episode_caps = torch.zeros(
-            (len(episode_agents), model_config.num_target_types + 1),
-            dtype=torch.bool, device=device)
-        for agent_index, agent in enumerate(episode_agents):
-            for capability in agent.capabilities:
-                episode_caps[agent_index, capability] = True
+        episode_caps = torch.tensor([
+            [capability in agent.capabilities
+             for capability in range(model_config.num_target_types + 1)]
+            for agent in episode_agents], dtype=torch.bool, device=device)
         episode_types = torch.tensor(
             [episode_truth.nodes[target]["rps_type"]
              for target in episode_world.targets],
@@ -327,14 +357,19 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
     completed_episodes = 0
     try:
         while completed_episodes < episodes:
+            diagnostics.reset()
             update_size = min(reinforce_batch_size,
                               episodes - completed_episodes)
             optimizer.zero_grad(set_to_none=True)
+            # Release replay's unused activation cache once when handing CUDA
+            # memory back to RAPIDS. Keep inference/replay caches warm within
+            # each phase, rather than flushing every simulation microbatch.
+            with diagnostics.phase("allocator_handoff"):
+                torch.cuda.empty_cache()
             # Keep the baseline fixed across all microbatches in this update.
             # Zero is the conventional initial baseline and avoids retaining a
             # first pass of trajectory graphs just to initialize the EMA.
             baseline_value = 0.0 if baseline.value is None else baseline.value
-            update_return_sum = 0.0
             update_records = []
             update_rollouts = []
             accumulated = 0
@@ -346,11 +381,13 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                     if initial_overlay_available and episode_number == 0:
                         initial_overlay_available = False
                     else:
-                        batch_env, batch_truth, batch_agents = instance_factory(
-                            episode_number)
-                        world = TensorWorld.from_networkx(
-                            batch_env, candidate_config, device=device,
-                            terrain=terrain)
+                        with diagnostics.phase("instance_generation"):
+                            batch_env, batch_truth, batch_agents = instance_factory(
+                                episode_number)
+                        with diagnostics.phase("world_preparation"):
+                            world = TensorWorld.from_networkx(
+                                batch_env, candidate_config, device=device,
+                                terrain=terrain)
                         builder = TensorObservationBuilder(
                             world, model_config.num_target_types,
                             task_graph=(
@@ -361,26 +398,27 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                                 model_config.edge_normalization_epsilon))
                         source, caps, types = encode_episode(
                             world, batch_truth, batch_agents)
-                        oracle_makespan = full_information_makespan(
-                            batch_truth, batch_agents)
+                        with diagnostics.phase("fi_opt"):
+                            oracle_makespan = full_information_makespan(
+                                batch_truth, batch_agents)
                 state = TensorEpisodeState.create(
                     world, torch.full((current_batch,), source, device=device),
                     caps[None].expand(current_batch, -1, -1).clone(),
                     types[None].expand(current_batch, -1).clone())
-                rollout = collect_tensor_episodes(
-                    model, state, builder, reinforce_config.death_penalty,
-                    reinforce_config.incomplete_penalty, training=True,
-                    oracle_makespans=oracle_makespan)
-                update_return_sum += float(rollout.returns.detach().sum())
+                with diagnostics.phase("rollout"):
+                    rollout = collect_tensor_episodes(
+                        model, state, builder, reinforce_config.death_penalty,
+                        reinforce_config.incomplete_penalty, training=True,
+                        oracle_makespans=oracle_makespan,
+                        diagnostics=diagnostics)
                 update_rollouts.append(rollout)
                 accumulated += current_batch
                 del state
-                # Return PyTorch's freed activation blocks to CUDA so RAPIDS
-                # can service subsequent cuGraph allocations.
-                torch.cuda.empty_cache()
+            diagnostics.snapshot("after_rollout")
 
             batch_returns = torch.cat(
                 [rollout.returns.detach() for rollout in update_rollouts])
+            update_return_sum = float(batch_returns.sum())
             raw_advantages = (batch_returns if model.has_critic
                               else batch_returns - baseline_value)
             advantage_mean = raw_advantages.mean()
@@ -395,47 +433,27 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                 current_batch = rollout.returns.numel()
                 rollout_signals = episode_signals[
                     advantage_offset:advantage_offset + current_batch]
-                (detached_losses, decision_counts, critic_losses,
-                 entropies, state_values) = replay_tensor_gradients(
-                    model, rollout, rollout_signals,
-                    reinforce_config.entropy_coefficient, update_size, device,
-                    reinforce_config.critic_coefficient)
-                for item in range(current_batch):
-                    update_records.append({
-                        "return": float(rollout.returns[item]),
-                        "loss": float(detached_losses[item]),
-                        "makespan": float(rollout.makespans[item]),
-                        "oracle_makespan": float(
-                            rollout.oracle_makespans[item]),
-                        "fi_opt_makespan": float(
-                            rollout.oracle_makespans[item]),
-                        "normalized_regret": float(
-                            rollout.normalized_regrets[item]),
-                        "completed": bool(rollout.completed[item]),
-                        "deaths": int(rollout.deaths[item]),
-                        "remaining_targets": int(
-                            rollout.remaining_targets[item]),
-                        "stalled": bool(rollout.stalled[item]),
-                        "all_agents_dead": bool(
-                            rollout.all_agents_dead[item]),
-                        "decisions": int(decision_counts[item]),
-                        "critic_loss": float(critic_losses[item]),
-                        "entropy": float(entropies[item]),
-                        "state_value": float(state_values[item]),
-                        "target_count": int(rollout.target_counts[item]),
-                    })
+                with diagnostics.phase("gradient_replay"):
+                    replay_outputs = replay_tensor_gradients(
+                        model, rollout, rollout_signals,
+                        reinforce_config.entropy_coefficient, update_size, device,
+                        reinforce_config.critic_coefficient,
+                        replay_batch_size=run_config.training.replay_batch_size)
+                with diagnostics.phase("metrics_to_cpu"):
+                    update_records.extend(_tensor_rollout_records(
+                        rollout, replay_outputs))
                 advantage_offset += current_batch
-                del rollout, detached_losses, decision_counts, critic_losses
-                del entropies, state_values
-                torch.cuda.empty_cache()
+                rollout.decision_traces.clear()
+                del rollout, replay_outputs
             del update_rollouts, batch_returns, raw_advantages
             del episode_signals
 
             parameters = [parameter for group in optimizer.param_groups
                           for parameter in group["params"]]
-            gradient_norm = torch.nn.utils.clip_grad_norm_(
-                parameters, reinforce_config.gradient_clip_norm)
-            optimizer.step()
+            with diagnostics.phase("optimizer"):
+                gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters, reinforce_config.gradient_clip_norm)
+                optimizer.step()
             if not model.has_critic:
                 baseline.update(update_return_sum / update_size)
             for offset, metrics in enumerate(update_records):
@@ -443,11 +461,13 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                 metrics["episode"] = episode
                 history.append(metrics)
             if run_directory is not None:
-                best_mean_return, best_episodes_seen = _save_rolling_weights(
-                    model, run_directory,
-                    completed_episodes + update_size,
-                    update_return_sum / update_size,
-                    best_mean_return, best_episodes_seen)
+                with diagnostics.phase("checkpoint"):
+                    best_mean_return, best_episodes_seen = _save_rolling_weights(
+                        model, run_directory,
+                        completed_episodes + update_size,
+                        update_return_sum / update_size,
+                        best_mean_return, best_episodes_seen)
+            profile_metrics = diagnostics.report(completed_episodes + update_size)
             if wandb_run is not None:
                 update_index = completed_episodes // reinforce_batch_size
                 completed_regrets = [
@@ -464,6 +484,7 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                     if model.has_critic and return_variance > 1e-12 else
                     torch.tensor(0.0))
                 logged_metrics = {
+                    **profile_metrics,
                     "update": update_index,
                     "episodes_seen": completed_episodes + update_size,
                     "mean_return": sum(record["return"]
@@ -517,6 +538,12 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                             record["completed"] for record in group) / len(group)
                 wandb_run.log(logged_metrics, step=update_index)
             completed_episodes += update_size
+    except (torch.OutOfMemoryError, MemoryError):
+        # Even a failure before the first completed update should leave useful
+        # allocator evidence beside the exception rather than only an OOM line.
+        diagnostics.enabled = True
+        diagnostics.report(completed_episodes)
+        raise
     finally:
         if wandb_run is not None:
             wandb_run.finish()
@@ -536,12 +563,18 @@ def main():
     parser.add_argument("--episodes", type=int)
     parser.add_argument("--simulation-batch-size", type=int)
     parser.add_argument("--reinforce-batch-size", type=int)
+    parser.add_argument(
+        "--replay-batch-size", type=int,
+        help="maximum episode-decision records per CUDA gradient replay batch")
     parser.add_argument("--num-target-types", type=int)
     parser.add_argument(
         "--num-agents", type=int,
         help="fix the agent count, overriding instances.min/max_agents")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"])
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="log synchronized CUDA stage timings and memory counters per update")
     parser.add_argument(
         "--checkpoint", "--checkpoint-dir", dest="checkpoint",
         help="directory under which a timestamped run folder is created")
@@ -588,6 +621,8 @@ def main():
         training, episodes=episodes,
         simulation_batch_size=simulation_batch_size,
         reinforce_batch_size=reinforce_batch_size,
+        replay_batch_size=(training.replay_batch_size if args.replay_batch_size is None
+                           else args.replay_batch_size),
         num_agents=num_agents, seed=seed,
         device=requested_device, checkpoint=checkpoint)
     resolved_config = LearningConfig(
@@ -618,7 +653,7 @@ def main():
             reinforce_batch_size, model_config,
             config.candidates, config.reinforce, resolved_config, device,
             checkpoint=checkpoint, instance_factory=factory,
-            prepared_map=prepared_map)
+            prepared_map=prepared_map, profile=args.profile)
         train.last_run_directory = run_directory
     else:
         _model, history = train(

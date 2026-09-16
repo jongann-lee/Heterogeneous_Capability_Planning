@@ -19,6 +19,8 @@ class TensorObservationBuilder:
         self.task_graph = bool(task_graph)
         self.edge_normalization = edge_normalization
         self.edge_normalization_epsilon = float(edge_normalization_epsilon)
+        self._relation_distances = None
+        self._relation_valid = None
 
     def candidate_roles(self, state):
         live = state.target_live
@@ -108,6 +110,37 @@ class TensorObservationBuilder:
         return distances, predecessors, target_distances, entry_nodes
 
     def _action_target_distances(self, state, episode_mask):
+        """Reuse compact relation features while the live-target mask is fixed.
+
+        Agent positions and type revelations do not change this geometry.
+        Cache only the region minima [mask, action, target], never graphs,
+        paths, predecessors, or full SSSP rows. The cache belongs to this world
+        and is capped at 512 masks and 8 MiB; larger layouts use direct queries.
+        """
+        targets, actions = len(self.world.targets), len(self.world.candidates)
+        mask_count = 1 << targets if targets <= 9 else 0
+        if not mask_count or mask_count * actions * targets * 4 > 8 * 1024 ** 2:
+            return self._compute_action_target_distances(state, episode_mask)
+        device = state.positions.device
+        if self._relation_distances is None:
+            self._relation_distances = torch.full(
+                (mask_count, actions, targets), torch.inf, device=device)
+            self._relation_valid = torch.zeros(
+                mask_count, dtype=torch.bool, device=device)
+        if episode_mask is None:
+            episode_mask = torch.ones(state.batch_size, dtype=torch.bool, device=device)
+        codes = (state.target_live.long() * (1 << torch.arange(
+            targets, device=device))).sum(dim=1)
+        missing = episode_mask & ~self._relation_valid[codes]
+        if missing.any():
+            computed = self._compute_action_target_distances(state, missing)
+            # Duplicate codes have identical minima from deduplicated queries.
+            self._relation_distances[codes[missing]] = computed[missing]
+            self._relation_valid[codes[missing]] = True
+        return self._relation_distances[codes].masked_fill(
+            ~episode_mask[:, None, None], torch.inf)
+
+    def _compute_action_target_distances(self, state, episode_mask):
         """Safe directed region-to-target distances for graph relations.
 
         All other live targets are blocked. The destination target is recovered

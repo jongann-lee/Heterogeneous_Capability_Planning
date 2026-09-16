@@ -1,9 +1,11 @@
-"""cuGraph-backed routing for the fixed WV graph."""
+"""cuGraph-backed routing with bounded temporary terrain copies."""
 
 from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
+
+from learning.gpu_sim.native_sssp import NativeSSSP
 
 
 @dataclass(frozen=True)
@@ -20,7 +22,8 @@ class CuGraphRouter:
     """
 
     def __init__(self, num_nodes, edge_sources, edge_destinations, edge_costs,
-                 target_nodes=(), max_cached_routes=512):
+                 target_nodes=(), max_cached_routes=512,
+                 max_batch_edges=1_000_000, max_batch_vertices=262_144):
         import cudf
 
         self.num_nodes = int(num_nodes)
@@ -31,8 +34,21 @@ class CuGraphRouter:
             "weight": edge_costs,
         })
         self._base_graph = None
+        self._native = NativeSSSP()
         self.max_cached_routes = int(max_cached_routes)
         self._base_sssp_cache = OrderedDict()
+        if max_batch_edges < 1 or max_batch_vertices < 1:
+            raise ValueError("routing batch limits must be positive")
+        # At least one terrain copy must fit; larger query banks are consumed
+        # in bounded chunks instead of allocating every copy simultaneously.
+        self.max_batch_edges = int(max_batch_edges)
+        self.max_batch_vertices = int(max_batch_vertices)
+
+    def _query_batch_size(self):
+        return max(1, min(
+            self.max_batch_edges // (len(self._edges) + 1),
+            self.max_batch_vertices // self.num_nodes,
+            (torch.iinfo(torch.int32).max - 1) // self.num_nodes))
 
     def _blocked_nodes(self, blocked):
         """Normalize either node IDs or the legacy fixed-target bit mask."""
@@ -42,7 +58,7 @@ class CuGraphRouter:
         return tuple(sorted({int(node) for node in blocked}))
 
     def _build_graph(self, blocked):
-        import cugraph
+        import cupy as cp
 
         keep = None
         for node in blocked:
@@ -50,11 +66,10 @@ class CuGraphRouter:
                        (self._edges.dst != node))
             keep = allowed if keep is None else keep & allowed
         edges = self._edges if keep is None else self._edges[keep]
-        graph = cugraph.Graph(directed=True)
-        graph.from_cudf_edgelist(
-            edges, source="src", destination="dst", edge_attr="weight",
-            renumber=False, vertices=list(range(self.num_nodes)))
-        return graph
+        return self._native.graph(
+            self.num_nodes, self._series_to_cupy(edges.src, cp.int32),
+            self._series_to_cupy(edges.dst, cp.int32),
+            self._series_to_cupy(edges.weight, cp.float64))
 
     def graph(self, blocked_nodes=()):
         """Return the cached base graph or a temporary blocked graph."""
@@ -73,17 +88,15 @@ class CuGraphRouter:
         return value.to(dtype=dtype) if dtype is not None else value
 
     def _run_sssp(self, source, blocked, graph=None):
-        import cugraph
+        import cupy as cp
 
         graph = self.graph(blocked) if graph is None else graph
-        frame = cugraph.sssp(graph, source=int(source)).sort_values("vertex")
-        vertices = self._series_to_torch(frame.vertex, torch.long)
-        if vertices.numel() != self.num_nodes or not torch.equal(
-                vertices, torch.arange(self.num_nodes,
-                                      device=vertices.device)):
+        vertices, distances, predecessors = graph.sssp(source)
+        if vertices.size != self.num_nodes:
             raise RuntimeError("cuGraph SSSP did not return every world node")
-        return (self._series_to_torch(frame.distance, torch.float32),
-                self._series_to_torch(frame.predecessor, torch.long))
+        order = cp.argsort(vertices)
+        return (torch.utils.dlpack.from_dlpack(distances[order]).float(),
+                torch.utils.dlpack.from_dlpack(predecessors[order]).long())
 
     def _base_sssp(self, source):
         """Return a cached SSSP row from the unmodified terrain graph."""
@@ -121,21 +134,21 @@ class CuGraphRouter:
                           torch.stack(predecessor_rows))
 
     def sssp_batch(self, sources, blocked_node_mask) -> SSSPResult:
-        """Run independent exact SSSP queries in one GPU graph traversal.
+        """Run independent exact SSSP queries in bounded GPU graph traversals.
 
-        cuGraph exposes weighted SSSP for one source. To keep a whole rollout
-        routing bank in one GPU operation, this method constructs disjoint,
+        cuGraph exposes weighted SSSP for one source. To batch independent
+        queries in each GPU operation, this method constructs disjoint,
         vertex-offset copies of the sparse terrain graph and connects a single
         super-source to each query source. Each copy receives its own blocked
         node mask. The copies cannot reach one another, so the one SSSP result
         reshapes exactly into independent distance and predecessor rows.
 
+        A bank exceeding the edge/vertex limits uses multiple traversals. Only
+        the final dense rows span the full bank, bounding graph scratch space
+        as the number of distinct query masks changes during training. A single
+        terrain copy is the minimum chunk, even if it exceeds either limit.
         This path intentionally performs no route or graph-variant caching.
         """
-        import cudf
-        import cugraph
-        import cupy as cp
-
         source_tensor = torch.as_tensor(
             sources, dtype=torch.long, device="cuda").flatten()
         query_count = int(source_tensor.numel())
@@ -147,15 +160,37 @@ class CuGraphRouter:
                 (0, self.num_nodes), dtype=torch.long,
                 device=source_tensor.device)
             return SSSPResult(empty_distances, empty_predecessors)
-        if query_count * self.num_nodes >= torch.iinfo(torch.int32).max:
-            raise ValueError("batched SSSP vertex IDs exceed int32 capacity")
-
         blocked_tensor = torch.as_tensor(
             blocked_node_mask, dtype=torch.bool,
             device=source_tensor.device)
         if blocked_tensor.shape != (query_count, self.num_nodes):
             raise ValueError(
                 "blocked_node_mask must have shape [queries, nodes]")
+
+        chunk_size = self._query_batch_size()
+        if query_count <= chunk_size:
+            return self._sssp_batch_chunk(source_tensor, blocked_tensor)
+        distances = torch.empty(
+            (query_count, self.num_nodes), dtype=torch.float32,
+            device=source_tensor.device)
+        predecessors = torch.empty(
+            (query_count, self.num_nodes), dtype=torch.long,
+            device=source_tensor.device)
+        for start in range(0, query_count, chunk_size):
+            end = min(start + chunk_size, query_count)
+            result = self._sssp_batch_chunk(
+                source_tensor[start:end], blocked_tensor[start:end])
+            distances[start:end] = result.distances
+            predecessors[start:end] = result.predecessors
+            del result
+        return SSSPResult(distances, predecessors)
+
+    def _sssp_batch_chunk(self, source_tensor, blocked_tensor):
+        import cupy as cp
+
+        query_count = source_tensor.numel()
+        if query_count * self.num_nodes >= torch.iinfo(torch.int32).max:
+            raise ValueError("batched SSSP vertex IDs exceed int32 capacity")
 
         source_array = cp.from_dlpack(source_tensor).astype(
             cp.int32, copy=False)
@@ -188,22 +223,14 @@ class CuGraphRouter:
             copied_costs,
             cp.zeros(query_count, dtype=cp.float32),
         ))
-        edges = cudf.DataFrame({
-            "src": copied_sources,
-            "dst": copied_destinations,
-            "weight": copied_costs,
-        })
-        graph = cugraph.Graph(directed=True)
-        graph.from_cudf_edgelist(
-            edges, source="src", destination="dst", edge_attr="weight",
-            renumber=False)
-        frame = cugraph.sssp(graph, source=int(super_source))
-
-        vertices = self._series_to_cupy(frame.vertex, cp.int32)
-        frame_distances = self._series_to_cupy(
-            frame.distance, cp.float32)
-        frame_predecessors = self._series_to_cupy(
-            frame.predecessor, cp.int32)
+        with self._native.graph(
+                super_source + 1, copied_sources,
+                copied_destinations, copied_costs) as graph:
+            vertices, frame_distances, frame_predecessors = graph.sssp(super_source)
+        # Results own independent copies; release graph buffers before dense
+        # conversion. Native vertex checks never extract/leak a vertex list.
+        del copied_sources, copied_destinations, copied_costs
+        del allowed, blocked
         dense_size = query_count * self.num_nodes
         distances = cp.full(dense_size, cp.inf, dtype=cp.float32)
         predecessors = cp.full(dense_size, -1, dtype=cp.int32)

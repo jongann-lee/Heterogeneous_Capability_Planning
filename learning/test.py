@@ -9,6 +9,7 @@ import random
 import subprocess
 import sys
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -175,14 +176,15 @@ def _gpu_episode(model, config, env, truth, agents, device, terrain=None,
         config.reinforce.incomplete_penalty,
         training=False,
         state_callback=None if trace is None else _capture_state(trace),
-        oracle_makespans=oracle_makespan)
+        oracle_makespans=oracle_makespan,
+        measure_planning_time=True)
     record = _tensor_rollout_record(rollout, 0)
     return record, world.terrain, world
 
 
 def _tensor_rollout_record(rollout, index):
     """Detach one scenario result from a tensor rollout batch."""
-    return {
+    record = {
         "return": float(rollout.returns[index]),
         "makespan": float(rollout.makespans[index]),
         "oracle_makespan": float(rollout.oracle_makespans[index]),
@@ -193,6 +195,20 @@ def _tensor_rollout_record(rollout, index):
         "remaining_targets": int(rollout.remaining_targets[index]),
         "stalled": bool(rollout.stalled[index]),
         "all_agents_dead": bool(rollout.all_agents_dead[index]),
+    }
+    record.update(_planning_metrics(
+        rollout.planning_times_seconds[index],
+        rollout.planning_call_counts[index]))
+    return record
+
+
+def _planning_metrics(total_seconds, call_count):
+    """Keep each rollout's per-replan mean for equal-weight suite reporting."""
+    return {
+        "planning_call_count": call_count,
+        "total_planning_time_seconds": total_seconds,
+        "mean_planning_time_seconds": (
+            total_seconds / call_count if call_count else None),
     }
 
 
@@ -277,7 +293,8 @@ def _gpu_suite_records(model, config, cases, device, progress=None,
                 config.reinforce.death_penalty,
                 config.reinforce.incomplete_penalty,
                 training=False,
-                oracle_makespans=oracle_makespans)
+                oracle_makespans=oracle_makespans,
+                measure_planning_time=True)
             for row, (case_index, _case) in enumerate(indexed_cases):
                 record = _tensor_rollout_record(rollout, row)
                 record.update({
@@ -403,9 +420,10 @@ def _cpu_episode(model, config, env, truth, agents, device,
         config.reinforce.death_penalty,
         config.reinforce.incomplete_penalty,
         render_dir=render_dir, render_dt=render_dt,
-        oracle_makespan=oracle_makespan)
+        oracle_makespan=oracle_makespan,
+        measure_policy_time=True)
     result = rollout.result
-    return {
+    record = {
         "return": float(rollout.episode_return),
         "makespan": float(result["makespan"]),
         "oracle_makespan": float(oracle_makespan),
@@ -417,6 +435,9 @@ def _cpu_episode(model, config, env, truth, agents, device,
         "stalled": bool(not result["completed"] and result["survivors"]),
         "all_agents_dead": bool(not result["survivors"]),
     }
+    record.update(_planning_metrics(
+        result["policy_time_seconds"], result["policy_calls"]))
+    return record
 
 
 class _PreserveFullInformationRoutes:
@@ -437,7 +458,9 @@ def _classical_episode(policy_name, config, env, truth, agents,
     oracle_makespan = full_information_makespan(truth, agents)
     diagnostics = {}
     if policy_name == "fi-opt":
+        planning_start = perf_counter()
         plan = solve_full_information(truth, agents)
+        planning_time_seconds = perf_counter() - planning_start
         if not plan.feasible:
             raise ValueError(plan.diagnostic.get(
                 "message", "FI-OPT evaluation instance is infeasible"))
@@ -462,6 +485,7 @@ def _classical_episode(policy_name, config, env, truth, agents,
         env, truth, agents, policy=policy,
         death_penalty=config.reinforce.death_penalty,
         render_dir=render_dir, render_dt=render_dt,
+        measure_policy_time=policy_name != "fi-opt",
     )
     if policy_name == "scout-then-execute":
         diagnostics = dict(policy.diagnostics)
@@ -478,7 +502,7 @@ def _classical_episode(policy_name, config, env, truth, agents,
     if predicted is not None and math.isfinite(float(predicted)):
         diagnostics["executed_makespan"] = float(result["makespan"])
         diagnostics["prediction_error"] = float(result["makespan"] - predicted)
-    return {
+    record = {
         "return": float(episode_return),
         "makespan": float(result["makespan"]),
         "oracle_makespan": float(oracle_makespan),
@@ -491,6 +515,11 @@ def _classical_episode(policy_name, config, env, truth, agents,
         "all_agents_dead": bool(not result["survivors"]),
         "policy_diagnostics": diagnostics,
     }
+    record.update(_planning_metrics(
+        planning_time_seconds if policy_name == "fi-opt"
+        else result["policy_time_seconds"],
+        1 if policy_name == "fi-opt" else result["policy_calls"]))
+    return record
 
 
 def _mean(records, key):
@@ -521,6 +550,10 @@ def _attach_case_metadata(record, suite, case):
 
 def summarize(records):
     """Return aggregate deterministic-policy statistics."""
+    planning_means = [
+        record["mean_planning_time_seconds"] for record in records
+        if record.get("mean_planning_time_seconds") is not None
+    ]
     batch_ids = {
         record.get("evaluation_batch_id", index)
         for index, record in enumerate(records)
@@ -532,6 +565,10 @@ def summarize(records):
         "rollout_batch_count": len(batch_ids),
         "max_rollout_batch_size": max(
             record.get("evaluation_batch_size", 1) for record in records),
+        "mean_planning_time_seconds": (
+            sum(planning_means) / len(planning_means)
+            if planning_means else None),
+        "planning_timed_rollouts": len(planning_means),
         "completion_rate": _mean(records, "completed"),
         "mean_return": _mean(records, "return"),
         "return_std": _std(records, "return"),
@@ -916,6 +953,13 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(rendered + "\n", encoding="utf-8")
     print(f"saved evaluation: {output}")
+    mean_planning_time = summary["mean_planning_time_seconds"]
+    if mean_planning_time is None:
+        print("average planning time per replan: n/a (no replans)")
+    else:
+        print("average planning time per replan: "
+              f"{mean_planning_time * 1000:.3f} ms "
+              "(mean of per-rollout averages)")
 
 
 if __name__ == "__main__":
