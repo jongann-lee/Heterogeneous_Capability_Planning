@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 
 import numpy as np
+import networkx as nx
 
 from learning.gpu_sim.instances import inspect_prepared_map, make_prepared_map_instance
 from learning.policy.candidates import CandidateTerrainCache
@@ -19,6 +20,8 @@ from Real_Life_Maps.indoor_map_generation import (
     write_prepared_map,
 )
 from simulation.engine import sensed_edges_truth, sensed_nodes_truth
+from simulation.agent import Agent
+from simulation.indoor_rendering import IndoorRenderer, interpolate_edge
 from simulation.visibility import visible_targets
 
 
@@ -122,7 +125,7 @@ def test_pruning_keeps_real_corridor_and_runs_test_evaluator():
         path = directory / "pruned.pkl.gz"
         write_prepared_map(
             pruned, two_part_nodes, pruned_visibility,
-            {"coarse_shape": [1, 3]}, path)
+            {"coarse_shape": [1, 3], "fine_shape": [5, 15]}, path)
         suite = directory / "suite.json"
         suite.write_text(json.dumps({
             "schema_version": 1,
@@ -141,10 +144,42 @@ def test_pruning_keeps_real_corridor_and_runs_test_evaluator():
         }))
         records, *_ = evaluate(
             suite=suite, map_path=path, policy="scout-then-execute",
-            device="cpu")
+            device="cpu", render=True, render_dir=directory / "frames",
+            output_mp4=directory / "result.mp4", render_dt=2.0)
+        assert list((directory / "frames").glob("frame_*.png"))
     assert len(records) == 1
     assert records[0]["completed"]
     assert records[0]["deaths"] == 0
+
+
+def test_indoor_rendering_follows_fine_route_around_wall():
+    graph = nx.DiGraph()
+    first, second = "start", "goal"
+    graph.add_node(first, pos=(1.0, 1.0), dense_anchor=(1, 1), type="source")
+    graph.add_node(second, pos=(5.0, 1.0), dense_anchor=(1, 5),
+                   type="target_unreached", rps_type=1)
+    route = ((1, 1), (2, 1), (2, 2), (2, 3), (2, 4), (2, 5), (1, 5))
+    graph.add_edge(first, second, fine_path=route, distance=6.0)
+    walkable = np.zeros((4, 7), dtype=np.uint8)
+    for row, col in route:
+        walkable[row, col] = 1
+    midpoint = interpolate_edge(graph, first, second, 0.5)
+    assert midpoint == (3.0, 2.0)
+    assert walkable[int(midpoint[1]), int(midpoint[0])]
+    assert not walkable[1, 3]  # Straight anchor interpolation crosses the wall.
+
+    with tempfile.TemporaryDirectory() as directory:
+        directory = Path(directory)
+        raster = directory / "walkable.npy"
+        np.save(raster, walkable)
+        renderer = IndoorRenderer(
+            graph, metadata={"fine_shape": [4, 7]}, raster_path=raster)
+        assert renderer.interpolate_edge(first, second, 0.5) == midpoint
+        agent = Agent(first, capabilities={1})
+        agent.planned_path = [first, second]
+        frame = directory / "frame_0000.png"
+        renderer(graph, graph, [agent], 0, frame, agent_xy=[midpoint])
+        assert frame.is_file() and frame.stat().st_size > 0
 
 
 def _main():

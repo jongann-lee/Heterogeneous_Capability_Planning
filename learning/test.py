@@ -38,7 +38,7 @@ from learning.policy.oracle import full_information_makespan
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RENDER_ROOT = PROJECT_ROOT / "outputs" / "my_policy_simulation"
+DEFAULT_RENDER_ROOT = PROJECT_ROOT / "cache" / "evaluation_render"
 DEFAULT_RENDER_DIR = DEFAULT_RENDER_ROOT / "frames"
 DEFAULT_OUTPUT_MP4 = DEFAULT_RENDER_ROOT / "render_result.mp4"
 DEFAULT_EVALUATION_DIR = PROJECT_ROOT / "outputs" / "evaluation"
@@ -326,11 +326,14 @@ def _route_from_snapshot(snapshot, agent_index, node, node_count):
 
 
 def _render_gpu_trace(trace, env, truth, source_agents, world, frames_dir,
-                      render_dt):
+                      render_dt, frame_renderer=None):
     """Render a device rollout after it completes; no CPU policy replay."""
     from simulation.agent import Agent
     from simulation.domain import UNKNOWN_TYPE
-    from simulation.rendering import render_frame
+    from simulation.visibility import visible_nodes
+    if frame_renderer is None:
+        from simulation.rendering import render_frame
+        frame_renderer = render_frame
 
     if not trace:
         return 0
@@ -356,12 +359,32 @@ def _render_gpu_trace(trace, env, truth, source_agents, world, frames_dir,
     frame_times.append(final_time)
     snapshot_index = 0
     targets = list(world.targets)
+    visible_env = env.copy()
+    processed_snapshot = -1
+    previous_positions = None
+    scout_viewsheds = {}
     for frame_index, tau in enumerate(frame_times):
         while (snapshot_index + 1 < len(trace)
                and float(trace[snapshot_index + 1]["clock"]) <= tau):
             snapshot_index += 1
         snapshot = trace[snapshot_index]
-        visible_env = env.copy()
+        while processed_snapshot < snapshot_index:
+            processed_snapshot += 1
+            observed_snapshot = trace[processed_snapshot]
+            current_positions = [
+                world.nodes[int(observed_snapshot["positions"][i])]
+                for i in range(len(display_agents))
+            ]
+            for i, node in enumerate(current_positions):
+                visible_env.nodes[node]["observed_node"] = True
+                if (source_agents[i].scout_capable
+                        and (previous_positions is None
+                             or previous_positions[i] != node)):
+                    if node not in scout_viewsheds:
+                        scout_viewsheds[node] = visible_nodes(env, node)
+                    for seen in scout_viewsheds[node]:
+                        visible_env.nodes[seen]["observed_node"] = True
+            previous_positions = current_positions
         for target_index, target in enumerate(targets):
             live = bool(snapshot["target_live"][target_index])
             known = bool(snapshot["target_known"][target_index])
@@ -386,10 +409,14 @@ def _render_gpu_trace(trace, env, truth, source_agents, world, frames_dir,
                 clock = float(snapshot["clock"])
                 fraction = 0.0 if arrival <= clock else max(
                     0.0, min(1.0, (tau - clock) / (arrival - clock)))
-                p0 = truth.nodes[world.nodes[start]]["pos"]
-                p1 = truth.nodes[world.nodes[end]]["pos"]
-                xys.append((p0[0] + fraction * (p1[0] - p0[0]),
-                            p0[1] + fraction * (p1[1] - p0[1])))
+                if hasattr(frame_renderer, "interpolate_edge"):
+                    xys.append(frame_renderer.interpolate_edge(
+                        world.nodes[start], world.nodes[end], fraction))
+                else:
+                    p0 = truth.nodes[world.nodes[start]]["pos"]
+                    p1 = truth.nodes[world.nodes[end]]["pos"]
+                    xys.append((p0[0] + fraction * (p1[0] - p0[0]),
+                                p0[1] + fraction * (p1[1] - p0[1])))
                 route_start = end
                 prefix = [start, end]
             else:
@@ -399,7 +426,7 @@ def _render_gpu_trace(trace, env, truth, source_agents, world, frames_dir,
                 snapshot, i, route_start, len(world.nodes))
             indices = prefix + route[1:] if prefix[-1] == route[0] else prefix
             agent.planned_path = [world.nodes[node] for node in indices]
-        render_frame(
+        frame_renderer(
             visible_env, truth, display_agents, frame_index,
             str(Path(frames_dir) / f"frame_{frame_index:04d}.png"),
             title=f"t = {tau:.1f}", agent_xy=xys)
@@ -407,7 +434,7 @@ def _render_gpu_trace(trace, env, truth, source_agents, world, frames_dir,
 
 
 def _cpu_episode(model, config, env, truth, agents, device,
-                 render_dir=None, render_dt=1.0):
+                 render_dir=None, render_dt=1.0, frame_renderer=None):
     from learning.policy.adapter import LearnedPolicyAdapter
     from learning.gpu_sim.rollout_cpu import collect_episode
 
@@ -420,6 +447,7 @@ def _cpu_episode(model, config, env, truth, agents, device,
         config.reinforce.death_penalty,
         config.reinforce.incomplete_penalty,
         render_dir=render_dir, render_dt=render_dt,
+        frame_renderer=frame_renderer,
         oracle_makespan=oracle_makespan,
         measure_policy_time=True)
     result = rollout.result
@@ -450,7 +478,8 @@ class _PreserveFullInformationRoutes:
 
 
 def _classical_episode(policy_name, config, env, truth, agents,
-                       render_dir=None, render_dt=1.0):
+                       render_dir=None, render_dt=1.0,
+                       frame_renderer=None):
     from planning.full_information import solve_full_information
     from planning.policies.scout_then_execute import ScoutThenExecutePolicy
     from simulation.engine import run_simulation
@@ -485,6 +514,7 @@ def _classical_episode(policy_name, config, env, truth, agents,
         env, truth, agents, policy=policy,
         death_penalty=config.reinforce.death_penalty,
         render_dir=render_dir, render_dt=render_dt,
+        frame_renderer=frame_renderer,
         measure_policy_time=policy_name != "fi-opt",
     )
     if policy_name == "scout-then-execute":
@@ -661,7 +691,7 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
     })
     configured_map_path = _select_prepared_map_path(
         map_path, explicit_config, saved_config)
-    (resolved_map_path, terrain_template, _map_metadata,
+    (resolved_map_path, terrain_template, map_metadata,
      prepared_map) = inspect_prepared_map(configured_map_path)
     validate_evaluation_suite_locations(suite_definition, terrain_template)
     checkpoint_map = (
@@ -719,12 +749,18 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
 
     records = []
     terrain = None
+    frame_renderer = None
     if render:
         from simulation.rendering import clear_frame_dir
         render_dir = Path(
             render_dir or DEFAULT_RENDER_DIR).resolve()
         output_mp4 = Path(
             output_mp4 or DEFAULT_OUTPUT_MP4).resolve()
+        if "fine_shape" in map_metadata:
+            from simulation.indoor_rendering import IndoorRenderer
+            frame_renderer = IndoorRenderer(
+                terrain_template, map_path=resolved_map_path,
+                metadata=map_metadata)
     progress_bar = tqdm(
         total=len(evaluation_cases), desc="Evaluating", unit="scenario",
         disable=not progress, file=sys.stderr)
@@ -755,6 +791,9 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
                 episode_video = _episode_output_path(
                     output_mp4, episode_index, episodes
                 )
+                if episode_video.exists():
+                    raise FileExistsError(
+                        f"render video already exists: {episode_video}")
                 clear_frame_dir(episode_frames)
                 if policy == "learned" and resolved_device == "cuda":
                     trace = []
@@ -763,17 +802,19 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
                         terrain=terrain, trace=trace)
                     _render_gpu_trace(
                         trace, env, truth, agents, world, episode_frames,
-                        render_dt)
+                        render_dt, frame_renderer=frame_renderer)
                     record["simulation_backend"] = "cuda_tensor"
                 elif policy == "learned":
                     record = _cpu_episode(
                         model, config, env, truth, agents, resolved_device,
-                        render_dir=episode_frames, render_dt=render_dt)
+                        render_dir=episode_frames, render_dt=render_dt,
+                        frame_renderer=frame_renderer)
                     record["simulation_backend"] = "cpu_render"
                 else:
                     record = _classical_episode(
                         policy, config, env, truth, agents,
-                        render_dir=episode_frames, render_dt=render_dt)
+                        render_dir=episode_frames, render_dt=render_dt,
+                        frame_renderer=frame_renderer)
                     record["simulation_backend"] = "cpu_classical_render"
                 try:
                     make_mp4_from_frames(

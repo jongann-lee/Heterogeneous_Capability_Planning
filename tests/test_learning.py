@@ -2855,6 +2855,55 @@ def test_learning_rollout_forwards_rendering():
     assert len(frames) == 3
 
 
+def test_cuda_trace_render_reconstructs_observed_nodes():
+    env = nx.DiGraph()
+    for index, node in enumerate(("source", "hall", "target")):
+        env.add_node(node, pos=(float(index), 0.0), type="intermediate")
+    env.nodes["source"].update(type="source", visible_nodes=("source", "hall"))
+    env.nodes["hall"]["visible_nodes"] = ("hall", "target")
+    env.nodes["target"].update(
+        type="target_unreached", rps_type=UNKNOWN_TYPE,
+        visible_nodes=("target",))
+    truth = env.copy()
+    truth.nodes["target"]["rps_type"] = 1
+    world = SimpleNamespace(nodes=("source", "hall", "target"),
+                            targets=("target",))
+
+    def snapshot(node, clock, moving, known):
+        return {
+            "positions": torch.tensor([node]),
+            "alive": torch.tensor([True]),
+            "target_live": torch.tensor([True]),
+            "target_known": torch.tensor([known]),
+            "moving": torch.tensor([moving]),
+            "transit_from": torch.tensor([0]),
+            "transit_to": torch.tensor([1]),
+            "arrival_time": torch.tensor([1.0]),
+            "clock": torch.tensor(clock),
+            "route_next": torch.full((1, 3), -1, dtype=torch.long),
+        }
+
+    rendered = []
+
+    def capture(frame_env, _truth, _agents, _index, _path, **_kwargs):
+        rendered.append((
+            {node for node, data in frame_env.nodes(data=True)
+             if data.get("observed_node")},
+            frame_env.nodes["target"]["rps_type"],
+        ))
+
+    trace = [snapshot(0, 0.0, True, False),
+             snapshot(1, 1.0, False, True)]
+    count = evaluation_module._render_gpu_trace(
+        trace, env, truth, [Agent("source", capabilities={0, 1})],
+        world, "/tmp", 1.0, frame_renderer=capture)
+    assert count == 2
+    assert rendered == [
+        ({"source", "hall"}, UNKNOWN_TYPE),
+        ({"source", "hall", "target"}, 1),
+    ]
+
+
 def _main():
     tests = [value for name, value in sorted(globals().items())
              if name.startswith("test_")]

@@ -44,14 +44,16 @@ def collect_episode(env_map, ground_truth, agents, adapter,
                     death_penalty=100.0, incomplete_penalty=1000.0,
                     max_events=100000, verbose=False,
                     render_dir=None, render_dt=1.0,
-                    oracle_makespan=None, measure_policy_time=False):
+                    oracle_makespan=None, measure_policy_time=False,
+                    frame_renderer=None):
     """Run one episode and retain the policy's differentiable trace."""
     adapter.reset_trace()
     result = run_simulation(
         env_map, ground_truth, agents, policy=adapter,
         death_penalty=death_penalty, max_events=max_events, verbose=verbose,
         render_dir=render_dir, render_dt=render_dt,
-        measure_policy_time=measure_policy_time)
+        measure_policy_time=measure_policy_time,
+        frame_renderer=frame_renderer)
     parameter = next(adapter.model.parameters())
     zero = parameter.sum() * 0.0
     logp = torch.stack(adapter.decision_log_probs).sum() \

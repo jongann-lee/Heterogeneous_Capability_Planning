@@ -129,9 +129,12 @@ def observe_and_reveal(env_map, ground_truth, agents, events=None, time=0.0,
             if env_map.has_edge(*e):
                 env_map.edges[e]["observed_edge"] = True
 
-        # Reveal the type of any target within sight.
+        # Keep the full observed-node footprint for visualization. This adds
+        # only facts actually sensed by the agent to the planner's map.
         for node in sensed_nodes_truth(ground_truth, agent):
             data = env_map.nodes.get(node, {})
+            if node in env_map:
+                data["observed_node"] = True
             if data.get("type") not in ("target_unreached", "target_reached"):
                 continue
             if data.get("rps_type", UNKNOWN_TYPE) != UNKNOWN_TYPE:
@@ -319,7 +322,7 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
                        sample_obstacle_hop=0, death_penalty=100.0,
                        max_events=100000, verbose=False,
                        render_dir=None, render_dt=1.0,
-                       measure_policy_time=False):
+                       measure_policy_time=False, frame_renderer=None):
     """Run the simulation in continuous time until all targets are cleared
     or the team stalls.
 
@@ -343,6 +346,7 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
         max_events: safety cap on processed arrivals.
         render_dir: if set, write interpolated PNG frames spaced ``render_dt``
             apart in time.
+        frame_renderer: optional callable with the ``render_frame`` signature.
         measure_policy_time: record wall-clock time spent in each policy replan,
             including its optional runtime-state hook.
 
@@ -413,15 +417,21 @@ def run_simulation(env_map, ground_truth, agents, policy=None,
             return pos[agents[i].position]
         u, v, dep, arr = tr
         frac = 0.0 if arr <= dep else max(0.0, min(1.0, (tau - dep) / (arr - dep)))
+        if frame_renderer is not None and hasattr(frame_renderer, "interpolate_edge"):
+            return frame_renderer.interpolate_edge(u, v, frac)
         (x0, y0), (x1, y1) = pos[u], pos[v]
         return (x0 + frac * (x1 - x0), y0 + frac * (y1 - y0))
 
     def emit_frame(tau):
         if render_dir is None:
             return
-        from simulation.rendering import render_frame  # lazy (matplotlib)
+        if frame_renderer is None:
+            from simulation.rendering import render_frame  # lazy (matplotlib)
+            renderer = render_frame
+        else:
+            renderer = frame_renderer
         xys = [_interp_xy(i, tau) for i in range(n)]
-        render_frame(
+        renderer(
             env_map, ground_truth, agents, render_state["frame"],
             os.path.join(render_dir, f"frame_{render_state['frame']:04d}.png"),
             agent_xy=xys, title=f"t = {tau:.1f}")

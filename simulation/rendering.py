@@ -325,11 +325,12 @@ render_rps_frame = render_frame
 
 
 def clear_frame_dir(frames_dir):
-    """Delete existing frame_*.png from frames_dir (creates the dir if absent)."""
+    """Prepare a frame directory without replacing any existing frames."""
     p = Path(frames_dir)
     p.mkdir(parents=True, exist_ok=True)
-    for f in p.glob("frame_*.png"):
-        f.unlink()
+    existing = next(p.glob("frame_*.png"), None)
+    if existing is not None:
+        raise FileExistsError(f"render frame already exists: {existing}")
 
 
 def clear_debug_dir(debug_dir):
@@ -388,7 +389,7 @@ def make_mp4_from_frames(frames_dir, output_mp4, fps=4):
     pattern = str(Path(frames_dir) / "frame_%04d.png")
     Path(output_mp4).parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg", "-n",
         "-framerate", str(fps),
         "-i", pattern,
         "-vf", video_filter,

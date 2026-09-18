@@ -1,0 +1,258 @@
+{
+  "schema_version": 1,
+  "checkpoint": "/home/jongannlee/Code/Heterogeneous_Capability_Planning/learning/checkpoints/2026-09-15_00-49-29_918864/trained_weights.pt",
+  "policy": "learned",
+  "deterministic": true,
+  "suite_id": "KTH_indoor",
+  "suite_path": "/home/jongannlee/Code/Heterogeneous_Capability_Planning/learning/evaluation_suites/KTH_indoor.json",
+  "terrain_id": "kth_50052749_patch5_pruned",
+  "output_path": "/home/jongannlee/Code/Heterogeneous_Capability_Planning/outputs/evaluation/indoor_0915.json",
+  "prepared_map": {
+    "configured_path": "Real_Life_Maps/KTH_Indoor_map.pkl.gz",
+    "resolved_path": "/home/jongannlee/Code/Heterogeneous_Capability_Planning/Real_Life_Maps/KTH_Indoor_map.pkl.gz",
+    "schema_version": 1,
+    "sha256": "a633f9bfa561192ad2b394f4e32304ec48a746dbef2939d66f704ff6ccb92970",
+    "dimensions": [
+      130,
+      171
+    ],
+    "coarse_size": null,
+    "node_count": 18584,
+    "edge_count": 72802,
+    "metadata": {
+      "source": "/Users/jongannlee/Code/LEADCAT/Heterogeneous_Capability_Planning/Real_Life_Maps/50052749",
+      "fine_shape": [
+        650,
+        855
+      ],
+      "occupancy_free_value": 254,
+      "occupancy_wall_value": 0,
+      "main_free_component_pixels": 424586,
+      "walkable_pixels": 427299,
+      "positive_zone_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        10,
+        11,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39
+      ],
+      "selection": "main 4-connected free component plus labelled free islands",
+      "patch_size": 5,
+      "coarse_shape": [
+        130,
+        171
+      ],
+      "node_count": 18584,
+      "directed_edge_count": 72802,
+      "split_patches": 234,
+      "fine_components_represented": 6,
+      "distance_units": "fine-pixel orthogonal steps",
+      "connectivity": "4-neighbor; edges require a shared walkable fine-pixel face",
+      "visibility_backend": "strict supercover line of sight on fine pixels",
+      "visible_unordered_pairs": 14160968,
+      "visible_nodes_min": 1,
+      "visible_nodes_median": 928.5,
+      "visible_nodes_max": 4911,
+      "pruning": {
+        "original_nodes": 18818,
+        "retained_nodes": 18584,
+        "removed_split_nodes": 234,
+        "removed_piece_components": 74,
+        "shortcuts_added": 2204,
+        "shortcuts_improved": 0,
+        "original_weak_components": 6,
+        "retained_weak_components": 5,
+        "removed_pixels": 981
+      }
+    },
+    "checkpoint_sha256": "dd99d08ca13f73a176b8f34e88819672c3c84f77070f5c6d4c1c4206229eb198",
+    "hash_matches_checkpoint": false,
+    "allow_map_mismatch": true,
+    "mismatch_override_used": true
+  },
+  "allow_map_mismatch": true,
+  "feature_schema": {
+    "version": 2,
+    "edge_normalization": "per_decision_zscore",
+    "edge_normalization_epsilon": 1e-06,
+    "checkpoint": {
+      "version": 2,
+      "edge_normalization": "per_decision_zscore",
+      "edge_normalization_epsilon": 1e-06
+    },
+    "allow_mismatch": false,
+    "compatibility_override_used": false
+  },
+  "allow_unknown_target_actions": false,
+  "scenario_ids": [
+    "specialists__fixed_nine_targets"
+  ],
+  "selection": {
+    "agent_config": null,
+    "target_config": null,
+    "agent_count": null,
+    "target_count": null,
+    "limit": null,
+    "episodes": 1,
+    "seed": 0
+  },
+  "summary": {
+    "scenario_count": 1,
+    "episodes": 1,
+    "rollout_batch_count": 1,
+    "max_rollout_batch_size": 1,
+    "mean_planning_time_seconds": 0.2892665242649276,
+    "planning_timed_rollouts": 1,
+    "completion_rate": 1.0,
+    "mean_return": -0.24672317504882812,
+    "return_std": 0.0,
+    "mean_makespan": 3234.0,
+    "makespan_std": 0.0,
+    "mean_oracle_makespan": 2594.0,
+    "mean_fi_opt_makespan": 2594.0,
+    "mean_normalized_regret": 0.24672317504882812,
+    "normalized_regret_std": 0.0,
+    "mean_deaths": 0.0,
+    "death_std": 0.0,
+    "mean_remaining_targets": 0.0,
+    "stalled_rate": 0.0,
+    "all_agents_dead_rate": 0.0
+  },
+  "scenarios": [
+    {
+      "return": -0.24672317504882812,
+      "makespan": 3234.0,
+      "oracle_makespan": 2594.0,
+      "fi_opt_makespan": 2594.0,
+      "normalized_regret": 0.24672317504882812,
+      "completed": true,
+      "deaths": 0,
+      "remaining_targets": 0,
+      "stalled": false,
+      "all_agents_dead": false,
+      "planning_call_count": 22,
+      "total_planning_time_seconds": 6.3638635338284075,
+      "mean_planning_time_seconds": 0.2892665242649276,
+      "simulation_backend": "cuda_tensor",
+      "video": "/home/jongannlee/Code/Heterogeneous_Capability_Planning/cache/KTH_learned.mp4",
+      "frames": "/home/jongannlee/Code/Heterogeneous_Capability_Planning/cache/KTH_frames",
+      "evaluation_batch_id": 0,
+      "evaluation_batch_size": 1,
+      "episode_index": 0,
+      "seed": 0,
+      "policy": "learned",
+      "suite_id": "KTH_indoor",
+      "scenario_id": "specialists__fixed_nine_targets",
+      "agent_configuration_id": "specialists",
+      "target_configuration_id": "fixed_nine_targets",
+      "agent_count": 4,
+      "target_count": 9,
+      "agent_profile": "scout_and_three_specialists",
+      "target_profile": "balanced_fixed",
+      "instance": {
+        "source_position": [
+          43,
+          77
+        ],
+        "agent_capabilities": [
+          [
+            0,
+            1
+          ],
+          [
+            0,
+            2
+          ],
+          [
+            1,
+            3
+          ],
+          [
+            2
+          ]
+        ],
+        "target_positions": [
+          [
+            17,
+            11
+          ],
+          [
+            66,
+            48
+          ],
+          [
+            41,
+            10
+          ],
+          [
+            11,
+            135
+          ],
+          [
+            40,
+            148
+          ],
+          [
+            88,
+            95
+          ],
+          [
+            107,
+            43
+          ],
+          [
+            76,
+            152
+          ],
+          [
+            109,
+            144
+          ]
+        ],
+        "target_types": [
+          1,
+          2,
+          3,
+          1,
+          2,
+          3,
+          3,
+          1,
+          2
+        ]
+      }
+    }
+  ]
+}

@@ -168,6 +168,7 @@ def test_capability_zero_grants_scouting():
     _, revealed = observe_and_reveal(env, truth, [hybrid])
     assert revealed == 1
     assert env.nodes[4]["rps_type"] == 5
+    assert all(env.nodes[node].get("observed_node") for node in truth)
 
 
 def test_agent_without_zero_is_blind():
@@ -182,6 +183,8 @@ def test_agent_without_zero_is_blind():
     _, revealed = observe_and_reveal(env, truth, [agent])
     assert revealed == 0
     assert env.nodes[4]["rps_type"] == UNKNOWN_TYPE
+    assert env.nodes[3]["observed_node"]
+    assert not env.nodes[4].get("observed_node", False)
 
 
 def test_placeholder_clears_n_type_instance():
