@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "suite_id": "KTH_indoor",
+  "terrain_id": "kth_50052749_patch5_pruned",
+  "num_target_types": 3,
+  "source_position": [43, 77],
+  "agent_configurations": [
+    {
+      "id": "specialists",
+      "agent_count": 4,
+      "profile": "scout_and_three_specialists",
+      "capabilities": [[0,1], [0,2], [1,3], [2]]
+    }
+  ],
+  "target_configurations": [
+    {
+      "id": "fixed_nine_targets",
+      "target_count": 9,
+      "profile": "balanced_fixed",
+      "targets": [
+        {"position": [17, 11], "type": 1},
+        {"position": [66, 48], "type": 2},
+        {"position": [41, 10], "type": 3},
+        {"position": [11, 135], "type": 1},
+        {"position": [40, 148], "type": 2},
+        {"position": [88, 95], "type": 3},
+        {"position": [107, 43], "type": 3},
+        {"position": [76, 152], "type": 1},
+        {"position": [109, 144], "type": 2}
+      ]
+    }
+  ]
+}

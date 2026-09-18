@@ -5,7 +5,7 @@ description = "Centralized planning for heterogeneous agents on uncertain terrai
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-    "cugraph-cu13==26.6.0",
+    "cugraph-cu13==26.6.0; sys_platform == 'linux'",
     "matplotlib>=3.11.1",
     "networkx>=3.6.1",
     "numpy>=2.4,<2.5",

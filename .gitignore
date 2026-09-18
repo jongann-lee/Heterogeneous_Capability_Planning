@@ -24,6 +24,8 @@ cache/
 
 # Simulation Results
 outputs/my_policy_simulation/
+outputs/map_diagnostics/
+outputs/paper_figures/
 
 # Learned checkpoints
 learning/checkpoints/

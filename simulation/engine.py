@@ -47,6 +47,7 @@ from simulation.domain import (
     UNKNOWN_TYPE, AGENT_WINS, AGENT_DIES, capability_label,
     resolve_encounter, target_type_name,
 )
+from simulation.visibility import visible_edges, visible_nodes
 
 
 # ---------------------------------------------------------------------------
@@ -80,9 +81,7 @@ def sensed_edges_truth(ground_truth, agent):
     """
     if not agent.scout_capable:
         return []
-    pos = agent.position
-    return [e for e in ground_truth.nodes[pos].get("visible_edges", [])
-            if ground_truth.has_edge(*e)]
+    return visible_edges(ground_truth, agent.position)
 
 
 def sensed_edges_assumed(env_map, agent):
@@ -90,22 +89,14 @@ def sensed_edges_assumed(env_map, agent):
     blind, so they sense nothing and discover no blockages themselves."""
     if not agent.scout_capable:
         return []
-    pos = agent.position
-    return list(env_map.nodes[pos].get("visible_edges", []))
+    return visible_edges(env_map, agent.position)
 
 
 def sensed_nodes_truth(ground_truth, agent):
     """Nodes the agent sees, preferring an explicit node-first viewshed."""
-    nodes = {agent.position}
-    explicit = ground_truth.nodes[agent.position].get("visible_nodes")
-    if explicit is not None:
-        nodes.update(node for node in explicit if node in ground_truth)
-        return nodes
-    # Compatibility for synthetic and legacy maps that only store edges.
-    for u, v in sensed_edges_truth(ground_truth, agent):
-        nodes.add(u)
-        nodes.add(v)
-    return nodes
+    if not agent.scout_capable:
+        return {agent.position}
+    return visible_nodes(ground_truth, agent.position)
 
 
 # ---------------------------------------------------------------------------

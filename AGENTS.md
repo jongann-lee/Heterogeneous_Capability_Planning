@@ -1,7 +1,7 @@
 # AGENTS.md
 
-Repository guide for coding agents. This describes the code currently on
-`main`; verify the branch and implementation after a branch switch.
+Repository guide for coding agents. This describes the implementation in this
+checkout; verify the branch and implementation after a branch switch.
 
 ## Project
 
@@ -33,6 +33,8 @@ The package is `heterogeneous-capability-planning`, requires Python 3.12 or
     the active model is direct capability matching, not cyclic RPS.
   - `engine.py`: map-independent continuous-time discrete-event simulator and
     safe placeholder policy.
+  - `visibility.py`: reads explicit node visibility or packed visibility rows
+    from prepared maps, and induces visible directed edges when needed.
   - `real_map_benchmark.py`: loads a prepared real-terrain map, applies episode
     overlays, selects a baseline, runs it, and optionally writes JSON, CSV,
     PNG, and MP4 output.
@@ -92,6 +94,7 @@ The package is `heterogeneous-capability-planning`, requires Python 3.12 or
   - `evaluation_suite.py` and `evaluation_suites/`: validated factorized fixed
     evaluation definitions. `development` is the original one-case RPS setup;
     `test` is the 12-by-15, 180-case WV factorial suite.
+    `KTH_indoor.json` is the one-case indoor suite.
   - `test.py`: deterministic suite-based learned, FI-OPT, and strict
     Scout-Then-Execute evaluation with optional single-scenario rendering.
     Only the learned mode requires a checkpoint. `policy/evaluation.py` is a
@@ -100,17 +103,22 @@ The package is `heterogeneous-capability-planning`, requires Python 3.12 or
     agent-count/target-count matrices and overall failure/death diagnostics.
 - `Graph_Generation/`: visibility, blockage, target-graph, and stochastic
   diverse-path helpers used by older planners.
-- `Real_Life_Maps/`: bundled `WV_DEM.tif` and `WV_roads.pkl`, the explicit
-  offline `build_map.py` compiler, prepared-map serialization, GRASS viewshed
-  worker, and retained older benchmark scripts. The compiler derives directed
-  Tobler travel times on a dense physical raster, computes node-first GRASS
-  viewsheds, induces edge visibility, and writes the target-independent map
-  consumed by simulation and learning.
+- `Real_Life_Maps/`: bundled outdoor data, the explicit offline `build_map.py`
+  compiler, prepared-map serialization, GRASS viewshed worker, and retained
+  older benchmark scripts. The outdoor compiler derives directed Tobler travel
+  times on a dense physical raster and computes node-first GRASS viewsheds.
+  `indoor_map_generation.py` and `indoor_los.c` build a separate occupancy-based
+  indoor graph with fine-pixel routes and line of sight. `html_map_viewer.py`
+  uses the checked-in HTML template to generate interactive coordinate viewers.
 - `Single_Agent/`: original reward-driven implementation and TSP solver,
   retained as dependencies/comparisons.
-- `tests/`: executable synthetic regressions for simulation and learning.
-- `outputs/` and `learning/checkpoints/`: ignored generated artifacts. Never
-  delete or overwrite them without checking with the user.
+- `tests/`: executable synthetic regressions for simulation, learning, and
+  indoor map generation.
+- `cache/`, selected `outputs/` subdirectories, and `learning/checkpoints/`:
+  ignored generated artifacts. `outputs/evaluation/` already contains tracked
+  results, so check Git status before adding new output files. Never delete or
+  overwrite existing outputs, checkpoints, or prepared maps without checking
+  with the user.
 
 `NEW_REPOSITORY_HANDOFF.md`, `learning/IMPLEMENTATION_PLAN.md`, and
 `learning/IMPLEMENTATION_REPORT.md` are design/history documents. They are
@@ -137,7 +145,10 @@ Active graph conventions:
 - node `type` includes `source`, `intermediate`, `target_unreached`, and
   `target_reached`;
 - target types use the legacy `rps_type` attribute;
-- nodes expose `visible_edges`; a scout sees their true endpoints plus itself;
+- visibility is either explicit `visible_nodes`/`visible_edges` on nodes or
+  packed node visibility on the graph; a scout sees visible nodes and the
+  directed edges induced by them. Use `simulation.visibility` to read either
+  representation;
 - directed edges carry `distance` and commonly `observed_edge`; grid instances
   usually contain both orientations, and uphill/downhill costs may differ.
 
@@ -198,10 +209,11 @@ passed RNG where the API supports one.
   Do not hard-code a 64x64 terrain size, WV-only identifier, or WV-only factory
   in those paths. Derive valid nodes and dimensions from the validated artifact,
   and validate suite source/target positions by graph membership.
-- Prepared maps may differ in size but must share one validated schema. Nodes
-  expose `pos`, `height`, `elevation_m`, `type`, `visible_nodes`, and
-  `visible_edges`; directed edges expose `distance`, `is_road`,
-  `observed_edge`, and `num_used`. Preserve additional diagnostic attributes.
+- Prepared maps may differ in size and need not be square or complete grids,
+  but must share one validated schema. Nodes expose `pos`, `height`,
+  `elevation_m`, and `type`; visibility is either explicit per node or packed
+  on the graph. Directed edges expose `distance`, `is_road`, `observed_edge`,
+  and `num_used`. Preserve additional diagnostic attributes.
   A checkpoint records the selected map identity, content hash, and relevant
   metadata. Evaluation must detect a checkpoint/map mismatch and require an
   explicit override rather than silently using different terrain.
@@ -246,12 +258,48 @@ passed RNG where the API supports one.
   all positive target types. Filters preserve file order, and `--episodes N`
   repeats each selected fixed case rather than sampling new layouts.
 
+## KTH indoor map handoff
+
+- The portable artifact is `Real_Life_Maps/KTH_Indoor_map.pkl.gz`. Its source
+  rasters are `Real_Life_Maps/50052749/occ_map.npy` and `valid_space.npy`.
+  The artifact is self-contained for simulation; the rasters are needed to
+  rebuild it and to show the fine occupancy background in the HTML viewer.
+  The artifact metadata records the original Mac source path as provenance;
+  loading the same artifact on another machine does not use that path.
+- The fine occupancy is 650×855 pixels. Five-by-five patches give a 130×171
+  coarse layout with 18,584 retained `(row, col)` nodes and 72,802 directed
+  edges. The graph is sparse, rectangular, and may have disconnected regions.
+  Traversal costs are exact counts of unit-cost fine-pixel steps along stored
+  routes. Pruning removed split-patch pieces and added path-backed shortcuts
+  where needed to preserve connectivity among retained nodes. Visibility was
+  computed once with strict supercover line of sight on the fine occupancy and
+  stored as packed node visibility; simulation derives visible edges on demand.
+- `learning/evaluation_suites/KTH_indoor.json` has source `(43, 77)` and nine
+  targets of types `1,2,3,1,2,3,3,1,2` in file order. Its current four-agent
+  capability sets are `[0,1]`, `[0,2]`, `[1,3]`, and `[2]`. All suite locations
+  are present in the prepared graph and reachable from the source. The suite's
+  `terrain_id` is descriptive; pass both `--suite` and `--map-path` because the
+  default map is still WV.
+- The viewer source and HTML template live in `Real_Life_Maps/`. Generated
+  viewers default to the Git-ignored `cache/html_map_viewer/`; do not commit
+  those HTML outputs. `--output` can choose another destination.
+- When publishing the indoor work, include the prepared artifact, both `.npy`
+  source rasters, indoor builder and C worker, viewer module and template,
+  `simulation/visibility.py`, the KTH suite, and the indoor regression test.
+  The diagnostic bundle under `outputs/map_diagnostics/` is generated output.
+- The suite and map have been validated, and synthetic indoor regressions cover
+  packed visibility, wall-separated patches, pruning, and evaluator loading.
+  A full nine-target evaluation and video render remain to be checked on the
+  desktop. FI-OPT search grows quickly with the number of targets, so allow
+  for substantial CPU time on this case.
+
 ## Environment and commands
 
 Use `uv`; system Python is not expected to have the dependencies. The lockfile
-includes PyTorch 2.12 and CUDA 13 cuGraph. CUDA training needs a compatible
-NVIDIA/RAPIDS environment, while the CPU simulator and synthetic checks do not
-need to run the CUDA backend.
+includes PyTorch 2.12 and CUDA 13 cuGraph, with cuGraph marked Linux-only.
+macOS can build maps and run CPU simulation without CUDA. CUDA training needs a
+compatible NVIDIA/RAPIDS environment. Rebuilding indoor visibility also needs
+`clang`, `gcc`, or `cc` for the C line-of-sight worker.
 
 ```bash
 uv sync
@@ -263,6 +311,16 @@ uv run python -m Real_Life_Maps.build_map
 uv run python -m tests.test_simulation
 uv run python -m tests.test_learning
 uv run python -m tests.test_real_map_builder
+uv run python -m tests.test_indoor_map_generation
+
+# Inspect the KTH indoor graph (HTML is written under ignored cache/)
+uv run python -m Real_Life_Maps.html_map_viewer Real_Life_Maps/KTH_Indoor_map.pkl.gz --open
+
+# KTH fixed case; CPU classical policy, checkpoint not required
+uv run python -m learning.test --policy scout-then-execute --suite learning/evaluation_suites/KTH_indoor.json --map-path Real_Life_Maps/KTH_Indoor_map.pkl.gz --output cache/KTH_indoor_evaluation.json
+
+# Render that single case after the non-rendering run is satisfactory
+uv run python -m learning.test --policy scout-then-execute --suite learning/evaluation_suites/KTH_indoor.json --map-path Real_Life_Maps/KTH_Indoor_map.pkl.gz --render --render-dir cache/KTH_indoor_frames --output-mp4 cache/KTH_indoor.mp4 --output cache/KTH_indoor_render.json
 
 # Real-map benchmark (equivalent root entry: uv run python main.py)
 uv run python -m simulation.real_map_benchmark --help

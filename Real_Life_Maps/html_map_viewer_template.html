@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Map node viewer</title>
+  <style>
+    :root { font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172329; background: #eef2f2; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body { display: flex; flex-direction: column; min-height: 100vh; }
+    header { display: flex; align-items: center; gap: 18px; padding: 12px 18px; background: #fff; border-bottom: 1px solid #d7dfdf; }
+    .identity { min-width: 0; flex: 1; }
+    h1 { margin: 0; font-size: 18px; font-weight: 680; }
+    .sub { margin-top: 2px; color: #657477; font-size: 12px; }
+    .readout { min-width: 215px; text-align: right; font-variant-numeric: tabular-nums; }
+    #hover-node { font-size: 20px; font-weight: 720; color: #0a6179; }
+    #hover-position { color: #5d6b70; font-size: 12px; }
+    button { border: 1px solid #b9c9cc; background: #fff; color: #163b44; border-radius: 8px; padding: 8px 12px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+    button:hover { background: #e8f2f3; }
+    button:focus-visible { outline: 2px solid #007c9c; outline-offset: 2px; }
+    main { flex: 1; min-height: 320px; position: relative; overflow: hidden; background: #cbd3d3; cursor: crosshair; touch-action: none; }
+    main.dragging { cursor: grabbing; }
+    canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+    #overlay { pointer-events: none; }
+    .hint { position: absolute; left: 14px; bottom: 14px; background: rgba(255,255,255,.94); padding: 7px 10px; border-radius: 6px; color: #32474c; font-size: 12px; pointer-events: none; }
+    footer { display: flex; align-items: center; gap: 12px; padding: 10px 18px; background: #fff; border-top: 1px solid #d7dfdf; }
+    footer label { font-size: 13px; font-weight: 650; white-space: nowrap; }
+    #selected { flex: 1; min-width: 100px; min-height: 40px; max-height: 80px; padding: 7px 9px; resize: vertical; border: 1px solid #b9c9cc; border-radius: 6px; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    @media (max-width: 700px) { header { flex-wrap: wrap; } .readout { text-align: left; min-width: 130px; } footer { flex-wrap: wrap; } #selected { flex-basis: 100%; order: 3; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="identity">
+      <h1 id="map-name">Map node viewer</h1>
+      <div class="sub" id="map-meta"></div>
+    </div>
+    <div class="readout" role="status" aria-live="polite">
+      <div id="hover-node">Hover a node</div>
+      <div id="hover-position">&nbsp;</div>
+    </div>
+    <button id="fit" type="button">Fit map</button>
+  </header>
+  <main id="map" aria-label="Interactive map of graph nodes">
+    <canvas id="base" aria-hidden="true"></canvas>
+    <canvas id="overlay" aria-hidden="true"></canvas>
+    <div class="hint">Scroll to zoom · drag to pan · click a node to save its coordinates</div>
+  </main>
+  <footer>
+    <label for="selected">Selected nodes <span id="selected-count">(0)</span></label>
+    <textarea id="selected" readonly aria-label="Selected node coordinates"></textarea>
+    <button id="copy" type="button">Copy coordinates</button>
+    <button id="clear" type="button">Clear</button>
+  </footer>
+  <script id="map-data" type="application/json">__MAP_DATA__</script>
+  <script>
+    (() => {
+      const data = JSON.parse(document.getElementById('map-data').textContent);
+      const stage = document.getElementById('map');
+      const base = document.getElementById('base');
+      const overlay = document.getElementById('overlay');
+      const baseContext = base.getContext('2d');
+      const overlayContext = overlay.getContext('2d');
+      const readout = document.getElementById('hover-node');
+      const positionReadout = document.getElementById('hover-position');
+      const selectedText = document.getElementById('selected');
+      const selectedCount = document.getElementById('selected-count');
+      const image = new Image();
+      const selected = new Set();
+      let hovered = -1;
+      let offsetX = 0;
+      let offsetY = 0;
+      let scale = 1;
+      let fitScale = 1;
+      let pixelRatio = 1;
+      let drag = null;
+
+      document.getElementById('map-name').textContent = data.name;
+      document.getElementById('map-meta').textContent =
+        `${data.nodes.length.toLocaleString()} nodes · ${data.width} × ${data.height} map pixels · ${data.background_note}`;
+
+      function resizeCanvases() {
+        pixelRatio = window.devicePixelRatio || 1;
+        const width = stage.clientWidth;
+        const height = stage.clientHeight;
+        for (const canvas of [base, overlay]) {
+          canvas.width = Math.max(1, Math.round(width * pixelRatio));
+          canvas.height = Math.max(1, Math.round(height * pixelRatio));
+        }
+        fitMap();
+      }
+
+      function fitMap() {
+        const width = stage.clientWidth;
+        const height = stage.clientHeight;
+        fitScale = Math.min((width - 32) / data.width, (height - 32) / data.height);
+        scale = Math.max(0.01, fitScale);
+        offsetX = (width - data.width * scale) / 2;
+        offsetY = (height - data.height * scale) / 2;
+        drawBase();
+        drawOverlay();
+      }
+
+      function prepare(context) {
+        context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+        context.clearRect(0, 0, stage.clientWidth, stage.clientHeight);
+      }
+
+      function screenPoint(node) {
+        return [offsetX + node[1] * scale, offsetY + node[2] * scale];
+      }
+
+      function drawBase() {
+        prepare(baseContext);
+        baseContext.fillStyle = '#cbd3d3';
+        baseContext.fillRect(0, 0, stage.clientWidth, stage.clientHeight);
+        if (image.complete && image.naturalWidth) {
+          baseContext.imageSmoothingEnabled = false;
+          baseContext.drawImage(image, offsetX, offsetY,
+                                data.width * scale, data.height * scale);
+        }
+        baseContext.fillStyle = 'rgba(3, 104, 139, 0.83)';
+        const dot = scale > 4 ? 3.4 : 2.5;
+        for (const node of data.nodes) {
+          const [x, y] = screenPoint(node);
+          if (x < -4 || y < -4 || x > stage.clientWidth + 4 || y > stage.clientHeight + 4) continue;
+          baseContext.fillRect(x - dot / 2, y - dot / 2, dot, dot);
+        }
+      }
+
+      function marker(index, color, radius) {
+        const [x, y] = screenPoint(data.nodes[index]);
+        overlayContext.beginPath();
+        overlayContext.arc(x, y, radius, 0, Math.PI * 2);
+        overlayContext.fillStyle = color;
+        overlayContext.fill();
+        overlayContext.strokeStyle = '#fff';
+        overlayContext.lineWidth = 1.5;
+        overlayContext.stroke();
+      }
+
+      function drawOverlay() {
+        prepare(overlayContext);
+        for (const index of selected) marker(index, '#e6602e', 5);
+        if (hovered >= 0) marker(hovered, '#0b5067', 7);
+      }
+
+      function nearest(x, y) {
+        let closest = -1;
+        let best = 11 * 11;
+        for (let index = 0; index < data.nodes.length; index++) {
+          const node = data.nodes[index];
+          const dx = offsetX + node[1] * scale - x;
+          const dy = offsetY + node[2] * scale - y;
+          const distance = dx * dx + dy * dy;
+          if (distance < best) { best = distance; closest = index; }
+        }
+        return closest;
+      }
+
+      function pointerPosition(event) {
+        const rectangle = stage.getBoundingClientRect();
+        return [event.clientX - rectangle.left, event.clientY - rectangle.top];
+      }
+
+      function setHover(index) {
+        if (index === hovered) return;
+        hovered = index;
+        if (index < 0) {
+          readout.textContent = 'Hover a node';
+          positionReadout.textContent = '\u00a0';
+        } else {
+          const node = data.nodes[index];
+          readout.textContent = node[0];
+          positionReadout.textContent = `Map position (${node[3]}, ${node[4]})`;
+        }
+        drawOverlay();
+      }
+
+      function updateSelection() {
+        selectedText.value = [...selected].map(index => data.nodes[index][0]).join('\n');
+        selectedCount.textContent = `(${selected.size})`;
+        drawOverlay();
+      }
+
+      stage.addEventListener('pointerdown', event => {
+        if (event.button !== 0) return;
+        const [x, y] = pointerPosition(event);
+        drag = { x, y, startX: offsetX, startY: offsetY, moved: false };
+        stage.setPointerCapture(event.pointerId);
+      });
+      stage.addEventListener('pointermove', event => {
+        const [x, y] = pointerPosition(event);
+        if (drag) {
+          const dx = x - drag.x;
+          const dy = y - drag.y;
+          if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+          if (drag.moved) {
+            stage.classList.add('dragging');
+            offsetX = drag.startX + dx;
+            offsetY = drag.startY + dy;
+            drawBase();
+            drawOverlay();
+          }
+        } else {
+          setHover(nearest(x, y));
+        }
+      });
+      stage.addEventListener('pointerup', event => {
+        if (!drag) return;
+        const [x, y] = pointerPosition(event);
+        if (!drag.moved) {
+          const index = nearest(x, y);
+          if (index >= 0) {
+            if (selected.has(index)) selected.delete(index);
+            else selected.add(index);
+            updateSelection();
+          }
+        }
+        drag = null;
+        stage.classList.remove('dragging');
+        setHover(nearest(x, y));
+      });
+      stage.addEventListener('pointercancel', () => {
+        drag = null;
+        stage.classList.remove('dragging');
+      });
+      stage.addEventListener('pointerleave', () => {
+        if (!drag) setHover(-1);
+      });
+      stage.addEventListener('wheel', event => {
+        event.preventDefault();
+        const [x, y] = pointerPosition(event);
+        const factor = Math.exp(-event.deltaY * 0.0015);
+        const newScale = Math.max(fitScale * 0.5, Math.min(fitScale * 40, scale * factor));
+        const ratio = newScale / scale;
+        offsetX = x - (x - offsetX) * ratio;
+        offsetY = y - (y - offsetY) * ratio;
+        scale = newScale;
+        drawBase();
+        setHover(nearest(x, y));
+        drawOverlay();
+      }, { passive: false });
+      document.getElementById('fit').addEventListener('click', fitMap);
+      document.getElementById('clear').addEventListener('click', () => {
+        selected.clear();
+        updateSelection();
+      });
+      document.getElementById('copy').addEventListener('click', async event => {
+        if (!selectedText.value) return;
+        try {
+          await navigator.clipboard.writeText(selectedText.value);
+        } catch (_) {
+          selectedText.select();
+          document.execCommand('copy');
+        }
+        const button = event.currentTarget;
+        button.textContent = 'Copied';
+        setTimeout(() => { button.textContent = 'Copy coordinates'; }, 1200);
+      });
+      image.onload = drawBase;
+      image.src = data.background;
+      new ResizeObserver(resizeCanvases).observe(stage);
+    })();
+  </script>
+</body>
+</html>

@@ -71,6 +71,7 @@ import heapq
 import math
 
 from simulation.domain import UNKNOWN_TYPE, capability_label
+from simulation.visibility import visible_targets
 from planning.policies.baseline1 import _route_attacker
 
 INF = float("inf")
@@ -111,19 +112,13 @@ def _compile(env_map, live_set, unknown_sorted):
 
     cellmask = [0] * len(nodes)
     unknown_set = set(unknown_sorted)
-    for n, data in env_map.nodes(data=True):
+    for n in env_map:
         i = idx.get(n)
         if i is None:
             continue
-        ve = data.get("visible_edges")
-        if not ve:
-            continue
         mk = 0
-        for e in ve:
-            if e[0] in unknown_set:
-                mk |= 1 << tbit[e[0]]
-            if e[1] in unknown_set:
-                mk |= 1 << tbit[e[1]]
+        for target in visible_targets(env_map, n, unknown_set):
+            mk |= 1 << tbit[target]
         cellmask[i] = mk
     return nodes, idx, fwd, rev, cellmask
 

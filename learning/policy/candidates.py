@@ -9,6 +9,17 @@ import networkx as nx
 
 from learning.policy.configuration import CandidateConfig
 from simulation.domain import UNKNOWN_TYPE
+from simulation.visibility import visible_nodes, visible_targets
+
+
+class _PackedVisibilityView:
+    """Decode packed rows only when a caller asks for one observer."""
+
+    def __init__(self, graph):
+        self.graph = graph
+
+    def __getitem__(self, node):
+        return frozenset(visible_nodes(self.graph, node))
 
 
 @dataclass
@@ -111,10 +122,14 @@ class CandidateTerrainCache:
 
     def __init__(self, graph):
         self.nodes = tuple(graph.nodes)
-        self.visible = {
-            node: frozenset(_visible_nodes(graph, node))
-            for node in self.nodes
-        }
+        self.visible = (
+            _PackedVisibilityView(graph)
+            if graph.graph.get("packed_visibility") is not None
+            else {
+                node: frozenset(_visible_nodes(graph, node))
+                for node in self.nodes
+            }
+        )
         self._staging_rankings = {}
 
     def staging_ranking(self, graph, target):
@@ -130,13 +145,7 @@ class CandidateTerrainCache:
 
 
 def _visible_nodes(graph, node):
-    explicit = graph.nodes[node].get("visible_nodes")
-    if explicit is not None:
-        return set(explicit) | {node}
-    visible = {node}
-    for u, v in graph.nodes[node].get("visible_edges", []):
-        visible.update((u, v))
-    return visible
+    return visible_nodes(graph, node)
 
 
 def _safe_distances_to_target(graph, target, target_nodes):
@@ -288,9 +297,12 @@ def generate_candidates(graph: nx.Graph,
     signature_nodes = {}
     unknown_set = set(unknown)
     for node in non_targets:
-        visible = (terrain_cache.visible[node] if terrain_cache is not None
-                   else _visible_nodes(graph, node))
-        signature = frozenset(visible & unknown_set)
+        if graph.graph.get("packed_visibility") is not None:
+            signature = frozenset(visible_targets(graph, node, unknown_set))
+        else:
+            visible = (terrain_cache.visible[node] if terrain_cache is not None
+                       else _visible_nodes(graph, node))
+            signature = frozenset(visible & unknown_set)
         if signature:
             signature_nodes.setdefault(signature, set()).add(node)
 

@@ -32,6 +32,10 @@ uv run python -m learning.test learning/checkpoints/<run-directory> \
   --map-path Real_Life_Maps/WV_tobler_viewshed_64.pkl.gz --device cuda
 ```
 
+On macOS, `uv sync` skips the Linux-only cuGraph package, so map building and
+CPU runs remain available. On a compatible Linux/CUDA host, `uv sync` retains
+cuGraph for CUDA training and evaluation.
+
 Use module entry points (`python -m ...`) so package imports resolve
 consistently. MP4 generation additionally requires the `ffmpeg` executable.
 Learning commands load only validated, offline-built prepared-map artifacts.
@@ -39,3 +43,13 @@ The CLI map path overrides `instances.map_path` in YAML; the bundled WV map
 remains the default. New checkpoints record the artifact SHA-256 and metadata,
 and learned evaluation rejects a different map unless
 `--allow-map-mismatch` is supplied explicitly.
+
+The indoor 50052749 map has a portable prepared artifact at
+`Real_Life_Maps/KTH_Indoor_map.pkl.gz`. It uses one `(row, col)`
+node per occupied 5×5 patch, with exact fine-pixel shortcut routes through
+discarded split-patch pieces. Precomputed line of sight is packed inside the
+artifact and read by the simulator. To regenerate only the pruned artifact
+from an existing diagnostic bundle, run
+`uv run python -m Real_Life_Maps.indoor_map_generation --prune-existing --output-dir outputs/map_diagnostics/indoor_50052749_patch5`
+on a diagnostic bundle that has not already been pruned; the builder protects
+existing prepared maps from replacement.

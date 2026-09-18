@@ -11,6 +11,7 @@ from learning.policy.candidates import (
     physical_group_metadata,
 )
 from learning.gpu_sim.cugraph_router import CuGraphRouter
+from simulation.visibility import visible_nodes
 
 
 @dataclass
@@ -50,13 +51,7 @@ class TensorTerrain:
         visibility = torch.zeros(
             (len(nodes), len(nodes)), dtype=torch.bool, device=device)
         for node in nodes:
-            visible = {node}
-            explicit = graph.nodes[node].get("visible_nodes")
-            if explicit is not None:
-                visible.update(explicit)
-            else:
-                for u, v in graph.nodes[node].get("visible_edges", []):
-                    visible.update((u, v))
+            visible = visible_nodes(graph, node)
             indices = [node_index[item] for item in visible if item in node_index]
             visibility[node_index[node], indices] = True
 
