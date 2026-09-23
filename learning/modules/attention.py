@@ -134,8 +134,41 @@ class _TypedNodeUpdate(nn.Module):
         return value.masked_fill(~node_mask[..., None], 0.0)
 
 
+class BeliefWeightedCapabilityRelations(nn.Module):
+    """Direct probability-weighted target/capability value messages.
+
+    These relations deliberately have no query/key scores, softmax, or reverse
+    neighborhood normalization. A belief mass of 0.25 therefore contributes
+    exactly 0.25 of the corresponding projected value in either direction.
+    """
+
+    def __init__(self, model_dim):
+        super().__init__()
+        self.capability_to_target = nn.Linear(
+            model_dim, model_dim, bias=False)
+        self.target_to_capability = nn.Linear(
+            model_dim, model_dim, bias=False)
+
+    def forward(self, targets, capabilities, beliefs,
+                target_mask, capability_mask):
+        relation = beliefs * (
+            target_mask[:, :, None] & capability_mask[:, None, :]
+        ).to(beliefs.dtype)
+        target_messages = torch.einsum(
+            "btk,bkd->btd", relation,
+            self.capability_to_target(capabilities))
+        capability_messages = torch.einsum(
+            "btk,btd->bkd", relation,
+            self.target_to_capability(targets))
+        return (
+            target_messages.masked_fill(~target_mask[..., None], 0.0),
+            capability_messages.masked_fill(
+                ~capability_mask[..., None], 0.0),
+        )
+
+
 class HeterogeneousGraphBlock(nn.Module):
-    """Synchronous typed message passing over agent/target/action nodes."""
+    """Synchronous typed message passing over task and capability nodes."""
 
     def __init__(self, model_dim, num_heads, distance_dim, dropout=0.0):
         super().__init__()
@@ -161,11 +194,17 @@ class HeterogeneousGraphBlock(nn.Module):
             for kind in ("serves", "reveals", "stages_for")
             for direction in ("target_to_action", "action_to_target")
         })
-        self.agent_update = _TypedNodeUpdate(model_dim, 2, dropout)
-        self.target_update = _TypedNodeUpdate(model_dim, 5, dropout)
+        self.capability_relations = nn.ModuleDict({
+            "agent_to_capability": semantic_relation(),
+            "capability_to_agent": semantic_relation(),
+        })
+        self.belief_relations = BeliefWeightedCapabilityRelations(model_dim)
+        self.agent_update = _TypedNodeUpdate(model_dim, 3, dropout)
+        self.target_update = _TypedNodeUpdate(model_dim, 6, dropout)
         self.action_update = _TypedNodeUpdate(model_dim, 5, dropout)
+        self.capability_update = _TypedNodeUpdate(model_dim, 2, dropout)
 
-    def forward(self, agents, targets, actions, observation,
+    def forward(self, agents, targets, actions, capabilities, observation,
                 agent_target_distance, agent_action_distance,
                 action_target_distance):
         at_mask = observation.agent_target_distance_mask
@@ -176,12 +215,29 @@ class HeterogeneousGraphBlock(nn.Module):
             ("reveals", observation.reveals_mask),
             ("stages_for", observation.stages_for_mask),
         )
+        living_agents = (
+            observation.agent_mask
+            & observation.task_agent_features[..., 0].bool())
+        active_targets = (
+            observation.target_mask
+            & ~observation.task_target_features[..., 0].bool())
+        membership = observation.agent_capability_membership.bool()
+        capability_to_agent_mask = (
+            membership
+            & living_agents[:, :, None]
+            & observation.capability_mask[:, None, :])
+        agent_to_capability_mask = capability_to_agent_mask.transpose(1, 2)
+        target_capability, capability_target = self.belief_relations(
+            targets, capabilities, observation.target_capability_beliefs,
+            active_targets, observation.capability_mask)
 
         agent_messages = [
             self.distance_relations["target_to_agent"](
                 agents, targets, at_mask, agent_target_distance),
             self.distance_relations["action_to_agent"](
                 agents, actions, aa_mask, agent_action_distance),
+            self.capability_relations["capability_to_agent"](
+                agents, capabilities, capability_to_agent_mask),
         ]
         target_messages = [
             self.distance_relations["agent_to_target"](
@@ -190,6 +246,7 @@ class HeterogeneousGraphBlock(nn.Module):
             self.distance_relations["action_to_target"](
                 targets, actions, ct_mask.transpose(1, 2),
                 action_target_distance.transpose(1, 2)),
+            target_capability,
         ]
         action_messages = [
             self.distance_relations["agent_to_action"](
@@ -205,6 +262,11 @@ class HeterogeneousGraphBlock(nn.Module):
             target_messages.append(
                 self.semantic_relations[f"{name}_action_to_target"](
                     targets, actions, relation_mask.transpose(1, 2)))
+        capability_messages = [
+            self.capability_relations["agent_to_capability"](
+                capabilities, agents, agent_to_capability_mask),
+            capability_target,
+        ]
 
         # All messages above read the same incoming node states.
         return (
@@ -214,4 +276,7 @@ class HeterogeneousGraphBlock(nn.Module):
                 targets, target_messages, observation.target_mask),
             self.action_update(
                 actions, action_messages, observation.action_mask),
+            self.capability_update(
+                capabilities, capability_messages,
+                observation.capability_mask),
         )

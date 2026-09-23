@@ -231,8 +231,11 @@ class TensorObservationBuilder:
         target_x[..., 4] = state.target_known
         target_x[..., 5] = ~state.target_known
         capable_counts = state.capabilities[..., 1:].sum(dim=1).float() / agents
-        known_type_index = (state.target_types - 1).clamp_min(0)
-        target_x[..., 7] = capable_counts.gather(1, known_type_index) * state.target_known
+        known_type_index = torch.where(
+            state.target_known, state.target_types - 1,
+            torch.zeros_like(state.target_types))
+        target_x[..., 7] = capable_counts.gather(
+            1, known_type_index) * state.target_known
         onehot = torch.nn.functional.one_hot(
             known_type_index, self.num_target_types).float()
         target_x[..., 8:] = onehot * state.target_known[..., None]
