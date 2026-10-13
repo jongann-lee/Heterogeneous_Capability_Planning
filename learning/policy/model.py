@@ -99,11 +99,12 @@ class HeterogeneousGraphPolicy(nn.Module):
         self.config = config
         self.has_critic = config.use_critic
         d = config.model_dim
-        k = config.num_target_types
         edge_dim = config.distance_embedding_dim
-        self.agent_encoder = EntityEncoder(k + 3, d)
-        self.target_encoder = EntityEncoder(k + 1, d)
+        self.agent_encoder = EntityEncoder(3, d)
+        self.target_encoder = EntityEncoder(2, d)
         self.action_encoder = EntityEncoder(4, d)
+        self.capability_embedding = nn.Parameter(torch.empty(d))
+        nn.init.normal_(self.capability_embedding, std=1.0 / math.sqrt(d))
         self.distance_encoder = nn.Sequential(
             nn.Linear(1, edge_dim), nn.GELU(),
             nn.Linear(edge_dim, edge_dim),
@@ -119,7 +120,7 @@ class HeterogeneousGraphPolicy(nn.Module):
             nn.Linear(config.relation_hidden_dim, 1),
         )
         self.critic = nn.Sequential(
-            nn.Linear(3 * d, config.critic_hidden_dim),
+            nn.Linear(4 * d, config.critic_hidden_dim),
             nn.GELU(),
             nn.Linear(config.critic_hidden_dim, 1),
         )
@@ -133,7 +134,8 @@ class HeterogeneousGraphPolicy(nn.Module):
             "agent_action_distances", "action_target_distances",
             "agent_target_distance_mask", "agent_action_distance_mask",
             "action_target_distance_mask", "serves_mask", "reveals_mask",
-            "stages_for_mask",
+            "stages_for_mask", "agent_capability_membership",
+            "target_capability_beliefs", "capability_mask",
         )
         missing = [name for name in required
                    if getattr(observation, name, None) is None]
@@ -147,17 +149,23 @@ class HeterogeneousGraphPolicy(nn.Module):
         agents = self.agent_encoder(observation.task_agent_features)
         targets = self.target_encoder(observation.task_target_features)
         actions = self.action_encoder(observation.task_action_features)
+        batch, capability_count = observation.capability_mask.shape
+        capabilities = self.capability_embedding.view(1, 1, -1).expand(
+            batch, capability_count, -1)
+        capabilities = capabilities.masked_fill(
+            ~observation.capability_mask[..., None], 0.0)
         at_distance = self.distance_encoder(observation.agent_target_distances)
         aa_distance = self.distance_encoder(observation.agent_action_distances)
         ct_distance = self.distance_encoder(observation.action_target_distances)
         for block in self.graph_blocks:
-            agents, targets, actions = block(
-                agents, targets, actions, observation,
+            agents, targets, actions, capabilities = block(
+                agents, targets, actions, capabilities, observation,
                 at_distance, aa_distance, ct_distance)
-        return agents, targets, actions, aa_distance
+        return agents, targets, actions, capabilities, aa_distance
 
     def actor_critic(self, observation):
-        agents, targets, actions, aa_distance = self.encode(observation)
+        agents, targets, actions, capabilities, aa_distance = self.encode(
+            observation)
         batch, num_agents, _ = agents.shape
         num_actions = actions.shape[1]
         agent_pairs = agents[:, :, None].expand(
@@ -178,6 +186,7 @@ class HeterogeneousGraphPolicy(nn.Module):
                 masked_sum(agents, observation.agent_mask),
                 masked_sum(targets, observation.target_mask),
                 masked_sum(actions, observation.action_mask),
+                masked_sum(capabilities, observation.capability_mask),
             ), dim=-1)
             values = self.critic(graph_state).squeeze(-1)
         return logits, values

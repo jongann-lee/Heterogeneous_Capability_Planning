@@ -722,8 +722,18 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
         instances=replace(config.instances, map_path=str(resolved_map_path)))
     if (policy == "learned"
             and config.model.num_target_types != suite_definition.num_target_types):
-        raise ValueError(
-            "checkpoint model num_target_types does not match evaluation suite")
+        if config.model.architecture == "transformer":
+            raise ValueError(
+                "checkpoint Transformer num_target_types does not match "
+                "evaluation suite")
+        # Capability nodes make task-graph parameter shapes independent of the
+        # scenario's categorical label count. Use the suite count for runtime
+        # observation/state construction while loading the same saved weights.
+        config = replace(
+            config,
+            model=replace(
+                config.model,
+                num_target_types=suite_definition.num_target_types))
     if seed is None:
         seed = config.training.seed
     random.seed(seed)

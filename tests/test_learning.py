@@ -60,7 +60,11 @@ from learning.policy.model import (
     VanillaTransformerPolicy,
     build_policy,
 )
-from learning.modules import AssignmentDecoder, DecoderOutput
+from learning.modules import (
+    AssignmentDecoder,
+    BeliefWeightedCapabilityRelations,
+    DecoderOutput,
+)
 from learning.gpu_sim.observation_cpu import (
     batch_observations,
     build_observation,
@@ -1476,6 +1480,38 @@ def test_training_writes_latest_best_and_final_weights():
         assert isinstance(best_model, HeterogeneousGraphPolicy)
 
 
+def test_task_graph_checkpoint_evaluates_with_suite_type_count():
+    base = load_config()
+    model_config = replace(
+        base.model, num_target_types=3, model_dim=16, num_heads=4,
+        message_passing_blocks=2, distance_embedding_dim=4,
+        critic_hidden_dim=8)
+    config = replace(
+        base, model=model_config,
+        candidates=replace(
+            base.candidates, staging_per_target=0,
+            include_pair_staging=False, allow_unknown_target_actions=True),
+        training=replace(base.training, device="cpu", wandb=False))
+    model = build_policy(model_config)
+    with tempfile.TemporaryDirectory() as directory:
+        directory = Path(directory)
+        checkpoint = directory / "checkpoint"
+        checkpoint.mkdir()
+        (checkpoint / "config.yaml").write_text(
+            yaml.safe_dump(
+                _serialized_run_config(config), sort_keys=False),
+            encoding="utf-8")
+        torch.save(model.state_dict(), checkpoint / "trained_weights.pt")
+        map_path = _save_prepared_grid(directory, "runtime_map.pkl.gz", 2)
+        suite_path = _write_single_case_suite(directory)
+        records, _summary, runtime_config, *_rest = evaluate_suite(
+            checkpoint, suite=suite_path, map_path=map_path,
+            device="cpu", limit=1)
+    assert len(records) == 1
+    assert runtime_config.model.architecture == "task_graph"
+    assert runtime_config.model.num_target_types == 1
+
+
 def test_tensor_training_accumulates_microbatches_and_handles_partial_update():
     from learning.train import train_gpu
 
@@ -1682,13 +1718,15 @@ def test_task_graph_schema_uses_beliefs_semantics_and_effective_distances():
         transit=[(0, 1, 0.0, 1.0)], clock=0.25,
         replan_transit=True, edge_normalization=RAW_EDGE_NORMALIZATION)
 
-    assert observation.task_agent_features.shape[-1] == 5
-    assert observation.task_target_features.shape[-1] == 3
+    assert observation.task_agent_features.shape[-1] == 3
+    assert observation.task_target_features.shape[-1] == 2
     assert observation.task_action_features.shape[-1] == 4
     # Unknown types use a uniform planner belief, never truth or all-zero.
     assert torch.allclose(
-        observation.task_target_features[0, 0, 1:],
+        observation.target_capability_beliefs[0, 0],
         torch.tensor([0.5, 0.5]))
+    assert observation.agent_capability_membership[0, 0].tolist() == [True, False]
+    assert observation.capability_mask[0].tolist() == [True, True]
 
     target_action = next(
         i for i, item in enumerate(observation.candidates[0])
@@ -1725,6 +1763,174 @@ def test_task_graph_schema_uses_beliefs_semantics_and_effective_distances():
     assert observation.reveals_mask[0, observation_action, target_index]
     assert not observation.action_target_distance_mask[
         0, wait_action, target_index]
+
+
+def test_belief_weighted_capability_messages_are_exact_and_unnormalized():
+    relation = BeliefWeightedCapabilityRelations(2)
+    with torch.no_grad():
+        relation.capability_to_target.weight.copy_(torch.eye(2))
+        relation.target_to_capability.weight.copy_(torch.eye(2))
+    capabilities = torch.tensor([[[1.0, 0.0], [0.0, 2.0], [3.0, 4.0]]])
+    targets = torch.tensor([[[2.0, 1.0], [4.0, 3.0], [6.0, 5.0]]])
+    beliefs = torch.tensor([[[1.0, 0.0, 0.0],
+                             [1 / 3, 1 / 3, 1 / 3],
+                             [0.25, 0.75, 0.0]]])
+    target_messages, capability_messages = relation(
+        targets, capabilities, beliefs,
+        torch.ones((1, 3), dtype=torch.bool),
+        torch.ones((1, 3), dtype=torch.bool))
+    assert torch.allclose(target_messages, torch.tensor([[
+        [1.0, 0.0], [4 / 3, 2.0], [0.25, 1.5],
+    ]]))
+    # The reverse direction is a raw sum. In particular, its first row is not
+    # divided by the aggregate belief mass 1 + 1/3 + 1/4.
+    assert torch.allclose(capability_messages, torch.tensor([[
+        [29 / 6, 13 / 4], [35 / 6, 19 / 4], [4 / 3, 1.0],
+    ]]))
+
+    masked_targets, masked_capabilities = relation(
+        targets, capabilities, torch.ones_like(beliefs),
+        torch.tensor([[True, False, False]]),
+        torch.tensor([[True, False, False]]))
+    assert torch.equal(masked_targets, torch.tensor([[[1.0, 0.0],
+                                                       [0.0, 0.0],
+                                                       [0.0, 0.0]]]))
+    assert torch.equal(masked_capabilities, torch.tensor([[[2.0, 1.0],
+                                                            [0.0, 0.0],
+                                                            [0.0, 0.0]]]))
+    empty_targets, empty_capabilities = relation(
+        targets, capabilities, beliefs,
+        torch.zeros((1, 3), dtype=torch.bool),
+        torch.zeros((1, 3), dtype=torch.bool))
+    assert not empty_targets.any() and not empty_capabilities.any()
+    assert torch.isfinite(empty_targets).all()
+    assert torch.isfinite(empty_capabilities).all()
+
+
+def test_dead_agents_and_serviced_targets_send_no_capability_messages():
+    graph = _line(3)
+    graph.nodes[2].update(type="target_reached", rps_type=1)
+    dead_agent = Agent(0, capabilities={1, 2})
+    dead_agent.alive = False
+    observation = build_observation(graph, [dead_agent], 2)
+    model = _graph_model(2)
+    block = model.graph_blocks[0]
+    captured = {}
+
+    def capture(name):
+        def hook(_module, _inputs, output):
+            captured[name] = output
+        return hook
+
+    hooks = [
+        block.capability_relations["agent_to_capability"].register_forward_hook(
+            capture("agent_to_capability")),
+        block.capability_relations["capability_to_agent"].register_forward_hook(
+            capture("capability_to_agent")),
+        block.belief_relations.register_forward_hook(capture("belief")),
+    ]
+    try:
+        encoded = model.encode(observation)
+    finally:
+        for hook in hooks:
+            hook.remove()
+    assert not captured["agent_to_capability"].any()
+    assert not captured["capability_to_agent"].any()
+    assert not captured["belief"][0].any()
+    assert not captured["belief"][1].any()
+    assert all(torch.isfinite(value).all() for value in encoded)
+
+
+def test_capability_relabeling_preserves_task_graph_logits():
+    graph = _line(5)
+    graph.nodes[3].update(type="target_unreached", rps_type=1)
+    graph.nodes[4].update(type="target_unreached", rps_type=3)
+    agents = [Agent(0, capabilities={0, 1, 2}),
+              Agent(0, capabilities={3})]
+    original = build_observation(graph, agents, 3)
+
+    relabeled_graph = graph.copy()
+    relabeled_graph.nodes[3]["rps_type"] = 3
+    relabeled_graph.nodes[4]["rps_type"] = 1
+    relabeled_agents = [Agent(0, capabilities={0, 3, 2}),
+                        Agent(0, capabilities={1})]
+    relabeled = build_observation(relabeled_graph, relabeled_agents, 3)
+    model = _graph_model(3)
+    with torch.no_grad():
+        original_logits = model(original)
+        relabeled_logits = model(relabeled)
+    assert torch.equal(
+        original.feasible_action_mask, relabeled.feasible_action_mask)
+    assert torch.allclose(
+        original_logits, relabeled_logits, atol=1.0e-6, equal_nan=True)
+
+
+def test_one_task_graph_model_handles_three_and_thirty_two_capabilities():
+    graph_three = _line(3)
+    graph_three.nodes[2].update(type="target_unreached", rps_type=3)
+    observation_three = build_observation(
+        graph_three, [Agent(0, capabilities={0, 3})], 3)
+    graph_thirty_two = _line(3)
+    graph_thirty_two.nodes[2].update(
+        type="target_unreached", rps_type=32)
+    observation_thirty_two = build_observation(
+        graph_thirty_two, [Agent(0, capabilities={0, 32})], 32)
+
+    model = _graph_model(3)
+    parameter_shapes = {
+        name: parameter.shape for name, parameter in model.named_parameters()}
+    with torch.no_grad():
+        logits_three = model(observation_three)
+        logits_thirty_two = model(observation_thirty_two)
+        batched_logits = model(batch_observations(
+            [observation_three, observation_thirty_two]))
+    assert torch.isfinite(
+        logits_three[observation_three.feasible_action_mask]).all()
+    assert torch.isfinite(
+        logits_thirty_two[observation_thirty_two.feasible_action_mask]).all()
+    assert torch.allclose(
+        logits_three[0], batched_logits[0, :, :logits_three.shape[2]],
+        atol=1.0e-5, equal_nan=True)
+    assert torch.allclose(
+        logits_thirty_two[0],
+        batched_logits[1, :, :logits_thirty_two.shape[2]],
+        atol=1.0e-5, equal_nan=True)
+    model_thirty_two = _graph_model(32)
+    assert parameter_shapes == {
+        name: parameter.shape
+        for name, parameter in model_thirty_two.named_parameters()}
+    if torch.cuda.is_available():
+        model.cuda()
+        cuda_observation = observation_thirty_two.to("cuda")
+        with torch.no_grad():
+            cuda_logits = model(cuda_observation)
+        assert torch.allclose(
+            logits_thirty_two,
+            cuda_logits.cpu(), atol=1.0e-5, equal_nan=True)
+
+
+def test_target_revelation_updates_only_visible_belief_rows():
+    graph = _line(4)
+    graph.nodes[2].update(
+        type="target_unreached", rps_type=UNKNOWN_TYPE)
+    graph.nodes[3].update(
+        type="target_unreached", rps_type=UNKNOWN_TYPE)
+    agents = [Agent(0, capabilities={0, 1, 2, 3})]
+    hidden = build_observation(graph, agents, 3)
+    assert torch.allclose(
+        hidden.target_capability_beliefs,
+        torch.full((1, 2, 3), 1 / 3))
+
+    graph.nodes[2]["rps_type"] = 2
+    revealed = build_observation(graph, agents, 3)
+    target_row = revealed.targets[0].index(2)
+    hidden_row = revealed.targets[0].index(3)
+    assert torch.equal(
+        revealed.target_capability_beliefs[0, target_row],
+        torch.tensor([0.0, 1.0, 0.0]))
+    assert torch.allclose(
+        revealed.target_capability_beliefs[0, hidden_row],
+        torch.full((3,), 1 / 3))
 
 
 def test_task_graph_distance_normalization_is_per_observation_and_shared():
@@ -1893,22 +2099,25 @@ def test_cpu_cuda_observation_parity_for_normalization_and_unknown_actions():
         load_config().candidates, staging_per_target=0,
         include_pair_staging=False, allow_unknown_target_actions=True)
     cpu = build_observation(
-        graph, [Agent(0, capabilities={1})], 1,
+        graph, [Agent(0, capabilities={1, 3})], 3,
         candidate_config=candidate_config)
     world = TensorWorld.from_networkx(
         graph, candidate_config, device="cuda")
     state = TensorEpisodeState.create(
-        world, [world.node_index[0]], [[[False, True]]], [[1]])
+        world, [world.node_index[0]],
+        [[[False, True, False, True]]], [[2]])
     config = load_config().model
     gpu = TensorObservationBuilder(
-        world, 1, edge_normalization=config.edge_normalization,
+        world, 3, edge_normalization=config.edge_normalization,
         edge_normalization_epsilon=(
             config.edge_normalization_epsilon)).build(state)[0]
     assert [candidate.key for candidate in cpu.candidates[0]] == [
         candidate.key for candidate in gpu.candidates[0]]
     for name in (
             "agent_target_distances", "agent_action_distances",
-            "action_target_distances"):
+            "action_target_distances", "task_agent_features",
+            "task_target_features", "agent_capability_membership",
+            "target_capability_beliefs", "capability_mask"):
         assert torch.allclose(
             getattr(cpu, name), getattr(gpu, name).cpu(), atol=1.0e-5)
     for name in (
@@ -1961,7 +2170,8 @@ def test_task_graph_policy_is_permutation_equivariant_and_has_finite_critic():
 
     swapped_agents = copy.copy(observation)
     order_a = torch.tensor([1, 0])
-    for name in ("agent_features", "agent_mask", "task_agent_features"):
+    for name in ("agent_features", "agent_mask", "task_agent_features",
+                 "agent_capability_membership"):
         setattr(swapped_agents, name, getattr(observation, name)[:, order_a])
     for name in ("agent_target_relations", "agent_action_relations",
                  "feasible_action_mask", "agent_target_distances",
@@ -1991,7 +2201,8 @@ def test_task_graph_policy_is_permutation_equivariant_and_has_finite_critic():
 
     swapped_targets = copy.copy(observation)
     order_t = torch.tensor([1, 0])
-    for name in ("target_features", "target_mask", "task_target_features"):
+    for name in ("target_features", "target_mask", "task_target_features",
+                 "target_capability_beliefs"):
         setattr(swapped_targets, name, getattr(observation, name)[:, order_t])
     for name in ("agent_target_relations", "agent_target_distances",
                  "agent_target_distance_mask"):
@@ -2416,6 +2627,9 @@ def test_hidden_ground_truth_never_enters_observation():
     second = build_observation(env, agents, 2)
     assert torch.equal(first.target_features, second.target_features)
     assert first.target_features[0, 0, -2:].sum() == 0
+    assert torch.equal(
+        first.target_capability_beliefs,
+        torch.tensor([[[0.5, 0.5]]]))
 
 
 def test_variable_sizes_batch_and_padding_invariance():

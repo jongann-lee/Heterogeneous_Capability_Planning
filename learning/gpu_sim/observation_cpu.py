@@ -52,6 +52,9 @@ class PlannerObservation:
     serves_mask: torch.Tensor | None = None
     reveals_mask: torch.Tensor | None = None
     stages_for_mask: torch.Tensor | None = None
+    agent_capability_membership: torch.Tensor | None = None
+    target_capability_beliefs: torch.Tensor | None = None
+    capability_mask: torch.Tensor | None = None
 
     def to(self, device):
         values = {}
@@ -184,10 +187,11 @@ def attach_task_graph_fields(observation: PlannerObservation,
     remaining_feature = (
         agent[..., 8:9] if agent_remaining_times is None else
         agent_remaining_times[..., None])
-    # Alive, remaining transit time, scout capability, then every positive
-    # service capability. Schema 2 normalizes the remaining-time slot below.
+    # Service capabilities and target-type beliefs are relations to explicit
+    # capability nodes. Only the fixed-width, type-independent features remain
+    # on agent and target nodes.
     observation.task_agent_features = torch.cat(
-        (agent[..., 2:3], remaining_feature, agent[..., 3:4], agent[..., 9:]),
+        (agent[..., 2:3], remaining_feature, agent[..., 3:4]),
         dim=-1)
 
     known = target[..., 4:5]
@@ -195,8 +199,13 @@ def attach_task_graph_fields(observation: PlannerObservation,
     prior = unknown.expand(*unknown.shape[:-1], num_target_types) \
         / float(num_target_types)
     belief = target[..., 8:] * known + prior
+    observation.agent_capability_membership = agent[..., 9:].bool()
+    observation.target_capability_beliefs = belief
+    observation.capability_mask = torch.ones(
+        (*agent.shape[:-2], num_target_types), dtype=torch.bool,
+        device=agent.device)
     observation.task_target_features = torch.cat(
-        (target[..., 3:4], belief), dim=-1)
+        (target[..., 3:4], known), dim=-1)
     observation.task_action_features = action[..., 2:6]
 
     legacy_remaining = agent[..., 8:9].unsqueeze(2)
@@ -525,7 +534,8 @@ def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:
     maxima = [max(x.agent_features.shape[1] for x in items),
               max(x.target_features.shape[1] for x in items),
               max(x.action_features.shape[1] for x in items),
-              max(x.physical_group_mask.shape[1] for x in items)]
+              max(x.physical_group_mask.shape[1] for x in items),
+              max(x.capability_mask.shape[1] for x in items)]
 
     def pad(tensor, shape, value=0):
         out = tensor.new_full(shape, value)
@@ -533,11 +543,16 @@ def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:
         out[slices] = tensor
         return out
 
-    a, t, c, g = maxima
+    a, t, c, g, k = maxima
+    agent_feature_dim = max(item.agent_features.shape[-1] for item in items)
+    target_feature_dim = max(item.target_features.shape[-1] for item in items)
     kwargs = {}
     specs = {
-        "agent_features": (1, a, items[0].agent_features.shape[-1]),
-        "target_features": (1, t, items[0].target_features.shape[-1]),
+        # Legacy Transformer fields retain their type-dependent widths. Pad
+        # those widths for mixed-count task-graph batches without changing the
+        # Transformer's same-count behavior.
+        "agent_features": (1, a, agent_feature_dim),
+        "target_features": (1, t, target_feature_dim),
         "action_features": (1, c, items[0].action_features.shape[-1]),
         "agent_mask": (1, a), "target_mask": (1, t), "action_mask": (1, c),
         "agent_target_relations": (1, a, t, items[0].agent_target_relations.shape[-1]),
@@ -561,6 +576,9 @@ def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:
         "serves_mask": (1, c, t),
         "reveals_mask": (1, c, t),
         "stages_for_mask": (1, c, t),
+        "agent_capability_membership": (1, a, k),
+        "target_capability_beliefs": (1, t, k),
+        "capability_mask": (1, k),
     }
     for name, shape in specs.items():
         kwargs[name] = torch.cat([pad(getattr(item, name), shape) for item in items])
