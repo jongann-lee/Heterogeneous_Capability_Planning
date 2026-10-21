@@ -27,6 +27,10 @@ DEFAULT_AGENT_COLORS = tuple(mcolors.TABLEAU_COLORS.values())
 
 DEAD_AGENT_COLOR = "grey"
 
+# Start low elevations at green, omitting terrain's blue water colors.
+TERRAIN_CMAP = mcolors.LinearSegmentedColormap.from_list(
+    "terrain_land", plt.cm.terrain([0.25 + 0.75 * i / 255 for i in range(256)]))
+
 
 def _agent_color(idx, agent_colors=None):
     colors = agent_colors if agent_colors is not None else DEFAULT_AGENT_COLORS
@@ -70,7 +74,7 @@ def render_simulation_frame(env_map, blocked_env_graph, agents, turn_idx, output
     all_heights = [d.get('height', 0) for _, d in blocked_env_graph.nodes(data=True)]
     max_height = max(all_heights) if all_heights else 1
     norm = mcolors.Normalize(vmin=0, vmax=max_height + 1)
-    cmap_terrain = plt.cm.terrain
+    cmap_terrain = TERRAIN_CMAP
 
     xs = sorted(set(p[0] for p in pos.values()))
     ys = sorted(set(p[1] for p in pos.values()))
@@ -205,7 +209,7 @@ def render_frame(env_map, ground_truth, agents, turn_idx, output_path,
     all_heights = [d.get('height', 0) for _, d in ground_truth.nodes(data=True)]
     max_height = max(all_heights) if all_heights else 1
     norm = mcolors.Normalize(vmin=0, vmax=max_height + 1)
-    cmap_terrain = plt.cm.terrain
+    cmap_terrain = TERRAIN_CMAP
 
     xs = sorted(set(p[0] for p in pos.values()))
     ys = sorted(set(p[1] for p in pos.values()))
