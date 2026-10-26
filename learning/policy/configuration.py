@@ -34,6 +34,8 @@ class ModelConfig:
     feature_schema_version: int = RAW_DISTANCE_FEATURE_SCHEMA_VERSION
     edge_normalization: str = RAW_EDGE_NORMALIZATION
     edge_normalization_epsilon: float = 1.0e-6
+    # Task-graph scoring; omitted fields preserve the original MLP checkpoints.
+    decoder_mode: str = "mlp"
 
     def __post_init__(self):
         if self.num_target_types < 1:
@@ -59,6 +61,9 @@ class ModelConfig:
             raise ValueError("critic_hidden_dim must be positive")
         if not isinstance(self.use_critic, bool):
             raise ValueError("use_critic must be a boolean")
+        if self.decoder_mode not in {"mlp", "dot_product"}:
+            raise ValueError(
+                "model.decoder_mode must be 'mlp' or 'dot_product'")
         if self.feature_schema_version not in {
                 RAW_DISTANCE_FEATURE_SCHEMA_VERSION,
                 CURRENT_FEATURE_SCHEMA_VERSION}:

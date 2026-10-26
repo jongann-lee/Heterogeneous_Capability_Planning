@@ -118,7 +118,7 @@ class HeterogeneousGraphPolicy(nn.Module):
             nn.Linear(2 * d + edge_dim, config.relation_hidden_dim),
             nn.GELU(),
             nn.Linear(config.relation_hidden_dim, 1),
-        )
+        ) if config.decoder_mode == "mlp" else None
         self.critic = nn.Sequential(
             nn.Linear(4 * d, config.critic_hidden_dim),
             nn.GELU(),
@@ -166,14 +166,20 @@ class HeterogeneousGraphPolicy(nn.Module):
     def actor_critic(self, observation):
         agents, targets, actions, capabilities, aa_distance = self.encode(
             observation)
-        batch, num_agents, _ = agents.shape
-        num_actions = actions.shape[1]
-        agent_pairs = agents[:, :, None].expand(
-            batch, num_agents, num_actions, -1)
-        action_pairs = actions[:, None].expand(
-            batch, num_agents, num_actions, -1)
-        logits = self.actor(torch.cat(
-            (agent_pairs, action_pairs, aa_distance), dim=-1)).squeeze(-1)
+        if self.config.decoder_mode == "dot_product":
+            # Travel-time information reaches this scorer through graph messages.
+            logits = torch.einsum(
+                "bad,bcd->bac", agents, actions,
+            ) / math.sqrt(self.config.model_dim)
+        else:
+            batch, num_agents, _ = agents.shape
+            num_actions = actions.shape[1]
+            agent_pairs = agents[:, :, None].expand(
+                batch, num_agents, num_actions, -1)
+            action_pairs = actions[:, None].expand(
+                batch, num_agents, num_actions, -1)
+            logits = self.actor(torch.cat(
+                (agent_pairs, action_pairs, aa_distance), dim=-1)).squeeze(-1)
         logits = logits.masked_fill(
             ~observation.feasible_action_mask, -torch.inf)
 

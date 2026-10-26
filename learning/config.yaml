@@ -13,6 +13,7 @@ model:
   edge_normalization_epsilon: 1.0E-6
   dropout: 0.0
   relation_hidden_dim: 64
+  decoder_mode: dot_product
 
 candidates:
   staging_per_target: 2

@@ -1,0 +1,48 @@
+model:
+  architecture: task_graph
+  num_target_types: 5
+  model_dim: 128
+  num_heads: 4
+  num_world_blocks: 2
+  message_passing_blocks: 3
+  distance_embedding_dim: 32
+  critic_hidden_dim: 128
+  use_critic: false
+  feature_schema_version: 2
+  edge_normalization: per_decision_zscore
+  edge_normalization_epsilon: 1.0E-6
+  dropout: 0.0
+  relation_hidden_dim: 64
+
+candidates:
+  staging_per_target: 2
+  staging_capacity: 1
+  include_pair_staging: True
+  include_wait: True
+  allow_unknown_target_actions: False
+
+instances:
+  map_path: Real_Life_Maps/KTH_Indoor_map.pkl.gz
+  min_targets: 14
+  max_targets: 14
+  min_agents: 3
+  max_agents: 6
+
+reinforce:
+  learning_rate: 3.0E-4
+  entropy_coefficient: 0.01
+  baseline_decay: 0.95
+  death_penalty: 1.0
+  incomplete_penalty: 10.0
+  gradient_clip_norm: 1.0
+  critic_coefficient: 0.5
+
+training:
+  episodes: 12800
+  simulation_batch_size: 8
+  reinforce_batch_size: 32
+  num_agents: 4
+  seed: 0
+  device: CUDA
+  checkpoint: learning/checkpoints
+  wandb: true

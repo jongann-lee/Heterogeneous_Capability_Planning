@@ -663,7 +663,7 @@ def test_rendering_uses_distinct_agent_colors_and_stacks_shared_labels():
             (0, 16), (0, 16), (0, 36), (0, 56)]
 
 
-def _graph_model(num_target_types=2, use_critic=True):
+def _graph_model(num_target_types=2, use_critic=True, decoder_mode="mlp"):
     torch.manual_seed(11)
     config = replace(
         load_config().model,
@@ -675,6 +675,7 @@ def _graph_model(num_target_types=2, use_critic=True):
         distance_embedding_dim=8,
         critic_hidden_dim=16,
         use_critic=use_critic,
+        decoder_mode=decoder_mode,
     )
     model = HeterogeneousGraphPolicy(config)
     model.eval()
@@ -1702,6 +1703,102 @@ def test_graph_and_transformer_configs_select_separate_policies():
     assert not graph_policy.has_critic
     assert isinstance(build_policy(transformer_config.model),
                       VanillaTransformerPolicy)
+
+
+def test_task_graph_decoder_config_validates_and_preserves_legacy_checkpoints():
+    config = load_config()
+    assert config.model.decoder_mode == "dot_product"
+    for invalid in ({"decoder_mode": "cosine"}, {"decoder_mode": "unknown"}):
+        try:
+            replace(config.model, **invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid decoder configuration accepted: {invalid}")
+
+    payload = asdict(config)
+    payload["model"].pop("decoder_mode")
+    with tempfile.TemporaryDirectory() as directory:
+        legacy_path = Path(directory) / "legacy.yaml"
+        legacy_path.write_text(yaml.safe_dump(payload))
+        legacy = load_config(legacy_path)
+        assert legacy.model.decoder_mode == "mlp"
+        model = _graph_model()
+        restored = build_policy(replace(
+            legacy.model, model_dim=32, message_passing_blocks=2,
+            distance_embedding_dim=8, critic_hidden_dim=16))
+        restored.load_state_dict(model.state_dict(), strict=True)
+
+        payload["model"].update(decoder_mode="dot_product")
+        dot_product_path = Path(directory) / "dot_product.yaml"
+        dot_product_path.write_text(yaml.safe_dump(payload))
+        dot_product_config = load_config(dot_product_path)
+        assert dot_product_config.model.decoder_mode == "dot_product"
+        saved = _serialized_run_config(dot_product_config)
+        assert saved["model"]["decoder_mode"] == "dot_product"
+
+
+def test_task_graph_dot_product_logits_preserve_magnitude_and_scale_by_dimension():
+    config = replace(load_config().model, model_dim=4, num_heads=1,
+                     decoder_mode="dot_product", use_critic=False)
+    model = build_policy(config)
+    agents = torch.tensor([[[2., 0., 0., 0.], [0., 0., 0., 0.]]],
+                          requires_grad=True)
+    actions = torch.tensor([[[3., 0., 0., 0.], [-4., 0., 0., 0.],
+                             [0., 1., 0., 0.], [0., 0., 0., 0.]]],
+                           requires_grad=True)
+    feasible = torch.tensor([[[True, True, True, True],
+                              [True, False, True, True]]])
+    observation = SimpleNamespace(feasible_action_mask=feasible)
+    with patch.object(model, "encode", return_value=(
+            agents, None, actions, None, None)):
+        logits, value = model.actor_critic(observation)
+    expected = torch.tensor([[[3., -4., 0., 0.],
+                              [0., -torch.inf, 0., 0.]]])
+    assert torch.allclose(logits, expected)
+    with patch.object(model, "encode", return_value=(
+            3 * agents, None, actions, None, None)):
+        assert torch.allclose(model(observation), 3 * expected)
+    assert value is None
+    assert model.actor is None
+    logits[feasible].sum().backward()
+    assert torch.isfinite(agents.grad).all()
+    assert torch.isfinite(actions.grad).all()
+
+
+def test_task_graph_dot_product_decodes_batches_and_trains_graph_embeddings():
+    graph, agents = _instance()
+    small = build_observation(graph, agents[:1], 2)
+    large = build_observation(graph, agents, 2)
+    observation = batch_observations([small, large])
+    model = _graph_model(decoder_mode="dot_product")
+    alone_logits, alone_value = model.actor_critic(small)
+    logits, values = model.actor_critic(observation)
+    actions = small.action_features.shape[1]
+    assert torch.allclose(alone_logits[0, 0], logits[0, 0, :actions], atol=1e-5)
+    assert torch.allclose(alone_value[0], values[0], atol=1e-5)
+    assert torch.isneginf(logits[~observation.feasible_action_mask]).all()
+    decoded, decoded_values = model.decode_with_value(observation, training=False)
+    assert torch.allclose(decoded_values, values)
+    for batch, assignments in enumerate(decoded.assignments):
+        assert len({agent for agent, _action in assignments}) == len(assignments)
+        counts = {}
+        for agent, action in assignments:
+            assert observation.feasible_action_mask[batch, agent, action]
+            group = observation.candidate_physical_group[batch, action].item()
+            counts[group] = counts.get(group, 0) + 1
+            assert counts[group] <= observation.physical_group_capacity[batch, group]
+    loss = -decoded.log_probabilities.mean() + values.square().mean()
+    loss.backward()
+    for module in (model.agent_encoder, model.action_encoder,
+                   model.distance_encoder, model.graph_blocks, model.critic):
+        gradients = [p.grad for p in module.parameters() if p.grad is not None]
+        assert gradients and all(torch.isfinite(g).all() for g in gradients)
+        assert any(torch.count_nonzero(g) for g in gradients)
+    restored = build_policy(model.config)
+    restored.load_state_dict(model.state_dict(), strict=True)
+    restored.eval()
+    assert torch.allclose(restored(observation), logits, atol=1e-5)
 
 
 def test_task_graph_schema_uses_beliefs_semantics_and_effective_distances():
