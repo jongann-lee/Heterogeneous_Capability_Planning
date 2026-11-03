@@ -140,6 +140,9 @@ class TensorWorld:
         candidates = generate_candidates(
             graph, candidate_config, terrain.candidate_cache,
             include_all_pairs=True, scenario_cache=scenario_cache)
+        # This is an atomic region bank. TensorObservationBuilder coarsens its
+        # observation regions per episode as unknown target signatures shrink;
+        # slots and static staging geometry remain stable for batched replay.
         target_index = {node: index for index, node in enumerate(targets)}
 
         positions = terrain.positions

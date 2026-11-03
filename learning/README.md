@@ -28,6 +28,16 @@ semantic aliases. Target-directed safe distance maps, target-pair separation,
 and pair minimax locations are computed once per sampled target layout; replans
 only filter that scenario cache using the current live/known target beliefs.
 
+Observation regions are partitioned by the targets that are still unknown at
+each decision. The tensor simulator keeps the initial regions as atomic pieces
+and merges pieces whose remaining unknown-target signatures become equal.
+Each merged region contributes one active action, with its centroid and height
+averaged over the full union, agent routes ending at the nearest reachable
+union node, and action-target distances minimized over that union. This merge
+is independent for every episode in a CUDA batch. Superseded slots are masked
+out of message passing, normalization, and constrained decoding. The static
+atom distance cache and staging geometry remain reusable across revelations.
+
 The simulator adapter observes and jointly replans the full living team. An
 agent traversing an edge must finish that edge, but its replacement route is
 chosen immediately from the committed arrival node and begins on arrival. No
@@ -42,7 +52,7 @@ single-source helper may persist. This dynamic route bank is separate from the
 scenario-static staging-geometry cache described above.
 
 `learning/policy/configuration.py` loads and validates experiment settings. The
-task-graph policy consumes only capabilities, normalized remaining transit
+task-graph policy consumes capabilities, normalized remaining transit
 time, completion/type beliefs, action categories, normalized safe-route
 distances, and typed action-target semantic relations. For every decision,
 `model.edge_normalization: per_decision_zscore` computes one population mean
@@ -52,6 +62,29 @@ independently per episode. Wait, unreachable, and padded relations are excluded.
 The normalization changes neural features only; terrain edges, routing,
 makespan, FI-OPT, and reports continue to use real seconds.
 
+The third mode, `model.edge_normalization: per_decision_max`, divides the same
+three edge families and remaining transit times by the largest valid travel
+edge in each episode, without subtracting a mean. Zero remains zero, and
+nonnegative valid edges lie in `[0, 1]`. This scales their range; it does not
+make their statistical distribution uniform. All-zero edges remain zero, and
+an episode with no valid travel edges has zero distance/ETA features. Schema 2
+supports both z-score and max normalization; schema 1 retains `none`. The saved
+normalization identity prevents silently evaluating weights with another mode.
+The current default is `per_decision_max`. Select `per_decision_zscore` in
+`learning/config.yaml` to restore the previous normalization.
+
+`model.decoder_mode` selects the task-graph scoring head: `mlp` (the default)
+or `dot_product`, which uses the agent/candidate dot product divided by
+`sqrt(model_dim)`. `model.use_position: true` appends two coordinates to the
+agent encoder input. Each axis is normalized independently over the full map:
+`(coordinate - axis_min) / (axis_max - axis_min)`, giving a unit square even
+for rectangular or sparse maps. A constant axis produces zero. Positions
+refer to the last reached node while an agent is in transit. CPU and CUDA
+observations use the same convention. Set `use_position: false` to recover
+the original three agent features; old checkpoints default to this setting.
+Checkpoints record the toggle in both the model config and feature-schema
+metadata. The current default disables position inputs.
+
 `candidates.allow_unknown_target_actions` controls risky direct contact with
 unrevealed targets. The default `false` requires scouting first. When enabled,
 only agents with a positive service capability may contact an unknown target;
@@ -59,8 +92,9 @@ pure scouts are never eligible. Known targets always require the matching
 service capability. Both this toggle and the model feature-schema metadata are
 saved in checkpoints, W&B configuration, and evaluation JSON. Schema-1 raw
 distance checkpoints require retraining or the explicit
-`--allow-feature-schema-mismatch` evaluation override. No observation path
-receives absolute coordinates, heights, or ground truth.
+`--allow-feature-schema-mismatch` evaluation override. The optional task-graph
+position input uses normalized coordinates; it receives no heights or ground
+truth.
 
 Training returns are normalized against
 `planning.full_information.full_information_makespan`, the exact FI-OPT

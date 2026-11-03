@@ -41,6 +41,7 @@ from learning.policy.configuration import (
     CURRENT_FEATURE_SCHEMA_VERSION,
     InstanceConfig,
     LearningConfig,
+    MAX_EDGE_NORMALIZATION,
     PER_DECISION_EDGE_NORMALIZATION,
     RAW_DISTANCE_FEATURE_SCHEMA_VERSION,
     RAW_EDGE_NORMALIZATION,
@@ -68,6 +69,7 @@ from learning.modules import (
 from learning.gpu_sim.observation_cpu import (
     batch_observations,
     build_observation,
+    normalize_task_graph_travel_times,
 )
 from learning.gpu_sim.observation_gpu import TensorObservationBuilder
 from learning.policy.oracle import parallel_tsp
@@ -114,6 +116,35 @@ def _line(length=5):
             graph.add_edge(u, v, distance=1.0, observed_edge=False)
     graph.nodes[0]["type"] = "source"
     return graph
+
+
+class _ReferenceRouter:
+    """CPU exact routes for exercising tensor simulation without CUDA."""
+
+    def __init__(self, num_nodes, sources, destinations, costs):
+        self.graph = nx.DiGraph()
+        self.graph.add_nodes_from(range(num_nodes))
+        self.graph.add_weighted_edges_from(zip(sources, destinations, costs))
+
+    def sssp(self, sources, blocked_nodes=()):
+        sources = torch.as_tensor(sources).flatten()
+        blocked = torch.zeros((len(sources), len(self.graph)), dtype=torch.bool)
+        blocked[:, list(blocked_nodes)] = True
+        return self.sssp_batch(sources, blocked)
+
+    def sssp_batch(self, sources, blocked):
+        distances = torch.full((len(sources), len(self.graph)), torch.inf)
+        predecessors = torch.full(distances.shape, -1, dtype=torch.long)
+        for row, source in enumerate(sources.tolist()):
+            excluded = set(torch.where(blocked[row])[0].tolist()) - {source}
+            graph = nx.subgraph_view(
+                self.graph, filter_node=lambda node: node not in excluded)
+            lengths, paths = nx.single_source_dijkstra(graph, source)
+            for node, length in lengths.items():
+                distances[row, node] = length
+                if len(paths[node]) > 1:
+                    predecessors[row, node] = paths[node][-2]
+        return SimpleNamespace(distances=distances, predecessors=predecessors)
 
 
 def _prepared_grid(size, height_offset=0.0):
@@ -663,7 +694,8 @@ def test_rendering_uses_distinct_agent_colors_and_stacks_shared_labels():
             (0, 16), (0, 16), (0, 36), (0, 56)]
 
 
-def _graph_model(num_target_types=2, use_critic=True, decoder_mode="mlp"):
+def _graph_model(num_target_types=2, use_critic=True, decoder_mode="mlp",
+                 use_position=False):
     torch.manual_seed(11)
     config = replace(
         load_config().model,
@@ -676,6 +708,7 @@ def _graph_model(num_target_types=2, use_critic=True, decoder_mode="mlp"):
         critic_hidden_dim=16,
         use_critic=use_critic,
         decoder_mode=decoder_mode,
+        use_position=use_position,
     )
     model = HeterogeneousGraphPolicy(config)
     model.eval()
@@ -1407,7 +1440,7 @@ def test_yaml_configuration_loads_and_validates():
     config = load_config()
     assert config.model.model_dim % config.model.num_heads == 0
     assert config.model.feature_schema_version == CURRENT_FEATURE_SCHEMA_VERSION
-    assert config.model.edge_normalization == PER_DECISION_EDGE_NORMALIZATION
+    assert config.model.edge_normalization == MAX_EDGE_NORMALIZATION
     assert config.model.edge_normalization_epsilon > 0
     assert config.candidates.include_wait
     assert config.candidates.include_pair_staging
@@ -1516,34 +1549,6 @@ def test_task_graph_checkpoint_evaluates_with_suite_type_count():
 def test_tensor_training_accumulates_microbatches_and_handles_partial_update():
     from learning.train import train_gpu
 
-    class ReferenceRouter:
-        """CPU exact routes let the complete tensor training loop run in CI."""
-
-        def __init__(self, num_nodes, sources, destinations, costs):
-            self.graph = nx.DiGraph()
-            self.graph.add_nodes_from(range(num_nodes))
-            self.graph.add_weighted_edges_from(zip(sources, destinations, costs))
-
-        def sssp(self, sources, blocked_nodes=()):
-            sources = torch.as_tensor(sources).flatten()
-            blocked = torch.zeros((len(sources), len(self.graph)), dtype=torch.bool)
-            blocked[:, list(blocked_nodes)] = True
-            return self.sssp_batch(sources, blocked)
-
-        def sssp_batch(self, sources, blocked):
-            distances = torch.full((len(sources), len(self.graph)), torch.inf)
-            predecessors = torch.full(distances.shape, -1, dtype=torch.long)
-            for row, source in enumerate(sources.tolist()):
-                excluded = set(torch.where(blocked[row])[0].tolist()) - {source}
-                graph = nx.subgraph_view(
-                    self.graph, filter_node=lambda node: node not in excluded)
-                lengths, paths = nx.single_source_dijkstra(graph, source)
-                for node, length in lengths.items():
-                    distances[row, node] = length
-                    if len(paths[node]) > 1:
-                        predecessors[row, node] = paths[node][-2]
-            return SimpleNamespace(distances=distances, predecessors=predecessors)
-
     config = load_config()
     config = replace(
         config,
@@ -1560,6 +1565,8 @@ def test_tensor_training_accumulates_microbatches_and_handles_partial_update():
     # rebuilding a world while reusing its immutable terrain.
     def shared_terrain_factory(episode):
         truth = _line(4)
+        for node, pos in enumerate(((-10., 20.), (0., 20.), (10., 25.), (30., 40.))):
+            truth.nodes[node]["pos"] = pos
         target = 2 + episode % 2
         truth.nodes[target].update(type="target_unreached", rps_type=1)
         env = truth.copy()
@@ -1567,7 +1574,7 @@ def test_tensor_training_accumulates_microbatches_and_handles_partial_update():
         return env, truth, [Agent(0, capabilities={1})]
 
     torch.manual_seed(73)
-    with patch("learning.gpu_sim.world.CuGraphRouter", ReferenceRouter):
+    with patch("learning.gpu_sim.world.CuGraphRouter", _ReferenceRouter):
         model, history, _world, run_directory = train_gpu(
             *shared_terrain_factory(0), episodes=5, simulation_batch_size=2,
             reinforce_batch_size=3, model_config=config.model,
@@ -1580,6 +1587,21 @@ def test_tensor_training_accumulates_microbatches_and_handles_partial_update():
     assert all(np.isfinite(record["loss"]) for record in history)
     assert all(not torch.is_tensor(value) for record in history for value in record.values())
     assert any(parameter.grad is not None for parameter in model.critic.parameters())
+    # Exercise the tensor observation path on CPU too, including non-square
+    # geometry, so normalization parity is checked without CUDA hardware.
+    source = _world.nodes[1]
+    cpu_observation = build_observation(
+        _world.graph, [Agent(source, capabilities={1})], 1,
+        candidate_config=config.candidates)
+    state = TensorEpisodeState.create(_world, [1], [[[False, True]]], [[1]])
+    tensor_observation = TensorObservationBuilder(
+        _world, 1, edge_normalization=config.model.edge_normalization).build(state)[0]
+    assert torch.allclose(cpu_observation.agent_positions,
+                          torch.tensor([[[0.25, 0.0]]]))
+    assert torch.allclose(cpu_observation.agent_positions,
+                          tensor_observation.agent_positions)
+    model.eval()
+    assert torch.allclose(model(cpu_observation), model(tensor_observation), atol=1e-5)
 
 
 def test_checkpoint_map_identity_relocation_and_mismatch_override():
@@ -1641,9 +1663,11 @@ def test_checkpoint_map_identity_relocation_and_mismatch_override():
         assert saved["model"]["feature_schema_version"] == (
             CURRENT_FEATURE_SCHEMA_VERSION)
         assert saved["model"]["edge_normalization"] == (
-            PER_DECISION_EDGE_NORMALIZATION)
+            model_config.edge_normalization)
         assert saved["feature_schema"]["version"] == (
             CURRENT_FEATURE_SCHEMA_VERSION)
+        assert saved["model"]["use_position"] == model_config.use_position
+        assert saved["feature_schema"]["use_position"] == model_config.use_position
         assert saved["candidates"]["allow_unknown_target_actions"]
 
         explicit_config_path = directory / "explicit-config.yaml"
@@ -1707,8 +1731,10 @@ def test_graph_and_transformer_configs_select_separate_policies():
 
 def test_task_graph_decoder_config_validates_and_preserves_legacy_checkpoints():
     config = load_config()
-    assert config.model.decoder_mode == "dot_product"
-    for invalid in ({"decoder_mode": "cosine"}, {"decoder_mode": "unknown"}):
+    assert config.model.decoder_mode == "mlp"
+    assert isinstance(config.model.use_position, bool)
+    for invalid in ({"decoder_mode": "cosine"}, {"decoder_mode": "unknown"},
+                    {"use_position": "true"}, {"use_position": 1}):
         try:
             replace(config.model, **invalid)
         except ValueError:
@@ -1718,11 +1744,13 @@ def test_task_graph_decoder_config_validates_and_preserves_legacy_checkpoints():
 
     payload = asdict(config)
     payload["model"].pop("decoder_mode")
+    payload["model"].pop("use_position")
     with tempfile.TemporaryDirectory() as directory:
         legacy_path = Path(directory) / "legacy.yaml"
         legacy_path.write_text(yaml.safe_dump(payload))
         legacy = load_config(legacy_path)
         assert legacy.model.decoder_mode == "mlp"
+        assert not legacy.model.use_position
         model = _graph_model()
         restored = build_policy(replace(
             legacy.model, model_dim=32, message_passing_blocks=2,
@@ -1736,6 +1764,102 @@ def test_task_graph_decoder_config_validates_and_preserves_legacy_checkpoints():
         assert dot_product_config.model.decoder_mode == "dot_product"
         saved = _serialized_run_config(dot_product_config)
         assert saved["model"]["decoder_mode"] == "dot_product"
+
+
+def test_agent_positions_use_full_rectangular_map_bounds_and_handle_flat_axes():
+    graph = _line(5)
+    coordinates = [(-10., 20.), (0., 20.), (10., 25.), (20., 30.), (30., 40.)]
+    for node, pos in enumerate(coordinates):
+        graph.nodes[node]["pos"] = pos
+    agents = [Agent(1, capabilities={1}), Agent(3, capabilities={0})]
+    observation = build_observation(graph, agents, 2)
+    expected = torch.tensor([[[0.25, 0.0], [0.75, 0.5]]])
+    assert torch.allclose(observation.agent_positions, expected)
+    # Transformer's historical aspect-preserving positions remain separate.
+    assert observation.agent_features[0, 1, 1] == 0.25
+
+    transformed = graph.copy()
+    for node, (x, y) in enumerate(coordinates):
+        transformed.nodes[node]["pos"] = (0.01 * x + 7, 3 * y - 5)
+    scaled = build_observation(transformed, agents, 2)
+    assert torch.allclose(scaled.agent_positions, expected, atol=1e-6)
+    line = build_observation(_line(5), agents[:1], 2)
+    assert torch.allclose(line.agent_positions, torch.tensor([[[0.25, 0.0]]]))
+    point = build_observation(_line(1), [Agent(0, capabilities={1})], 2)
+    assert torch.equal(point.agent_positions, torch.zeros(1, 1, 2))
+    padded = batch_observations([line, observation]).to("cpu")
+    assert torch.equal(padded.agent_positions[0, 1], torch.zeros(2))
+    assert torch.equal(padded.agent_positions[1], expected[0])
+
+
+def test_task_graph_position_toggle_controls_agent_input_and_gradients():
+    graph, agents = _instance()
+    agents[0].position = 1
+    observation = build_observation(graph, agents, 2)
+    changed = copy.copy(observation)
+    changed.agent_positions = 1.0 - observation.agent_positions
+    for decoder_mode in ("mlp", "dot_product"):
+        for use_position in (False, True):
+            model = _graph_model(decoder_mode=decoder_mode,
+                                 use_position=use_position)
+            inputs = []
+            hook = model.agent_encoder.register_forward_pre_hook(
+                lambda _module, args: inputs.append(args[0]))
+            try:
+                logits = model(observation)
+                changed_logits = model(changed)
+            finally:
+                hook.remove()
+            assert inputs[0].shape[-1] == (5 if use_position else 3)
+            if use_position:
+                assert torch.equal(inputs[0][..., -2:], observation.agent_positions)
+                assert not torch.allclose(logits, changed_logits)
+                logits[observation.feasible_action_mask].sum().backward()
+                gradient = model.agent_encoder.network[0].weight.grad
+                assert torch.isfinite(gradient).all()
+                assert torch.count_nonzero(gradient[:, -2:])
+            else:
+                assert torch.equal(logits, changed_logits)
+            missing = copy.copy(observation)
+            missing.agent_positions = None
+            if use_position:
+                try:
+                    model(missing)
+                except ValueError as error:
+                    assert "agent_positions" in str(error)
+                else:
+                    raise AssertionError("missing positions were accepted")
+            else:
+                assert torch.equal(logits, model(missing))
+
+
+def test_position_enabled_policy_preserves_padding_and_agent_permutations():
+    graph, agents = _instance()
+    agents[0].position = 1
+    large = build_observation(graph, agents, 2)
+    small = build_observation(graph, agents[:1], 2)
+    batch = batch_observations([small, large])
+    model = _graph_model(use_position=True)
+    logits, values = model.actor_critic(large)
+    alone_logits, alone_value = model.actor_critic(small)
+    batch_logits, batch_values = model.actor_critic(batch)
+    assert torch.allclose(alone_logits[0, 0], batch_logits[0, 0], atol=1e-5)
+    assert torch.allclose(alone_value[0], batch_values[0], atol=1e-5)
+    permuted = copy.copy(large)
+    for name in ("agent_features", "agent_positions", "agent_mask",
+                 "task_agent_features", "agent_capability_membership",
+                 "agent_target_relations", "agent_action_relations",
+                 "feasible_action_mask", "agent_target_distances",
+                 "agent_action_distances", "agent_target_distance_mask",
+                 "agent_action_distance_mask"):
+        setattr(permuted, name, getattr(large, name)[:, [1, 0]])
+    permuted_logits, permuted_values = model.actor_critic(permuted)
+    assert torch.allclose(permuted_logits, logits[:, [1, 0]], atol=1e-5)
+    assert torch.allclose(permuted_values, values, atol=1e-5)
+    restored = build_policy(model.config)
+    restored.load_state_dict(model.state_dict(), strict=True)
+    restored.eval()
+    assert torch.allclose(restored(large), logits, atol=1e-5)
 
 
 def test_task_graph_dot_product_logits_preserve_magnitude_and_scale_by_dimension():
@@ -1809,7 +1933,7 @@ def test_task_graph_schema_uses_beliefs_semantics_and_effective_distances():
     observation = build_observation(
         graph, [agent], 2,
         transit=[(0, 1, 0.0, 1.0)], clock=0.25,
-        replan_transit=True)
+        replan_transit=True, edge_normalization=PER_DECISION_EDGE_NORMALIZATION)
     raw_observation = build_observation(
         graph, [agent], 2,
         transit=[(0, 1, 0.0, 1.0)], clock=0.25,
@@ -2036,10 +2160,12 @@ def test_task_graph_distance_normalization_is_per_observation_and_shared():
     second_graph = first_graph.copy()
     second_graph.edges[0, 1]["distance"] = 7.0
     first = build_observation(
-        first_graph, [Agent(0, capabilities={1})], 2)
+        first_graph, [Agent(0, capabilities={1})], 2,
+        edge_normalization=PER_DECISION_EDGE_NORMALIZATION)
     second = build_observation(
         second_graph,
-        [Agent(0, capabilities={1}), Agent(1, capabilities={2})], 2)
+        [Agent(0, capabilities={1}), Agent(1, capabilities={2})], 2,
+        edge_normalization=PER_DECISION_EDGE_NORMALIZATION)
     batched = batch_observations([first, second])
     for row in range(2):
         values = _valid_task_distances(batched, row)
@@ -2069,6 +2195,72 @@ def test_task_graph_normalization_has_zero_variance_and_no_edge_fallbacks():
     assert not no_edges.agent_action_distances.any()
     # With no edge statistics there is no scale for a moving ETA either.
     assert no_edges.task_agent_features[0, 0, 1] == 0
+
+
+def test_max_normalization_preserves_zero_and_scales_all_edge_families_per_episode():
+    graph = _line(6)
+    graph.nodes[5].update(type="target_unreached", rps_type=1)
+    agents = [Agent(3, capabilities={1}), Agent(1, capabilities={1})]
+    raw = build_observation(
+        graph, agents, 1, transit=[(3, 4, 0., 1.), None],
+        replan_transit=True, edge_normalization=RAW_EDGE_NORMALIZATION)
+    expected_max = _valid_task_distances(raw).max()
+    assert expected_max == 4.0
+    scaled = copy.deepcopy(raw)
+    names = ("agent_target_distances", "agent_action_distances",
+             "action_target_distances")
+    masks = ("agent_target_distance_mask", "agent_action_distance_mask",
+             "action_target_distance_mask")
+    for name in names:
+        getattr(scaled, name).mul_(1.0e-12)
+    batch = batch_observations([raw, scaled])
+    # Invalid slots, including wait edges, must never set the scale.
+    for name, mask in zip(names, masks):
+        getattr(batch, name).masked_fill_(~getattr(batch, mask)[..., None], torch.inf)
+    remaining = torch.tensor([[1., 0.], [1.0e-12, 0.]])
+    normalize_task_graph_travel_times(batch, remaining, MAX_EDGE_NORMALIZATION, 1e-6)
+    for name, mask in zip(names, masks):
+        actual = getattr(batch, name)
+        valid = getattr(batch, mask)
+        assert torch.allclose(actual[0], actual[1], atol=1e-6)
+        assert torch.allclose(actual[0][valid[0]],
+                              getattr(raw, name)[0][valid[0]] / expected_max)
+        assert not actual[~valid].any()
+        assert torch.isfinite(actual).all()
+    assert _valid_task_distances(batch).max() == 1.0
+    assert torch.allclose(batch.task_agent_features[..., 1],
+                          torch.tensor([[0.25, 0.], [0.25, 0.]]))
+    assert torch.equal(batch.agent_features[..., 8], batch.task_agent_features[..., 1])
+    target_action = next(i for i, c in enumerate(raw.candidates[0]) if c.is_target)
+    assert batch.action_target_distances[0, target_action, 0, 0] == 0
+
+
+def test_max_normalization_handles_zero_empty_and_config_checkpoint_metadata():
+    config = load_config()
+    max_config = replace(config, model=replace(
+        config.model, edge_normalization=MAX_EDGE_NORMALIZATION))
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "max.yaml"
+        path.write_text(yaml.safe_dump(_serialized_run_config(max_config)))
+        assert load_config(path).model.edge_normalization == MAX_EDGE_NORMALIZATION
+        metadata = _serialized_run_config(max_config)["feature_schema"]
+        assert metadata["edge_normalization"] == MAX_EDGE_NORMALIZATION
+    try:
+        replace(max_config.model, feature_schema_version=RAW_DISTANCE_FEATURE_SCHEMA_VERSION)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("schema 1 accepted max normalization")
+    singleton = nx.DiGraph()
+    singleton.add_node("t", pos=(0, 0), type="target_unreached", rps_type=1)
+    zero = build_observation(singleton, [Agent("t", capabilities={1})], 1,
+                             edge_normalization=MAX_EDGE_NORMALIZATION)
+    assert not _valid_task_distances(zero).any()
+    empty = build_observation(_line(2), [Agent(0, capabilities={1})], 1,
+                              edge_normalization=MAX_EDGE_NORMALIZATION,
+                              transit=[(0, 1, 0., 1.)], replan_transit=True)
+    assert _valid_task_distances(empty).numel() == 0
+    assert empty.task_agent_features[0, 0, 1] == 0
 
 
 def test_task_graph_normalization_excludes_unreachable_wait_and_padding():
@@ -2190,18 +2382,20 @@ def test_cpu_cuda_observation_parity_for_normalization_and_unknown_actions():
     if not torch.cuda.is_available():
         return
     graph = _line(3)
+    for node, pos in enumerate(((-2., 10.), (3., 11.), (8., 14.))):
+        graph.nodes[node]["pos"] = pos
     graph.nodes[2].update(
         type="target_unreached", rps_type=UNKNOWN_TYPE)
     candidate_config = replace(
         load_config().candidates, staging_per_target=0,
         include_pair_staging=False, allow_unknown_target_actions=True)
     cpu = build_observation(
-        graph, [Agent(0, capabilities={1, 3})], 3,
+        graph, [Agent(1, capabilities={1, 3})], 3,
         candidate_config=candidate_config)
     world = TensorWorld.from_networkx(
         graph, candidate_config, device="cuda")
     state = TensorEpisodeState.create(
-        world, [world.node_index[0]],
+        world, [world.node_index[1]],
         [[[False, True, False, True]]], [[2]])
     config = load_config().model
     gpu = TensorObservationBuilder(
@@ -2214,7 +2408,7 @@ def test_cpu_cuda_observation_parity_for_normalization_and_unknown_actions():
             "agent_target_distances", "agent_action_distances",
             "action_target_distances", "task_agent_features",
             "task_target_features", "agent_capability_membership",
-            "target_capability_beliefs", "capability_mask"):
+            "target_capability_beliefs", "capability_mask", "agent_positions"):
         assert torch.allclose(
             getattr(cpu, name), getattr(gpu, name).cpu(), atol=1.0e-5)
     for name in (
@@ -2647,6 +2841,129 @@ def test_semantic_staging_aliases_share_physical_group_and_encode_arity():
     assert observation.stages_for_mask[0, pair_index].sum() == 2
 
 
+def _check_tensor_observation_region_updates(device):
+    graph = nx.DiGraph()
+    nodes = ("s", "u", "x", "x2", "y", "z", "a", "b", "c")
+    for i, node in enumerate(nodes):
+        graph.add_node(node, pos=(i, i % 3), height=float(i),
+                       type="target_unreached" if node in "abc" else "intermediate",
+                       rps_type=UNKNOWN_TYPE, visible_nodes=[])
+    graph.nodes["s"]["type"] = "source"
+    for node, forward, backward in (("u", 8., 2.), ("x", 5., 3.),
+                                     ("x2", 9., 4.), ("y", 1., 7.),
+                                     ("z", 2., 1.), ("a", 11., 13.),
+                                     ("b", 12., 14.), ("c", 13., 15.)):
+        graph.add_edge("s", node, distance=forward, observed_edge=False)
+        graph.add_edge(node, "s", distance=backward, observed_edge=False)
+    for node, visible in (("u", ["a"]), ("x", ["a", "b"]),
+                           ("x2", ["a", "b"]), ("y", ["b"]),
+                           ("z", ["b", "c"])):
+        graph.nodes[node]["visible_nodes"] = visible
+    candidates = replace(load_config().candidates, staging_per_target=1)
+    if device == "cpu":
+        with patch("learning.gpu_sim.world.CuGraphRouter", _ReferenceRouter):
+            world = TensorWorld.from_networkx(graph, candidates, device=device)
+    else:
+        world = TensorWorld.from_networkx(graph, candidates, device=device)
+    state = TensorEpisodeState.create(
+        world, [world.node_index["s"]],
+        [[[True, True, False], [False, True, False]]] * 2, [[1, 2, 1]] * 2)
+    snapshots = []
+    for method in (PER_DECISION_EDGE_NORMALIZATION, MAX_EDGE_NORMALIZATION):
+        builder = TensorObservationBuilder(world, 2, edge_normalization=method)
+        # Rows reveal different subsets in the same batch. Later remove a
+        # target too, then remove every unknown observation action.
+        for phase in range(4):
+            known = ([[False, False, False]] * 2 if phase == 0 else
+                     [[True, False, False], [True, False, True]] if phase == 1 else
+                     [[False, False, True], [True, True, False]] if phase == 2 else
+                     [[True, True, True]] * 2)
+            live = ([[True, False, True], [False, True, True]] if phase == 2
+                    else [[True, True, True]] * 2)
+            state.target_known[:] = torch.tensor(known, device=device)
+            state.target_live[:] = torch.tensor(live, device=device)
+            built = builder.build(state)
+            tensor_observation = built[0]
+            snapshots.append(tensor_observation.to("cpu"))
+            representatives = builder.observation_representatives(state).cpu()
+            model = _graph_model(use_position=True).to(device)
+            tensor_logits, tensor_values = model.actor_critic(tensor_observation)
+            for row in range(2):
+                belief = graph.copy()
+                for t, node in enumerate(world.targets):
+                    belief.nodes[node].update(
+                        type="target_unreached" if live[row][t] else "target_reached",
+                        rps_type=(1, 2, 1)[t] if known[row][t] else UNKNOWN_TYPE)
+                cpu = build_observation(
+                    belief, [Agent("s", capabilities={0, 1}),
+                             Agent("s", capabilities={1})], 2,
+                    candidate_config=candidates, edge_normalization=method)
+                by_key = {candidate.semantic_key: i
+                          for i, candidate in enumerate(cpu.candidates[0])}
+                active_slots = torch.where(tensor_observation.action_mask[row])[0].tolist()
+                matched = {}
+                for slot in active_slots:
+                    original = world.candidates[slot]
+                    if original.is_observation:
+                        revealed = tensor_observation.reveals_mask[row, slot].cpu()
+                        signature = tuple(t for i, t in enumerate(world.targets) if revealed[i])
+                        key = ("observation", signature)
+                        atom_slots = torch.where(representatives[row] == slot)[0].tolist()
+                        region = frozenset().union(*(
+                            world.candidates[i].region_nodes for i in atom_slots))
+                        assert region == cpu.candidates[0][by_key[key]].region_nodes
+                    else:
+                        key = original.semantic_key
+                    assert key not in matched, "duplicate active observation signature"
+                    matched[key] = slot
+                assert set(matched) == set(by_key)
+                order = [matched[c.semantic_key] for c in cpu.candidates[0]]
+                for name in ("action_features", "task_action_features",
+                             "action_target_relations", "action_target_distances",
+                             "action_target_distance_mask", "reveals_mask",
+                             "serves_mask", "stages_for_mask"):
+                    actual = getattr(tensor_observation, name)[row, order].cpu()
+                    assert torch.allclose(actual, getattr(cpu, name)[0], atol=1e-5), (method, phase, row, name)
+                for name in ("agent_action_distances", "agent_action_relations",
+                             "agent_action_distance_mask", "feasible_action_mask"):
+                    actual = getattr(tensor_observation, name)[row][:, order].cpu()
+                    assert torch.allclose(actual, getattr(cpu, name)[0], atol=1e-5), (method, phase, row, name)
+                cpu_logits, cpu_values = model.actor_critic(cpu.to(device))
+                assert torch.allclose(tensor_logits[row][:, order], cpu_logits[0], atol=1e-5)
+                assert torch.allclose(tensor_values[row], cpu_values[0], atol=1e-5)
+                if phase == 1 and row == 0:
+                    slot = matched[("observation", ("b",))]
+                    # The representative atom is {x,x2}; the best destination
+                    # is y, which belongs to a different atom in the union.
+                    assert world.candidates[slot].region_nodes == frozenset({"x", "x2"})
+                    assert built[-1][row, 0, slot].item() == world.node_index["y"]
+                    actions = torch.full_like(state.positions, slot)
+                    next_hop, reachable, routes, destinations = builder.next_hops(state, actions, *built[1:])
+                    assert reachable[row, 0]
+                    assert destinations[row, 0].item() == world.node_index["y"]
+                    assert next_hop[row, 0].item() == world.node_index["y"]
+    # Replaying an earlier decision must not observe later region changes.
+    model = _graph_model(use_position=True)
+    trace = snapshots[1]
+    decoded = model.decode(trace, training=False)
+    rollout = SimpleNamespace(decision_traces=[DecisionTrace(trace, decoded.selected_group_indices)])
+    losses, *_rest = replay_tensor_gradients(
+        model, rollout, torch.tensor([1., -1.]), entropy_coefficient=0.01,
+        update_size=2, device="cpu")
+    assert torch.isfinite(losses).all()
+    assert any(p.grad is not None and torch.count_nonzero(p.grad)
+               for p in model.agent_encoder.parameters())
+
+
+def test_tensor_observation_regions_follow_current_unknown_sets():
+    _check_tensor_observation_region_updates("cpu")
+
+
+def test_cuda_observation_regions_follow_current_unknown_sets_when_cuda():
+    if torch.cuda.is_available():
+        _check_tensor_observation_region_updates("cuda")
+
+
 def test_cuda_static_pair_activation_matches_cpu_belief_selection():
     graph = _pair_graph(("a", "b", "c", "d"))
     config = _candidate_config()
@@ -2676,6 +2993,7 @@ def test_cuda_static_pair_activation_matches_cpu_belief_selection():
                 static_candidates[index].staging_targets, key=repr))))
     world = SimpleNamespace(
         target_candidate_mask=target_mask,
+        candidate_nodes=torch.arange(len(static_candidates)),
         candidate_observed_mask=observed_mask,
         candidate_staging_mask=staging_mask,
         candidate_staging_arity=torch.tensor([

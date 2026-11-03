@@ -14,6 +14,7 @@ RAW_DISTANCE_FEATURE_SCHEMA_VERSION = 1
 CURRENT_FEATURE_SCHEMA_VERSION = 2
 RAW_EDGE_NORMALIZATION = "none"
 PER_DECISION_EDGE_NORMALIZATION = "per_decision_zscore"
+MAX_EDGE_NORMALIZATION = "per_decision_max"
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class ModelConfig:
     edge_normalization_epsilon: float = 1.0e-6
     # Task-graph scoring; omitted fields preserve the original MLP checkpoints.
     decoder_mode: str = "mlp"
+    use_position: bool = False
 
     def __post_init__(self):
         if self.num_target_types < 1:
@@ -64,6 +66,8 @@ class ModelConfig:
         if self.decoder_mode not in {"mlp", "dot_product"}:
             raise ValueError(
                 "model.decoder_mode must be 'mlp' or 'dot_product'")
+        if not isinstance(self.use_position, bool):
+            raise ValueError("model.use_position must be a boolean")
         if self.feature_schema_version not in {
                 RAW_DISTANCE_FEATURE_SCHEMA_VERSION,
                 CURRENT_FEATURE_SCHEMA_VERSION}:
@@ -71,18 +75,18 @@ class ModelConfig:
                 "model.feature_schema_version must be 1 or 2")
         if self.edge_normalization not in {
                 RAW_EDGE_NORMALIZATION,
-                PER_DECISION_EDGE_NORMALIZATION}:
+                PER_DECISION_EDGE_NORMALIZATION, MAX_EDGE_NORMALIZATION}:
             raise ValueError(
                 "model.edge_normalization must be 'none' or "
-                "'per_decision_zscore'")
-        expected_normalization = (
-            RAW_EDGE_NORMALIZATION
+                "'per_decision_zscore' or 'per_decision_max'")
+        allowed_normalizations = (
+            {RAW_EDGE_NORMALIZATION}
             if self.feature_schema_version == RAW_DISTANCE_FEATURE_SCHEMA_VERSION
-            else PER_DECISION_EDGE_NORMALIZATION)
-        if self.edge_normalization != expected_normalization:
+            else {PER_DECISION_EDGE_NORMALIZATION, MAX_EDGE_NORMALIZATION})
+        if self.edge_normalization not in allowed_normalizations:
             raise ValueError(
                 f"model feature schema {self.feature_schema_version} requires "
-                f"edge_normalization={expected_normalization!r}")
+                f"edge_normalization in {sorted(allowed_normalizations)!r}")
         if (not isinstance(self.edge_normalization_epsilon, (int, float))
                 or not math.isfinite(self.edge_normalization_epsilon)
                 or self.edge_normalization_epsilon <= 0):
@@ -208,6 +212,7 @@ def feature_schema_metadata(model_config: ModelConfig) -> dict[str, Any]:
         "edge_normalization": model_config.edge_normalization,
         "edge_normalization_epsilon": float(
             model_config.edge_normalization_epsilon),
+        "use_position": model_config.use_position,
     }
 
 

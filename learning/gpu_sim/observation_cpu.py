@@ -13,6 +13,7 @@ from learning.policy.candidates import (
 )
 from learning.policy.configuration import (
     CandidateConfig,
+    MAX_EDGE_NORMALIZATION,
     PER_DECISION_EDGE_NORMALIZATION,
     RAW_EDGE_NORMALIZATION,
     load_config,
@@ -55,6 +56,7 @@ class PlannerObservation:
     agent_capability_membership: torch.Tensor | None = None
     target_capability_beliefs: torch.Tensor | None = None
     capability_mask: torch.Tensor | None = None
+    agent_positions: torch.Tensor | None = None
 
     def to(self, device):
         values = {}
@@ -77,13 +79,14 @@ def normalize_task_graph_travel_times(
         ) -> PlannerObservation:
     """Normalize all valid task-graph travel edges per batch item.
 
-    The three edge families share one population mean and standard deviation.
+    The three edge families share one scale: population standard deviation
+    with centering, or maximum travel time without centering.
     Masks are authoritative: unreachable, inactive, padded, and wait relations
     neither affect the statistics nor receive a nonzero feature.
     """
     if method == RAW_EDGE_NORMALIZATION:
         return observation
-    if method != PER_DECISION_EDGE_NORMALIZATION:
+    if method not in {PER_DECISION_EDGE_NORMALIZATION, MAX_EDGE_NORMALIZATION}:
         raise ValueError(f"unsupported task-graph edge normalization: {method!r}")
     if epsilon <= 0:
         raise ValueError("edge normalization epsilon must be positive")
@@ -113,14 +116,20 @@ def normalize_task_graph_travel_times(
     safe_values = torch.where(
         flat_masks, flat_values, torch.zeros_like(flat_values))
     counts = flat_masks.sum(dim=1)
-    count_scale = counts.clamp_min(1).to(flat_values.dtype)
-    means = safe_values.sum(dim=1) / count_scale
-    centered = safe_values - means[:, None]
-    variances = (
-        torch.where(flat_masks, centered.square(), torch.zeros_like(centered))
-    ).sum(dim=1) / count_scale
-    standard_deviations = variances.clamp_min(0).sqrt()
-    denominators = standard_deviations.clamp_min(float(epsilon))
+    if method == MAX_EDGE_NORMALIZATION:
+        means = flat_values.new_zeros(batch)
+        # A zero column makes empty/targetless observations well-defined.
+        maxima = torch.cat((safe_values, means[:, None]), dim=1).amax(dim=1)
+        denominators = torch.where(maxima > 0, maxima, torch.ones_like(maxima))
+    else:
+        count_scale = counts.clamp_min(1).to(flat_values.dtype)
+        means = safe_values.sum(dim=1) / count_scale
+        centered = safe_values - means[:, None]
+        variances = (
+            torch.where(flat_masks, centered.square(), torch.zeros_like(centered))
+        ).sum(dim=1) / count_scale
+        standard_deviations = variances.clamp_min(0).sqrt()
+        denominators = standard_deviations.clamp_min(float(epsilon))
     has_edges = counts > 0
 
     normalized = []
@@ -244,14 +253,19 @@ def attach_task_graph_fields(observation: PlannerObservation,
         edge_normalization_epsilon)
 
 
-def _positions(graph):
+def _positions(graph, *, unit_square=False):
     raw = {n: graph.nodes[n].get("pos", (0.0, 0.0)) for n in graph.nodes}
     xs = [float(p[0]) for p in raw.values()] or [0.0]
     ys = [float(p[1]) for p in raw.values()] or [0.0]
     x0, y0 = min(xs), min(ys)
-    scale = max(max(xs) - x0, max(ys) - y0, 1.0)
-    return {n: ((float(p[0]) - x0) / scale,
-                (float(p[1]) - y0) / scale) for n, p in raw.items()}
+    x_span, y_span = max(xs) - x0, max(ys) - y0
+    if unit_square:
+        x_scale = x_span if x_span > 0 else 1.0
+        y_scale = y_span if y_span > 0 else 1.0
+    else:
+        x_scale = y_scale = max(x_span, y_span, 1.0)
+    return {n: ((float(p[0]) - x0) / x_scale,
+                (float(p[1]) - y0) / y_scale) for n, p in raw.items()}
 
 
 def _distance_scale(graph):
@@ -328,6 +342,7 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
                if d.get("type") in ("target_unreached", "target_reached")]
     targets.sort(key=repr)
     pos = _positions(graph)
+    unit_pos = _positions(graph, unit_square=True)
     distance_scale = _distance_scale(graph)
     live = {n for n in targets if graph.nodes[n].get("type") == "target_unreached"}
     fa, ft, fc, fat, fac, fct = feature_dimensions(num_target_types)
@@ -516,6 +531,9 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
             [group_representatives], dtype=torch.long),
         physical_group_mask=torch.ones(
             (1, len(group_capacities)), dtype=torch.bool),
+        agent_positions=torch.tensor([
+            unit_pos.get(agent.position, (0.0, 0.0)) for agent in agents
+        ], dtype=torch.float32).reshape(1, len(agents), 2),
     )
     return attach_task_graph_fields(
         observation, at_reachable.unsqueeze(0), ct_reachable.unsqueeze(0),
@@ -552,6 +570,7 @@ def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:
         # those widths for mixed-count task-graph batches without changing the
         # Transformer's same-count behavior.
         "agent_features": (1, a, agent_feature_dim),
+        "agent_positions": (1, a, 2),
         "target_features": (1, t, target_feature_dim),
         "action_features": (1, c, items[0].action_features.shape[-1]),
         "agent_mask": (1, a), "target_mask": (1, t), "action_mask": (1, c),

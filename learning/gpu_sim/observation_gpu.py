@@ -7,7 +7,9 @@ from learning.gpu_sim.observation_cpu import (
     attach_task_graph_fields,
     feature_dimensions,
 )
-from learning.policy.configuration import PER_DECISION_EDGE_NORMALIZATION
+from learning.policy.configuration import (
+    PER_DECISION_EDGE_NORMALIZATION, RAW_EDGE_NORMALIZATION,
+)
 
 
 class TensorObservationBuilder:
@@ -21,12 +23,60 @@ class TensorObservationBuilder:
         self.edge_normalization_epsilon = float(edge_normalization_epsilon)
         self._relation_distances = None
         self._relation_valid = None
+        self._unit_positions = None
 
-    def candidate_roles(self, state):
+    def observation_representatives(self, state):
+        """Coarsen initial observation regions by their current unknown sets.
+
+        Revelations only remove unknown targets, so the current partition is
+        exactly a union of initial regions. Keep one slot per union without
+        enumerating target subsets or copying episode beliefs to the CPU.
+        """
+        world = self.world
+        batch, targets = state.target_live.shape
+        actions = world.candidate_observed_mask.shape[0]
+        slots = torch.arange(actions, device=state.target_live.device)
+        representatives = slots[None].expand(batch, -1).clone()
+        observation_slots = torch.where(world.candidate_observed_mask.any(dim=1))[0]
+        if not observation_slots.numel():
+            return representatives
+        unknown = state.target_live & ~state.target_known
+        signatures = (world.candidate_observed_mask[observation_slots][None]
+                      & unknown[:, None])
+        rows = torch.arange(batch, device=slots.device)[:, None, None].expand(
+            -1, observation_slots.numel(), -1)
+        keys = torch.cat((rows, signatures.long()), dim=2).reshape(-1, targets + 1)
+        unique, inverse = torch.unique(keys, dim=0, return_inverse=True)
+        # Nodes are ordered by repr in TensorWorld. Choose the slot containing
+        # the smallest region node, just as CPU candidate generation does.
+        scores = (world.candidate_nodes[observation_slots] * actions
+                  + observation_slots)[None].expand(batch, -1).reshape(-1)
+        minima = torch.full((len(unique),), torch.iinfo(torch.long).max,
+                            dtype=torch.long, device=slots.device)
+        minima.scatter_reduce_(0, inverse, scores, reduce="amin", include_self=True)
+        merged_slots = (minima[inverse] % actions).reshape(batch, -1)
+        representatives[:, observation_slots] = torch.where(
+            signatures.any(dim=2), merged_slots, observation_slots[None])
+        return representatives
+
+    @staticmethod
+    def _merge_action_minima(values, representatives, action_dim):
+        shape = [values.shape[0]] + [1] * (values.ndim - 1)
+        shape[action_dim] = representatives.shape[1]
+        indices = representatives.reshape(shape).expand_as(values)
+        return torch.full_like(values, torch.inf).scatter_reduce_(
+            action_dim, indices, values, reduce="amin", include_self=True)
+
+    def candidate_roles(self, state, representatives=None):
         live = state.target_live
         unknown = live & ~state.target_known
         target_links = self.world.target_candidate_mask[None] & live[:, None]
         observed_links = self.world.candidate_observed_mask[None] & unknown[:, None]
+        if representatives is None:
+            representatives = self.observation_representatives(state)
+        kept = representatives == torch.arange(
+            representatives.shape[1], device=representatives.device)[None]
+        observed_links = observed_links & kept[..., None]
         staging_members = (
             self.world.candidate_staging_mask[None] & unknown[:, None])
         member_count = staging_members.sum(dim=2)
@@ -112,7 +162,8 @@ class TensorObservationBuilder:
     def _action_target_distances(self, state, episode_mask):
         """Reuse compact relation features while the live-target mask is fixed.
 
-        Agent positions and type revelations do not change this geometry.
+        Agent positions and type revelations do not change these atomic-region
+        distances. Current observation unions are reduced after this cache.
         Cache only the region minima [mask, action, target], never graphs,
         paths, predecessors, or full SSSP rows. The cache belongs to this world
         and is capped at 512 masks and 8 MiB; larger layouts use direct queries.
@@ -206,11 +257,18 @@ class TensorObservationBuilder:
         targets = len(world.targets)
         actions = len(world.candidates)
         fa, ft, fc, _fat, _fac, _fct = feature_dimensions(self.num_target_types)
+        representatives = self.observation_representatives(state)
         (is_target, is_observation, is_staging, active, associated,
-         observed_links, staging_links) = self.candidate_roles(state)
+         observed_links, staging_links) = self.candidate_roles(state, representatives)
         route_distances, predecessors, target_route_distances, target_entries = (
             self._route_banks(state, planning_episode_mask))
 
+        if self._unit_positions is None:
+            # Legacy coordinates preserve aspect ratio. Rescale each axis over
+            # every terrain node, and cache this geometry for the whole world.
+            spans = world.positions.amax(dim=0)
+            self._unit_positions = world.positions / torch.where(
+                spans > 0, spans, torch.ones_like(spans))
         agent_x = torch.zeros((batch, agents, fa), device=device)
         agent_x[..., :2] = world.positions[state.positions]
         agent_x[..., 2] = state.alive
@@ -244,10 +302,14 @@ class TensorObservationBuilder:
         physical = world.candidate_nodes >= 0
         region_nodes = world.candidate_region_nodes.clamp_min(0)
         region_mask = world.candidate_region_mask
-        region_count = region_mask.sum(dim=1).clamp_min(1)
-        region_positions = (world.positions[region_nodes] *
-                            region_mask[..., None]).sum(dim=1) / region_count[:, None]
-        action_x[..., :2] = region_positions[None]
+        region_count = torch.zeros((batch, actions), device=device).scatter_add_(
+            1, representatives, region_mask.sum(dim=1).float()[None].expand(batch, -1))
+        position_sums = (world.positions[region_nodes] *
+                         region_mask[..., None]).sum(dim=1)
+        region_positions = torch.zeros((batch, actions, 2), device=device).scatter_add_(
+            1, representatives[..., None].expand(-1, -1, 2),
+            position_sums[None].expand(batch, -1, -1))
+        action_x[..., :2] = region_positions / region_count.clamp_min(1)[..., None]
         action_x[..., 2] = is_target
         action_x[..., 3] = is_observation
         action_x[..., 4] = (
@@ -255,9 +317,10 @@ class TensorObservationBuilder:
         action_x[..., 5] = world.candidate_is_wait
         action_x[..., 6] = associated.sum(dim=2) / max(targets, 1)
         action_x[..., 7] = observed_links.sum(dim=2) / max(targets, 1)
-        region_heights = (world.heights[region_nodes] * region_mask).sum(
-            dim=1) / region_count
-        action_x[..., 8] = region_heights[None]
+        height_sums = (world.heights[region_nodes] * region_mask).sum(dim=1)
+        region_heights = torch.zeros((batch, actions), device=device).scatter_add_(
+            1, representatives, height_sums[None].expand(batch, -1))
+        action_x[..., 8] = region_heights / region_count.clamp_min(1)
         action_x[..., 9] = world.candidate_capacity < 0
         action_x[..., 10] = world.candidate_capacity.clamp_min(0)
 
@@ -296,6 +359,16 @@ class TensorObservationBuilder:
                 :, :, target, None]
             candidate_entry_nodes[..., columns] = target_entries[
                 :, :, target, None]
+        merged_distance = self._merge_action_minima(ac_distance, representatives, 2)
+        route_groups = representatives[:, None].expand(-1, agents, -1)
+        best_entry = candidate_entry_nodes.masked_fill(
+            ~torch.isfinite(ac_distance)
+            | (ac_distance != merged_distance.gather(2, route_groups)), len(world.nodes))
+        candidate_entry_nodes = torch.full_like(
+            best_entry, len(world.nodes)).scatter_reduce_(
+                2, route_groups, best_entry, reduce="amin", include_self=True)
+        candidate_entry_nodes = candidate_entry_nodes.clamp_max(len(world.nodes) - 1)
+        ac_distance = merged_distance
         ac_distance[..., ~physical] = 0.0
         reachable = torch.isfinite(ac_distance) & (ac_distance < 1e30)
         ac_rel = torch.zeros((batch, agents, actions, 6), device=device)
@@ -334,8 +407,7 @@ class TensorObservationBuilder:
         ct_rel[..., 0] = world.target_candidate_mask
         ct_rel[..., 1] = observed_links
         ct_rel[..., 2] = staging_links
-        if (self.task_graph
-                or self.edge_normalization == PER_DECISION_EDGE_NORMALIZATION):
+        if self.task_graph or self.edge_normalization != RAW_EDGE_NORMALIZATION:
             base_distance = self._action_target_distances(
                 state, planning_episode_mask)
         else:
@@ -347,6 +419,7 @@ class TensorObservationBuilder:
                 ~region_mask[:, None], torch.inf)
             static_distance = target_region_options.amin(dim=2)
             base_distance = static_distance[None].expand(batch, -1, -1)
+        base_distance = self._merge_action_minima(base_distance, representatives, 1)
         ct_rel[..., 3] = torch.where(
             torch.isfinite(base_distance),
             base_distance / world.distance_scale,
@@ -373,7 +446,8 @@ class TensorObservationBuilder:
             physical_group_representative=(
                 world.physical_group_representative[None].expand(batch, -1)),
             physical_group_mask=(
-                world.physical_group_mask[None].expand(batch, -1)))
+                world.physical_group_mask[None].expand(batch, -1)),
+            agent_positions=self._unit_positions[state.positions])
         ct_reachable = (
             torch.isfinite(base_distance) & (base_distance < 1e30)
             & physical[None, :, None]
