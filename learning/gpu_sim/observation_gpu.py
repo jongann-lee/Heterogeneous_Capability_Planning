@@ -447,7 +447,9 @@ class TensorObservationBuilder:
                 world.physical_group_representative[None].expand(batch, -1)),
             physical_group_mask=(
                 world.physical_group_mask[None].expand(batch, -1)),
-            agent_positions=self._unit_positions[state.positions])
+            agent_positions=self._unit_positions[state.positions],
+            target_positions=self._unit_positions[world.target_nodes][None].expand(
+                batch, -1, -1))
         ct_reachable = (
             torch.isfinite(base_distance) & (base_distance < 1e30)
             & physical[None, :, None]

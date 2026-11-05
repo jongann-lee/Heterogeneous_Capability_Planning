@@ -82,7 +82,8 @@ class ModelConfig:
         allowed_normalizations = (
             {RAW_EDGE_NORMALIZATION}
             if self.feature_schema_version == RAW_DISTANCE_FEATURE_SCHEMA_VERSION
-            else {PER_DECISION_EDGE_NORMALIZATION, MAX_EDGE_NORMALIZATION})
+            else {RAW_EDGE_NORMALIZATION, PER_DECISION_EDGE_NORMALIZATION,
+                  MAX_EDGE_NORMALIZATION})
         if self.edge_normalization not in allowed_normalizations:
             raise ValueError(
                 f"model feature schema {self.feature_schema_version} requires "

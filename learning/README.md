@@ -28,6 +28,14 @@ semantic aliases. Target-directed safe distance maps, target-pair separation,
 and pair minimax locations are computed once per sampled target layout; replans
 only filter that scenario cache using the current live/known target beliefs.
 
+Staging ablations use the existing candidate switches. For single-target
+staging only, set `staging_per_target: 2` and `include_pair_staging: false`
+(the current config). To disable all staging, set `staging_per_target: 0` and
+keep `include_pair_staging: false`. A zero single-target count alone does not
+disable pair staging. Target, observation, and wait actions remain available
+according to their existing settings. CPU and tensor candidate generation
+share these switches, and each checkpoint saves the selected configuration.
+
 Observation regions are partitioned by the targets that are still unknown at
 each decision. The tensor simulator keeps the initial regions as atomic pieces
 and merges pieces whose remaining unknown-target signatures become equal.
@@ -52,8 +60,8 @@ single-source helper may persist. This dynamic route bank is separate from the
 scenario-static staging-geometry cache described above.
 
 `learning/policy/configuration.py` loads and validates experiment settings. The
-task-graph policy consumes capabilities, normalized remaining transit
-time, completion/type beliefs, action categories, normalized safe-route
+task-graph policy consumes capabilities, remaining transit
+time, completion/type beliefs, action categories, safe-route
 distances, and typed action-target semantic relations. For every decision,
 `model.edge_normalization: per_decision_zscore` computes one population mean
 and standard deviation over all finite, reachable agent-target, agent-action,
@@ -68,22 +76,32 @@ edge in each episode, without subtracting a mean. Zero remains zero, and
 nonnegative valid edges lie in `[0, 1]`. This scales their range; it does not
 make their statistical distribution uniform. All-zero edges remain zero, and
 an episode with no valid travel edges has zero distance/ETA features. Schema 2
-supports both z-score and max normalization; schema 1 retains `none`. The saved
+supports `none`, z-score, and max normalization; schema 1 retains legacy `none`.
+For the no-normalization task-graph ablation, `edge_normalization: none`
+passes raw traversal times and remaining transit times directly to the neural
+encoders, without centering or scaling. The saved
 normalization identity prevents silently evaluating weights with another mode.
-The current default is `per_decision_max`. Select `per_decision_zscore` in
-`learning/config.yaml` to restore the previous normalization.
+The current config uses `none` for the no-edge-normalization ablation. Select
+`per_decision_zscore` or `per_decision_max` in `learning/config.yaml` to normalize.
 
 `model.decoder_mode` selects the task-graph scoring head: `mlp` (the default)
 or `dot_product`, which uses the agent/candidate dot product divided by
-`sqrt(model_dim)`. `model.use_position: true` appends two coordinates to the
-agent encoder input. Each axis is normalized independently over the full map:
+`sqrt(model_dim)`. Setting `model.use_position: true` appends two coordinates
+to both the agent and target task encoder inputs. Candidate-action inputs
+retain their four semantic
+features and do not receive coordinates. Each axis is normalized independently
+over the full map:
 `(coordinate - axis_min) / (axis_max - axis_min)`, giving a unit square even
 for rectangular or sparse maps. A constant axis produces zero. Positions
 refer to the last reached node while an agent is in transit. CPU and CUDA
-observations use the same convention. Set `use_position: false` to recover
-the original three agent features; old checkpoints default to this setting.
-Checkpoints record the toggle in both the model config and feature-schema
-metadata. The current default disables position inputs.
+observations use the same convention. Target locations are known even when
+their types are hidden, so target coordinates use only planner-visible state.
+Set `use_position: false` to recover the original three agent features and two
+target features. The toggle is recorded in both model config and feature-schema
+metadata, and evaluation rejects incompatible overrides. The current config
+disables position inputs. Agent-only position checkpoints
+are unsupported. An existing running training process retains its loaded
+architecture; the corrected ablation needs a new training run.
 
 `candidates.allow_unknown_target_actions` controls risky direct contact with
 unrevealed targets. The default `false` requires scouting first. When enabled,
@@ -149,6 +167,11 @@ and agent count, requiring 60 tensor rollouts and 15 world constructions for
 the complete suite. `--agent-config`,
 `--target-config`, `--agent-count`, `--target-count`, and `--limit` filter that
 Cartesian product. An explicit suite JSON path can replace either alias.
+For Washington, use `--suite learning/evaluation_suites/wa_factorial_test_v1.json`
+with `--map-path Real_Life_Maps/WA_tobler_viewshed_64.pkl.gz`. This suite keeps
+the same 180 agent/target combinations but starts every agent at the opposite
+corner `(63, 63)`. The 64-by-64 maps use indices 0 through 63; `(64, 64)` is
+outside the map. Cross-terrain learned evaluation also needs `--allow-map-mismatch`.
 Rendering is accepted only when the final filtered selection contains exactly
 one scenario. Every result records both its resolved suite ID and scenario ID.
 Suite coordinates are checked against actual nodes in the selected graph, not
@@ -184,8 +207,9 @@ Each training run creates a timestamped directory beneath
 progress is recorded in `checkpoint_state.yaml`; `trained_weights.pt` remains
 the final snapshot for compatibility. Pass `--checkpoint-dir` to use a
 different parent directory. Evaluation accepts any of these weight files
-directly; a run directory prefers the final snapshot when it exists and falls
-back to the rolling snapshots during an active run. With
+directly; a run directory selects `best_weights.pt` first, then
+`trained_weights.pt`, then `latest_weights.pt`. An explicit weights-file path
+always selects that file. With
 `training.wandb: true`, the same resolved
 configuration and one aggregate record per optimizer update are logged to the
 `heterogeneous-capability-planning` Weights & Biases project. Metrics include

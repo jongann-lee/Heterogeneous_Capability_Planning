@@ -23,8 +23,8 @@ def load_policy(checkpoint, device="cpu",
     checkpoint = Path(checkpoint)
     if checkpoint.is_dir():
         weights_path = next((candidate for candidate in (
-            checkpoint / "trained_weights.pt",
             checkpoint / "best_weights.pt",
+            checkpoint / "trained_weights.pt",
             checkpoint / "latest_weights.pt",
         ) if candidate.is_file()), checkpoint / "trained_weights.pt")
     else:

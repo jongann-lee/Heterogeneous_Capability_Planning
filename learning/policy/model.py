@@ -101,7 +101,7 @@ class HeterogeneousGraphPolicy(nn.Module):
         d = config.model_dim
         edge_dim = config.distance_embedding_dim
         self.agent_encoder = EntityEncoder(5 if config.use_position else 3, d)
-        self.target_encoder = EntityEncoder(2, d)
+        self.target_encoder = EntityEncoder(4 if config.use_position else 2, d)
         self.action_encoder = EntityEncoder(4, d)
         self.capability_embedding = nn.Parameter(torch.empty(d))
         nn.init.normal_(self.capability_embedding, std=1.0 / math.sqrt(d))
@@ -147,14 +147,20 @@ class HeterogeneousGraphPolicy(nn.Module):
     def encode(self, observation):
         self._require_task_graph(observation)
         agent_features = observation.task_agent_features
+        target_features = observation.task_target_features
         if self.config.use_position:
             if getattr(observation, "agent_positions", None) is None:
                 raise ValueError(
                     "model.use_position requires normalized agent_positions")
             agent_features = torch.cat(
                 (agent_features, observation.agent_positions), dim=-1)
+            if getattr(observation, "target_positions", None) is None:
+                raise ValueError(
+                    "model.use_position requires normalized target_positions")
+            target_features = torch.cat(
+                (target_features, observation.target_positions), dim=-1)
         agents = self.agent_encoder(agent_features)
-        targets = self.target_encoder(observation.task_target_features)
+        targets = self.target_encoder(target_features)
         actions = self.action_encoder(observation.task_action_features)
         batch, capability_count = observation.capability_mask.shape
         capabilities = self.capability_embedding.view(1, 1, -1).expand(

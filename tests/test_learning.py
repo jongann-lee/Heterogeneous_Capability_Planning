@@ -420,6 +420,21 @@ def test_factorial_evaluation_suite_has_180_filterable_cases():
         assert len({case.agent.agent_count for _index, case in batch}) == 1
 
 
+def test_washington_suite_uses_the_opposite_corner_with_the_same_factorial_cases():
+    suite, _path = load_evaluation_suite("learning/evaluation_suites/wa_factorial_test_v1.json")
+    original, _original_path = load_evaluation_suite("test")
+    assert suite.suite_id == "wa_factorial_test_v1"
+    assert suite.source_position == (63, 63)
+    assert suite.agent_configurations == original.agent_configurations
+    assert suite.target_configurations == original.target_configurations
+    cases = select_evaluation_cases(suite)
+    assert len(cases) == 180
+    assert all(case.source_position == (63, 63) for case in cases)
+    _path, graph, _metadata, _identity = inspect_prepared_map(
+        "Real_Life_Maps/WA_tobler_viewshed_64.pkl.gz")
+    validate_evaluation_suite_locations(suite, graph)
+
+
 def test_factorial_targets_have_one_alternating_heavy_and_multi_clusters():
     suite, _path = load_evaluation_suite("test")
     expected_heavy_type = {5: 1, 6: 2, 7: 1, 8: 2, 9: 1}
@@ -1440,10 +1455,11 @@ def test_yaml_configuration_loads_and_validates():
     config = load_config()
     assert config.model.model_dim % config.model.num_heads == 0
     assert config.model.feature_schema_version == CURRENT_FEATURE_SCHEMA_VERSION
-    assert config.model.edge_normalization == MAX_EDGE_NORMALIZATION
+    assert config.model.edge_normalization == RAW_EDGE_NORMALIZATION
+    assert not config.model.use_position
     assert config.model.edge_normalization_epsilon > 0
     assert config.candidates.include_wait
-    assert config.candidates.include_pair_staging
+    assert not config.candidates.include_pair_staging
     assert not config.candidates.allow_unknown_target_actions
     assert config.instances.min_targets == 5
     assert config.instances.max_targets == 9
@@ -1452,6 +1468,46 @@ def test_yaml_configuration_loads_and_validates():
     assert config.training.simulation_batch_size >= 1
     assert config.training.reinforce_batch_size >= 1
     assert config.training.device in {"auto", "cpu", "cuda"}
+
+
+def test_checkpoint_directories_prefer_best_then_final_then_latest():
+    from learning.policy.evaluation import load_policy
+
+    model = _graph_model()
+    config = replace(load_config(), model=model.config)
+    names = ("best_weights.pt", "trained_weights.pt", "latest_weights.pt")
+    states = {}
+    marker = next(iter(model.state_dict()))
+    for index, name in enumerate(names):
+        states[name] = {key: value.clone() for key, value in model.state_dict().items()}
+        states[name][marker].fill_(index + 1)
+    with tempfile.TemporaryDirectory() as directory:
+        for index, present in enumerate((names, names[:1] + names[2:], names[1:], names[2:])):
+            run = Path(directory) / str(index)
+            run.mkdir()
+            config_path = run / "config.yaml"
+            config_path.write_text(yaml.safe_dump(_serialized_run_config(config)))
+            for name in present:
+                torch.save(states[name], run / name)
+            weights_path, saved_config_path = evaluation_module._resolve_checkpoint(run)
+            assert weights_path == run / present[0]
+            assert saved_config_path == config_path
+            loaded, _adapter = load_policy(run, device="cpu")
+            assert torch.equal(loaded.state_dict()[marker], states[present[0]][marker])
+            # Explicit paths override the directory's preference in both APIs.
+            for name in present:
+                explicit, _saved_config = evaluation_module._resolve_checkpoint(run / name)
+                assert explicit == run / name
+                loaded, _adapter = load_policy(run / name, device="cpu")
+                assert torch.equal(loaded.state_dict()[marker], states[name][marker])
+        empty = Path(directory) / "empty"
+        empty.mkdir()
+        try:
+            evaluation_module._resolve_checkpoint(empty)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("an empty checkpoint directory was accepted")
 
 
 def test_training_writes_latest_best_and_final_weights():
@@ -1600,6 +1656,8 @@ def test_tensor_training_accumulates_microbatches_and_handles_partial_update():
                           torch.tensor([[[0.25, 0.0]]]))
     assert torch.allclose(cpu_observation.agent_positions,
                           tensor_observation.agent_positions)
+    assert torch.allclose(cpu_observation.target_positions,
+                          tensor_observation.target_positions)
     model.eval()
     assert torch.allclose(model(cpu_observation), model(tensor_observation), atol=1e-5)
 
@@ -1771,10 +1829,14 @@ def test_agent_positions_use_full_rectangular_map_bounds_and_handle_flat_axes():
     coordinates = [(-10., 20.), (0., 20.), (10., 25.), (20., 30.), (30., 40.)]
     for node, pos in enumerate(coordinates):
         graph.nodes[node]["pos"] = pos
+    for node in (2, 4):
+        graph.nodes[node].update(type="target_unreached", rps_type=UNKNOWN_TYPE)
     agents = [Agent(1, capabilities={1}), Agent(3, capabilities={0})]
     observation = build_observation(graph, agents, 2)
     expected = torch.tensor([[[0.25, 0.0], [0.75, 0.5]]])
     assert torch.allclose(observation.agent_positions, expected)
+    expected_targets = torch.tensor([[[0.5, 0.25], [1.0, 1.0]]])
+    assert torch.allclose(observation.target_positions, expected_targets)
     # Transformer's historical aspect-preserving positions remain separate.
     assert observation.agent_features[0, 1, 1] == 0.25
 
@@ -1783,13 +1845,17 @@ def test_agent_positions_use_full_rectangular_map_bounds_and_handle_flat_axes():
         transformed.nodes[node]["pos"] = (0.01 * x + 7, 3 * y - 5)
     scaled = build_observation(transformed, agents, 2)
     assert torch.allclose(scaled.agent_positions, expected, atol=1e-6)
+    assert torch.allclose(scaled.target_positions, expected_targets, atol=1e-6)
     line = build_observation(_line(5), agents[:1], 2)
     assert torch.allclose(line.agent_positions, torch.tensor([[[0.25, 0.0]]]))
     point = build_observation(_line(1), [Agent(0, capabilities={1})], 2)
     assert torch.equal(point.agent_positions, torch.zeros(1, 1, 2))
+    assert point.target_positions.shape == (1, 0, 2)
     padded = batch_observations([line, observation]).to("cpu")
     assert torch.equal(padded.agent_positions[0, 1], torch.zeros(2))
     assert torch.equal(padded.agent_positions[1], expected[0])
+    assert not padded.target_positions[0].any()
+    assert torch.equal(padded.target_positions[1], expected_targets[0])
 
 
 def test_task_graph_position_toggle_controls_agent_input_and_gradients():
@@ -1860,6 +1926,85 @@ def test_position_enabled_policy_preserves_padding_and_agent_permutations():
     restored.load_state_dict(model.state_dict(), strict=True)
     restored.eval()
     assert torch.allclose(restored(large), logits, atol=1e-5)
+
+
+def test_position_toggle_includes_target_coordinates_but_not_candidate_coordinates():
+    graph, agents = _instance()
+    graph.nodes[3].update(type="target_unreached", rps_type=2)
+    observation = build_observation(graph, agents, 2)
+    changed = copy.copy(observation)
+    changed.target_positions = 1.0 - observation.target_positions
+    for mode in ("mlp", "dot_product"):
+        for enabled in (False, True):
+            model = _graph_model(decoder_mode=mode, use_position=enabled)
+            inputs = {"target": [], "action": []}
+            hooks = [
+                model.target_encoder.register_forward_pre_hook(
+                    lambda _module, args: inputs["target"].append(args[0])),
+                model.action_encoder.register_forward_pre_hook(
+                    lambda _module, args: inputs["action"].append(args[0])),
+            ]
+            try:
+                logits = model(observation)
+                changed_logits = model(changed)
+            finally:
+                for hook in hooks:
+                    hook.remove()
+            assert inputs["target"][0].shape[-1] == (4 if enabled else 2)
+            assert torch.equal(inputs["action"][0], observation.task_action_features)
+            assert inputs["action"][0].shape[-1] == 4
+            if enabled:
+                assert torch.equal(inputs["target"][0][..., -2:], observation.target_positions)
+                assert not torch.allclose(logits, changed_logits)
+                logits[observation.feasible_action_mask].sum().backward()
+                gradients = model.target_encoder.network[0].weight.grad
+                assert torch.isfinite(gradients).all()
+                assert torch.count_nonzero(gradients[:, -2:])
+            else:
+                assert torch.equal(logits, changed_logits)
+            missing = copy.copy(observation)
+            missing.target_positions = None
+            if enabled:
+                try:
+                    model(missing)
+                except ValueError as error:
+                    assert "target_positions" in str(error)
+                else:
+                    raise AssertionError("missing target coordinates were accepted")
+            else:
+                assert torch.equal(logits, model(missing))
+
+    # Target order changes only the corresponding input rows, not the policy.
+    model = _graph_model(use_position=True)
+    permuted = copy.copy(observation)
+    for name in ("target_features", "target_positions", "target_mask",
+                 "task_target_features", "target_capability_beliefs"):
+        setattr(permuted, name, getattr(observation, name)[:, [1, 0]])
+    for name in ("agent_target_relations", "agent_target_distances",
+                 "agent_target_distance_mask", "action_target_relations",
+                 "action_target_distances", "action_target_distance_mask",
+                 "serves_mask", "reveals_mask", "stages_for_mask"):
+        setattr(permuted, name, getattr(observation, name)[:, :, [1, 0]])
+    assert torch.allclose(model(observation), model(permuted), atol=1e-5)
+
+
+def test_position_enabled_checkpoints_preserve_agent_and_target_inputs():
+    from learning.policy.evaluation import load_policy
+
+    model = _graph_model(use_position=True)
+    graph, agents = _instance()
+    observation = build_observation(graph, agents, 2)
+    payload = _serialized_run_config(replace(load_config(), model=model.config))
+    with tempfile.TemporaryDirectory() as directory:
+        directory = Path(directory)
+        (directory / "config.yaml").write_text(yaml.safe_dump(payload))
+        torch.save(model.state_dict(), directory / "best_weights.pt")
+        loaded, _adapter = load_policy(directory, device="cpu")
+        assert loaded.config.use_position
+        assert loaded.agent_encoder.network[0].in_features == 5
+        assert loaded.target_encoder.network[0].in_features == 4
+        assert loaded.action_encoder.network[0].in_features == 4
+        assert torch.allclose(loaded(observation), model(observation), atol=1e-5)
 
 
 def test_task_graph_dot_product_logits_preserve_magnitude_and_scale_by_dimension():
@@ -2180,7 +2325,8 @@ def test_task_graph_normalization_has_zero_variance_and_no_edge_fallbacks():
         "t", pos=(0, 0), height=0.0,
         type="target_unreached", rps_type=1, visible_edges=[])
     zero_variance = build_observation(
-        singleton, [Agent("t", capabilities={1})], 1)
+        singleton, [Agent("t", capabilities={1})], 1,
+        edge_normalization=PER_DECISION_EDGE_NORMALIZATION)
     values = _valid_task_distances(zero_variance)
     assert values.numel() == 3
     assert torch.equal(values, torch.zeros_like(values))
@@ -2189,12 +2335,64 @@ def test_task_graph_normalization_has_zero_variance_and_no_edge_fallbacks():
     no_edges = build_observation(
         targetless, [Agent(0, capabilities={1})], 1,
         transit=[(0, 1, 0.0, 1.0)], clock=0.5,
-        replan_transit=True)
+        replan_transit=True, edge_normalization=PER_DECISION_EDGE_NORMALIZATION)
     assert _valid_task_distances(no_edges).numel() == 0
     assert not no_edges.agent_action_distance_mask.any()
     assert not no_edges.agent_action_distances.any()
     # With no edge statistics there is no scale for a moving ETA either.
     assert no_edges.task_agent_features[0, 0, 1] == 0
+
+
+def test_no_edge_normalization_retains_raw_travel_times_in_the_current_schema():
+    config = load_config()
+    assert config.model.feature_schema_version == CURRENT_FEATURE_SCHEMA_VERSION
+    assert config.model.edge_normalization == RAW_EDGE_NORMALIZATION
+    graph = _line(6)
+    graph.nodes[5].update(type="target_unreached", rps_type=1)
+    graph.edges[3, 4]["distance"] = 2.0
+    graph.edges[4, 5]["distance"] = 3.0
+    observation = build_observation(
+        graph, [Agent(3, capabilities={1})], 1,
+        transit=[(3, 4, 0.0, 2.0)], clock=0.5, replan_transit=True)
+    target_action = next(i for i, candidate in enumerate(observation.candidates[0])
+                         if candidate.is_target)
+    assert observation.task_agent_features[0, 0, 1] == 1.5
+    assert observation.agent_target_distances[0, 0, 0, 0] == 4.5
+    assert observation.agent_action_distances[0, 0, target_action, 0] == 4.5
+    assert observation.action_target_distances[0, target_action, 0, 0] == 0.0
+    with patch("learning.gpu_sim.world.CuGraphRouter", _ReferenceRouter):
+        world = TensorWorld.from_networkx(graph, config.candidates, device="cpu")
+    state = TensorEpisodeState.create(world, [world.node_index[3]],
+                                      [[[False, True]]], [[1]])
+    state.target_known[:] = True
+    state.dispatch_next_hops(torch.tensor([[world.node_index[4]]]),
+                              torch.tensor([[True]]))
+    state.clock[:] = 0.5
+    tensor_observation = TensorObservationBuilder(
+        world, 1, edge_normalization=RAW_EDGE_NORMALIZATION).build(state)[0]
+    for name in ("task_agent_features", "agent_target_distances",
+                 "agent_action_distances", "action_target_distances"):
+        assert torch.allclose(getattr(tensor_observation, name), getattr(observation, name))
+    scaled = graph.copy()
+    for _u, _v, attributes in scaled.edges(data=True):
+        attributes["distance"] *= 10.0
+    enlarged = build_observation(
+        scaled, [Agent(3, capabilities={1})], 1,
+        transit=[(3, 4, 0.0, 20.0)], clock=5.0, replan_transit=True)
+    for name in ("agent_target_distances", "agent_action_distances",
+                 "action_target_distances"):
+        assert torch.allclose(getattr(enlarged, name), 10.0 * getattr(observation, name))
+    assert enlarged.task_agent_features[0, 0, 1] == 15.0
+    model = build_policy(config.model)
+    assert model.agent_encoder.network[0].in_features == 3
+    assert model.target_encoder.network[0].in_features == 2
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "raw.yaml"
+        serialized = _serialized_run_config(config)
+        path.write_text(yaml.safe_dump(serialized))
+        assert load_config(path) == config
+        assert serialized["feature_schema"]["edge_normalization"] == "none"
+        assert serialized["feature_schema"]["version"] == CURRENT_FEATURE_SCHEMA_VERSION
 
 
 def test_max_normalization_preserves_zero_and_scales_all_edge_families_per_episode():
@@ -2322,11 +2520,11 @@ def test_uniform_travel_time_scaling_preserves_features_and_policy_logits():
     base = build_observation(
         graph, [agent], 2,
         transit=[(0, 1, 0.0, 1.0)], clock=0.25,
-        replan_transit=True)
+        replan_transit=True, edge_normalization=PER_DECISION_EDGE_NORMALIZATION)
     enlarged = build_observation(
         scaled, [scaled_agent], 2,
         transit=[(0, 1, 0.0, 80.0)], clock=20.0,
-        replan_transit=True)
+        replan_transit=True, edge_normalization=PER_DECISION_EDGE_NORMALIZATION)
     for name in (
             "agent_target_distances", "agent_action_distances",
             "action_target_distances", "task_agent_features",
@@ -2408,7 +2606,8 @@ def test_cpu_cuda_observation_parity_for_normalization_and_unknown_actions():
             "agent_target_distances", "agent_action_distances",
             "action_target_distances", "task_agent_features",
             "task_target_features", "agent_capability_membership",
-            "target_capability_beliefs", "capability_mask", "agent_positions"):
+            "target_capability_beliefs", "capability_mask", "agent_positions",
+            "target_positions"):
         assert torch.allclose(
             getattr(cpu, name), getattr(gpu, name).cpu(), atol=1.0e-5)
     for name in (
@@ -2869,7 +3068,8 @@ def _check_tensor_observation_region_updates(device):
         world, [world.node_index["s"]],
         [[[True, True, False], [False, True, False]]] * 2, [[1, 2, 1]] * 2)
     snapshots = []
-    for method in (PER_DECISION_EDGE_NORMALIZATION, MAX_EDGE_NORMALIZATION):
+    for method in (RAW_EDGE_NORMALIZATION, PER_DECISION_EDGE_NORMALIZATION,
+                   MAX_EDGE_NORMALIZATION):
         builder = TensorObservationBuilder(world, 2, edge_normalization=method)
         # Rows reveal different subsets in the same batch. Later remove a
         # target too, then remove every unknown observation action.
@@ -2898,6 +3098,8 @@ def _check_tensor_observation_region_updates(device):
                     belief, [Agent("s", capabilities={0, 1}),
                              Agent("s", capabilities={1})], 2,
                     candidate_config=candidates, edge_normalization=method)
+                assert torch.allclose(tensor_observation.target_positions[row].cpu(),
+                                      cpu.target_positions[0])
                 by_key = {candidate.semantic_key: i
                           for i, candidate in enumerate(cpu.candidates[0])}
                 active_slots = torch.where(tensor_observation.action_mask[row])[0].tolist()
@@ -3117,7 +3319,7 @@ def test_masks_enforce_dead_transit_scout_and_compatibility_rules():
 
     future = build_observation(
         graph, [Agent(0, capabilities={1})], 2, candidates, transit, 0.5,
-        replan_transit=True)
+        replan_transit=True, edge_normalization=PER_DECISION_EDGE_NORMALIZATION)
     target_index = next(i for i, item in enumerate(candidates)
                         if item.is_target)
     assert future.feasible_action_mask[0, 0, target_index]

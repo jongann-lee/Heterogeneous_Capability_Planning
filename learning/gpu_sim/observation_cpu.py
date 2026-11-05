@@ -57,6 +57,7 @@ class PlannerObservation:
     target_capability_beliefs: torch.Tensor | None = None
     capability_mask: torch.Tensor | None = None
     agent_positions: torch.Tensor | None = None
+    target_positions: torch.Tensor | None = None
 
     def to(self, device):
         values = {}
@@ -534,6 +535,9 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
         agent_positions=torch.tensor([
             unit_pos.get(agent.position, (0.0, 0.0)) for agent in agents
         ], dtype=torch.float32).reshape(1, len(agents), 2),
+        target_positions=torch.tensor([
+            unit_pos[target] for target in targets
+        ], dtype=torch.float32).reshape(1, len(targets), 2),
     )
     return attach_task_graph_fields(
         observation, at_reachable.unsqueeze(0), ct_reachable.unsqueeze(0),
@@ -571,6 +575,7 @@ def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:
         # Transformer's same-count behavior.
         "agent_features": (1, a, agent_feature_dim),
         "agent_positions": (1, a, 2),
+        "target_positions": (1, t, 2),
         "target_features": (1, t, target_feature_dim),
         "action_features": (1, c, items[0].action_features.shape[-1]),
         "agent_mask": (1, a), "target_mask": (1, t), "action_mask": (1, c),

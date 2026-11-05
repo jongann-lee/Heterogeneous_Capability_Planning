@@ -45,11 +45,12 @@ DEFAULT_EVALUATION_DIR = PROJECT_ROOT / "outputs" / "evaluation"
 
 
 def _resolve_checkpoint(path):
+    """Prefer best, then final, then latest weights for a run directory."""
     path = Path(path).expanduser().resolve()
     if path.is_dir():
         weights = next((candidate for candidate in (
-            path / "trained_weights.pt",
             path / "best_weights.pt",
+            path / "trained_weights.pt",
             path / "latest_weights.pt",
         ) if candidate.is_file()), path / "trained_weights.pt")
         config = path / "config.yaml"
