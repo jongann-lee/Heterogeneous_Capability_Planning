@@ -1,38 +1,109 @@
 {
   "schema_version": 1,
-  "suite_id": "KTH_indoor",
+  "suite_id": "kth_indoor_big_factorial_v2",
   "terrain_id": "kth_50052749_patch5_pruned",
   "num_target_types": 5,
   "source_position": [43, 77],
   "agent_configurations": [
     {
-      "id": "specialists",
+      "id": "agents_08_a",
       "agent_count": 8,
-      "profile": "5 capabilities",
-      "capabilities": [[0,1], [0,2], [1,3], [2,3], [4,5], [0,5], [1,2,3], [5]]
+      "profile": "specialists",
+      "capabilities": [[0, 1], [0, 2], [1], [2], [3, 4], [4, 5], [1, 3, 5], [2, 3, 4]]
+    },
+    {
+      "id": "agents_08_b",
+      "agent_count": 8,
+      "profile": "balanced_hybrid",
+      "capabilities": [[0, 1], [0, 3], [0, 5], [1, 2], [2, 3], [3, 4], [4, 5], [1, 5]]
+    },
+    {
+      "id": "agents_08_c",
+      "agent_count": 8,
+      "profile": "scout_redundant",
+      "capabilities": [[0], [0, 2], [0, 3], [0, 4], [1, 5], [2, 3, 5], [4], [1, 2]]
     }
   ],
   "target_configurations": [
     {
-      "id": "fixed_14_targets",
+      "id": "targets_14_a",
       "target_count": 14,
-      "profile": "balanced_fixed",
+      "profile": "balanced",
       "targets": [
-        {"position": [17, 11], "type": 1},
-        {"position": [66, 48], "type": 2},
-        {"position": [41, 10], "type": 4},
-        {"position": [11, 135], "type": 3},
-        {"position": [40, 148], "type": 2},
-        {"position": [88, 95], "type": 3},
-        {"position": [107, 43], "type": 3},
-        {"position": [76, 152], "type": 1},
-        {"position": [109, 144], "type": 2},
-        {"position": [16, 147], "type": 4},
-        {"position": [122, 65], "type": 5},
-        {"position": [124, 61], "type": 5},
-        {"position": [93, 73], "type": 3},
-        {"position": [15, 93], "type": 1}
+        {"position": [18, 7], "type": 2, "room_zone_id": 1},
+        {"position": [1, 24], "type": 1, "room_zone_id": 3},
+        {"position": [18, 59], "type": 3, "room_zone_id": 7},
+        {"position": [16, 71], "type": 4, "room_zone_id": 8},
+        {"position": [18, 95], "type": 4, "room_zone_id": 10},
+        {"position": [1, 155], "type": 1, "room_zone_id": 11},
+        {"position": [18, 136], "type": 5, "room_zone_id": 13},
+        {"position": [47, 136], "type": 2, "room_zone_id": 16},
+        {"position": [32, 58], "type": 2, "room_zone_id": 19},
+        {"position": [49, 37], "type": 5, "room_zone_id": 24},
+        {"position": [71, 57], "type": 4, "room_zone_id": 29},
+        {"position": [78, 149], "type": 1, "room_zone_id": 34},
+        {"position": [63, 99], "type": 3, "room_zone_id": 36},
+        {"position": [53, 75], "type": 3, "room_zone_id": 38}
+      ]
+    },
+    {
+      "id": "targets_14_b",
+      "target_count": 14,
+      "profile": "types_1_2_heavy",
+      "targets": [
+        {"position": [38, 6], "type": 1, "room_zone_id": 2},
+        {"position": [14, 20], "type": 2, "room_zone_id": 4},
+        {"position": [17, 59], "type": 2, "room_zone_id": 7},
+        {"position": [18, 94], "type": 1, "room_zone_id": 10},
+        {"position": [2, 155], "type": 5, "room_zone_id": 11},
+        {"position": [46, 135], "type": 1, "room_zone_id": 16},
+        {"position": [39, 64], "type": 1, "room_zone_id": 20},
+        {"position": [49, 47], "type": 1, "room_zone_id": 25},
+        {"position": [51, 31], "type": 2, "room_zone_id": 28},
+        {"position": [71, 56], "type": 2, "room_zone_id": 29},
+        {"position": [128, 169], "type": 2, "room_zone_id": 31},
+        {"position": [89, 147], "type": 4, "room_zone_id": 32},
+        {"position": [70, 134], "type": 3, "room_zone_id": 36},
+        {"position": [54, 96], "type": 3, "room_zone_id": 38}
+      ]
+    },
+    {
+      "id": "targets_14_c",
+      "target_count": 14,
+      "profile": "multi_cluster_balanced",
+      "targets": [
+        {"position": [18, 31], "type": 1, "room_zone_id": 7},
+        {"position": [18, 29], "type": 2, "room_zone_id": 7},
+        {"position": [18, 33], "type": 3, "room_zone_id": 7},
+        {"position": [20, 31], "type": 4, "room_zone_id": 7},
+        {"position": [32, 102], "type": 5, "room_zone_id": 16},
+        {"position": [32, 104], "type": 1, "room_zone_id": 16},
+        {"position": [30, 102], "type": 2, "room_zone_id": 16},
+        {"position": [32, 100], "type": 3, "room_zone_id": 16},
+        {"position": [70, 57], "type": 4, "room_zone_id": 29},
+        {"position": [68, 57], "type": 5, "room_zone_id": 29},
+        {"position": [66, 57], "type": 1, "room_zone_id": 29},
+        {"position": [74, 149], "type": 2, "room_zone_id": 34},
+        {"position": [74, 147], "type": 3, "room_zone_id": 34},
+        {"position": [76, 148], "type": 4, "room_zone_id": 34}
+      ],
+      "clusters": [
+        {"room_zone_id": 7, "positions": [[18, 31], [18, 29], [18, 33], [20, 31]]},
+        {"room_zone_id": 16, "positions": [[32, 102], [32, 104], [30, 102], [32, 100]]},
+        {"room_zone_id": 29, "positions": [[70, 57], [68, 57], [66, 57]]},
+        {"room_zone_id": 34, "positions": [[74, 149], [74, 147], [76, 148]]}
       ]
     }
-  ]
+  ],
+  "placement_design": {
+    "seed": 20261105,
+    "prepared_map_sha256": "a633f9bfa561192ad2b394f4e32304ec48a746dbef2939d66f704ff6ccb92970",
+    "fine_pixel_wall_clearance_range": [2, 10],
+    "initially_visible_from_source": false,
+    "excluded_custom_suite": "KTH_indoor_big_single.json",
+    "minimum_coarse_chebyshev_separation_from_custom": 3,
+    "room_zones_source": "Real_Life_Maps/50052749/valid_space.npy",
+    "cluster_count": 4,
+    "cluster_max_seed_radius_fine_pixels": 25
+  }
 }

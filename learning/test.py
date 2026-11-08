@@ -19,6 +19,7 @@ import yaml
 from Real_Life_Maps.prepared_map import DEFAULT_PREPARED_MAP_PATH
 from learning.evaluation_suite import (
     load_evaluation_suite,
+    resolve_suite_path,
     select_evaluation_cases,
     validate_evaluation_suite_locations,
 )
@@ -152,7 +153,7 @@ def _capture_state(trace):
 
 
 def _gpu_episode(model, config, env, truth, agents, device, terrain=None,
-                 trace=None):
+                 trace=None, task_progress=None):
     from learning.gpu_sim.observation_gpu import TensorObservationBuilder
     from learning.gpu_sim.rollout_gpu import collect_tensor_episodes
     from learning.gpu_sim.state import TensorEpisodeState
@@ -164,6 +165,16 @@ def _gpu_episode(model, config, env, truth, agents, device, terrain=None,
         world, truth, agents, config.model.num_target_types, device)
     state = TensorEpisodeState.create(
         world, [source], capabilities, target_types)
+    capture_trace = None if trace is None else _capture_state(trace)
+
+    def capture(state):
+        if capture_trace is not None:
+            capture_trace(state)
+        if task_progress is not None:
+            task_progress.capture_tensor_state(state)
+
+    if task_progress is not None:
+        task_progress.initialize(env)
     oracle_makespan = full_information_makespan(truth, agents)
     rollout = collect_tensor_episodes(
         model, state,
@@ -176,10 +187,13 @@ def _gpu_episode(model, config, env, truth, agents, device, terrain=None,
         config.reinforce.death_penalty,
         config.reinforce.incomplete_penalty,
         training=False,
-        state_callback=None if trace is None else _capture_state(trace),
+        state_callback=(
+            capture if trace is not None or task_progress is not None else None),
         oracle_makespans=oracle_makespan,
         measure_planning_time=True)
     record = _tensor_rollout_record(rollout, 0)
+    if task_progress is not None:
+        record["task_progress"] = task_progress.finish(record["makespan"])
     return record, world.terrain, world
 
 
@@ -435,7 +449,8 @@ def _render_gpu_trace(trace, env, truth, source_agents, world, frames_dir,
 
 
 def _cpu_episode(model, config, env, truth, agents, device,
-                 render_dir=None, render_dt=1.0, frame_renderer=None):
+                 render_dir=None, render_dt=1.0, frame_renderer=None,
+                 task_progress=None):
     from learning.policy.adapter import LearnedPolicyAdapter
     from learning.gpu_sim.rollout_cpu import collect_episode
 
@@ -443,6 +458,8 @@ def _cpu_episode(model, config, env, truth, agents, device,
         model, config.model.num_target_types, training=False,
         candidate_config=config.candidates, device=device)
     oracle_makespan = full_information_makespan(truth, agents)
+    if task_progress is not None:
+        task_progress.initialize(env)
     rollout = collect_episode(
         env, truth, agents, adapter,
         config.reinforce.death_penalty,
@@ -466,6 +483,9 @@ def _cpu_episode(model, config, env, truth, agents, device,
     }
     record.update(_planning_metrics(
         result["policy_time_seconds"], result["policy_calls"]))
+    if task_progress is not None:
+        task_progress.consume_cpu_events(result["events"])
+        record["task_progress"] = task_progress.finish(record["makespan"])
     return record
 
 
@@ -480,7 +500,7 @@ class _PreserveFullInformationRoutes:
 
 def _classical_episode(policy_name, config, env, truth, agents,
                        render_dir=None, render_dt=1.0,
-                       frame_renderer=None):
+                       frame_renderer=None, task_progress=None):
     from planning.full_information import solve_full_information
     from planning.policies.scout_then_execute import ScoutThenExecutePolicy
     from simulation.engine import run_simulation
@@ -511,6 +531,8 @@ def _classical_episode(policy_name, config, env, truth, agents,
     else:
         raise ValueError(f"unknown classical policy: {policy_name}")
 
+    if task_progress is not None:
+        task_progress.initialize(env, full_information=policy_name == "fi-opt")
     result = run_simulation(
         env, truth, agents, policy=policy,
         death_penalty=config.reinforce.death_penalty,
@@ -550,6 +572,9 @@ def _classical_episode(policy_name, config, env, truth, agents,
         planning_time_seconds if policy_name == "fi-opt"
         else result["policy_time_seconds"],
         1 if policy_name == "fi-opt" else result["policy_calls"]))
+    if task_progress is not None:
+        task_progress.consume_cpu_events(result["events"])
+        record["task_progress"] = task_progress.finish(record["makespan"])
     return record
 
 
@@ -632,7 +657,7 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
              render=False, render_dir=None, output_mp4=None, mp4_fps=4,
              render_dt=1.0, policy="learned", episodes=1, progress=False,
              map_path=None, allow_map_mismatch=False,
-             allow_feature_schema_mismatch=False):
+             allow_feature_schema_mismatch=False, detailed=False):
     if policy not in {"learned", "fi-opt", "scout-then-execute"}:
         raise ValueError(f"unknown evaluation policy: {policy}")
     if episodes < 1:
@@ -651,6 +676,9 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
     if render and len(selected_cases) != 1:
         raise ValueError(
             "--render requires exactly one selected evaluation scenario")
+    if detailed and (len(selected_cases) != 1 or episodes != 1):
+        raise ValueError(
+            "detailed evaluation requires exactly one scenario and --episodes 1")
 
     if policy == "learned" and checkpoint is None:
         raise ValueError("the learned policy requires a checkpoint")
@@ -776,7 +804,8 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
         total=len(evaluation_cases), desc="Evaluating", unit="scenario",
         disable=not progress, file=sys.stderr)
     with torch.no_grad(), progress_bar:
-        if policy == "learned" and resolved_device == "cuda" and not render:
+        if (policy == "learned" and resolved_device == "cuda"
+                and not render and not detailed):
             records = _gpu_suite_records(
                 model, config, evaluation_cases, resolved_device,
                 progress=progress_bar, map_path=resolved_map_path)
@@ -793,6 +822,11 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
             torch.manual_seed(episode_seed)
             env, truth, agents = _case_factory(
                 case, map_path=resolved_map_path)
+            detail_options = {}
+            if detailed:
+                from learning.task_progress import TaskProgressRecorder
+                detail_options["task_progress"] = TaskProgressRecorder(
+                    [target.position for target in case.target.targets], truth)
             if render:
                 from simulation.rendering import make_mp4_from_frames
                 episode_frames = (
@@ -810,7 +844,7 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
                     trace = []
                     record, terrain, world = _gpu_episode(
                         model, config, env, truth, agents, resolved_device,
-                        terrain=terrain, trace=trace)
+                        terrain=terrain, trace=trace, **detail_options)
                     _render_gpu_trace(
                         trace, env, truth, agents, world, episode_frames,
                         render_dt, frame_renderer=frame_renderer)
@@ -819,13 +853,13 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
                     record = _cpu_episode(
                         model, config, env, truth, agents, resolved_device,
                         render_dir=episode_frames, render_dt=render_dt,
-                        frame_renderer=frame_renderer)
+                        frame_renderer=frame_renderer, **detail_options)
                     record["simulation_backend"] = "cpu_render"
                 else:
                     record = _classical_episode(
                         policy, config, env, truth, agents,
                         render_dir=episode_frames, render_dt=render_dt,
-                        frame_renderer=frame_renderer)
+                        frame_renderer=frame_renderer, **detail_options)
                     record["simulation_backend"] = "cpu_classical_render"
                 try:
                     make_mp4_from_frames(
@@ -837,15 +871,16 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
             elif policy == "learned" and resolved_device == "cuda":
                 record, terrain, _world = _gpu_episode(
                     model, config, env, truth, agents, resolved_device,
-                    terrain=terrain)
+                    terrain=terrain, **detail_options)
                 record["simulation_backend"] = "cuda_tensor"
             elif policy == "learned":
                 record = _cpu_episode(
-                    model, config, env, truth, agents, resolved_device)
+                    model, config, env, truth, agents, resolved_device,
+                    **detail_options)
                 record["simulation_backend"] = "cpu_simulator"
             else:
                 record = _classical_episode(
-                    policy, config, env, truth, agents)
+                    policy, config, env, truth, agents, **detail_options)
                 record["simulation_backend"] = "cpu_classical"
             record.update({
                 "evaluation_batch_id": case_index,
@@ -871,11 +906,14 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
             suite_definition, suite_path)
 
 
-def main():
+def main(argv=None, *, detailed=False, default_suite="development",
+         default_map_path=None, default_output_dir=None,
+         default_agent_config=None, default_target_config=None):
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate learned or classical policies on a prepared map and "
-            "fixed suite"))
+            "Evaluate one fixed scenario with task discovery/completion events"
+            if detailed else
+            "Evaluate learned or classical policies on a prepared map and fixed suite"))
     parser.add_argument(
         "checkpoint", nargs="?",
         help="timestamped checkpoint directory or weights file (learned policy only)")
@@ -888,7 +926,7 @@ def main():
         help="repeat every selected fixed-suite case N times")
     parser.add_argument("--config", help="config override; defaults to checkpoint config")
     parser.add_argument(
-        "--map-path",
+        "--map-path", default=default_map_path,
         help="prepared-map artifact; overrides config and checkpoint map paths")
     parser.add_argument(
         "--allow-map-mismatch", action="store_true",
@@ -898,7 +936,7 @@ def main():
         help=("allow an older or otherwise incompatible checkpoint feature "
               "schema; retraining is recommended"))
     parser.add_argument(
-        "--suite", default="development",
+        "--suite", default=default_suite,
         help="development, test, or a factorized suite JSON path")
     parser.add_argument(
         "--agent-config", action="append",
@@ -934,7 +972,12 @@ def main():
     parser.add_argument("--mp4-fps", type=int, default=4)
     parser.add_argument("--render-dt", type=float, default=1.0,
                         help="sim-time between rendered frames (continuous time)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if resolve_suite_path(args.suite) == resolve_suite_path(default_suite):
+        if args.agent_config is None and default_agent_config is not None:
+            args.agent_config = [default_agent_config]
+        if args.target_config is None and default_target_config is not None:
+            args.target_config = [default_target_config]
     if args.mp4_fps < 1:
         parser.error("--mp4-fps must be positive")
     if args.render_dt <= 0:
@@ -950,6 +993,13 @@ def main():
     if args.cuda and args.device is not None:
         parser.error("use either --cuda or --device, not both")
     selected_device = "cuda" if args.cuda else args.device
+    output = _evaluation_output_path(args.output)
+    if args.output is None and default_output_dir is not None:
+        output = Path(default_output_dir).expanduser().resolve() / output.name
+    if detailed and args.output is None:
+        output = output.with_name(f"{output.stem}_detailed.json")
+    if output.exists():
+        parser.error(f"evaluation output already exists: {output}")
 
     try:
         (records, summary, config, weights,
@@ -968,12 +1018,11 @@ def main():
             map_path=args.map_path,
             allow_map_mismatch=args.allow_map_mismatch,
             allow_feature_schema_mismatch=(
-                args.allow_feature_schema_mismatch))
+                args.allow_feature_schema_mismatch), detailed=detailed)
     except (FileNotFoundError, ValueError) as error:
         parser.error(str(error))
     prepared_map = evaluate.last_prepared_map
     feature_schema = evaluate.last_feature_schema
-    output = _evaluation_output_path(args.output)
     payload = {
         "schema_version": 1,
         "checkpoint": str(weights) if weights is not None else None,
@@ -1001,9 +1050,12 @@ def main():
         "summary": summary,
         "scenarios": records,
     }
+    if detailed:
+        payload["detailed"] = True
     rendered = json.dumps(payload, indent=2)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(rendered + "\n", encoding="utf-8")
+    with output.open("x", encoding="utf-8") as stream:
+        stream.write(rendered + "\n")
     print(f"saved evaluation: {output}")
     mean_planning_time = summary["mean_planning_time_seconds"]
     if mean_planning_time is None:

@@ -37,3 +37,4 @@ cluster/
 
 # Figures
 analysis_figures/
+.figure_scripts/outputs/

@@ -81,8 +81,9 @@ For the no-normalization task-graph ablation, `edge_normalization: none`
 passes raw traversal times and remaining transit times directly to the neural
 encoders, without centering or scaling. The saved
 normalization identity prevents silently evaluating weights with another mode.
-The current config uses `none` for the no-edge-normalization ablation. Select
-`per_decision_zscore` or `per_decision_max` in `learning/config.yaml` to normalize.
+The current config uses `per_decision_zscore` for the single-target staging
+ablation. Select `none` or `per_decision_max` in `learning/config.yaml` for the
+other normalization ablations.
 
 `model.decoder_mode` selects the task-graph scoring head: `mlp` (the default)
 or `dot_product`, which uses the agent/candidate dot product divided by
@@ -172,6 +173,29 @@ with `--map-path Real_Life_Maps/WA_tobler_viewshed_64.pkl.gz`. This suite keeps
 the same 180 agent/target combinations but starts every agent at the opposite
 corner `(63, 63)`. The 64-by-64 maps use indices 0 through 63; `(64, 64)` is
 outside the map. Cross-terrain learned evaluation also needs `--allow-map-mismatch`.
+
+`learning/evaluation_suites/KTH_indoor_big.json` contains nine indoor cases:
+three eight-agent profiles crossed with three fourteen-target layouts, using
+five target types and source `(43, 77)`. `agents_08_a` mixes specialist and
+multi-type service agents with two scout-capable agents. `agents_08_b` has
+three scout-service hybrids and five dual-type workers. `agents_08_c` has
+four scout-service hybrids and four dual-type workers. Every team has exactly
+two capabilities per agent on average (including scouting capability `0`),
+and every service type is supported by at least two agents. The suite ID is
+`kth_indoor_big_factorial_v2` to distinguish these cases from the earlier
+five-agent results.
+
+The indoor target layouts are dispersed balanced, dispersed types-1-and-2-heavy
+(type counts `5,5,2,1,1`), and balanced clusters of `4,4,3,3` targets inside room
+zones `7,16,29,34`. Room IDs refer to the fine `valid_space.npy` raster. All
+42 target locations are distinct across layouts, near walls (2–10 fine pixels
+of clearance), outside the source's initial line of sight, and safely
+reachable/observable with the other live targets blocked. The clustered
+targets stay within 25 fine pixels of their cluster's first target. The custom
+single case is retained in `KTH_indoor_big_single.json`; its locations and
+their immediate neighborhoods are excluded from the new suite. The JSON
+records room IDs, cluster membership, the map hash, and placement criteria.
+
 Rendering is accepted only when the final filtered selection contains exactly
 one scenario. Every result records both its resolved suite ID and scenario ID.
 Suite coordinates are checked against actual nodes in the selected graph, not
@@ -180,6 +204,43 @@ Every evaluation writes its full JSON result to
 `outputs/evaluation/<current-date-and-time>.json` by default. Pass
 `--output <path>` to choose the filename or destination explicitly. The CLI
 prints only the saved path instead of echoing the complete JSON payload.
+
+For exact discovery and completion times for a figure, use the separate
+single-case evaluator. It accepts the same checkpoint, policy, suite, map,
+and selection options as `learning.test`, but requires exactly one selected
+case and `--episodes 1`. Rendering is optional; no PNGs or video are created
+unless `--render` is requested. The detailed evaluator defaults to
+`Real_Life_Maps/KTH_Indoor_map.pkl.gz` and
+`learning/evaluation_suites/KTH_indoor_big.json`, selecting `agents_08_b`
+(eight balanced-hybrid agents, three scouts) and `targets_14_a` (14 balanced
+targets). Explicit agent/target filters replace these defaults; selecting a
+different suite disables the default filters.
+
+```bash
+uv run python -m learning.test_single_detailed --policy scout-then-execute
+uv run python -m learning.test_single_detailed learning/checkpoints/<run-timestamp> \
+  --allow-map-mismatch --device cuda
+```
+
+Use `--suite` and `--map-path` to select another scenario or terrain explicitly.
+The default filename is `outputs/evaluation/KTH-detailed/<timestamp>_detailed.json`.
+An existing output path is rejected. Under `scenarios[0].task_progress`,
+`events` contains each `task_discovered` and `task_completed` event with its
+exact simulation time, zero-based target ID (in suite order), node, and type.
+`targets` gives each task's `discovered_at` and `completed_at` (null if absent).
+`timeline` contains cumulative `discovered_count`, `scouted_count`, and
+`completed_count`, plus unknown and remaining counts. Use a step plot with
+`where="post"`; counts include all changes at that timestamp, including
+source observations at time zero, and extend to the final makespan even on
+an incomplete run. Times use the prepared map's traversal units, not wall time.
+
+`scouted_count` counts tasks first revealed by scout sensing. `discovered_count`
+also includes types learned by contact or known initially. FI-OPT knows all
+types at time zero (`source: full_information`), which is not counted as
+scouting. A contact discovery and completion may share a timestamp. The learned
+CUDA path records task transitions directly from tensor state; learned CPU and
+classical policies use the event-driven simulator's event log. Recording does
+not require switching a CUDA policy to the CPU simulator.
 
 `learning.analyze` keeps the full evaluation JSON as the raw reproducible
 artifact and prints a compact report derived from it. The report contains

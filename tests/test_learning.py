@@ -1,7 +1,7 @@
 """Fast checks for the centralized learned planner."""
 
 import copy
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import asdict, replace
 from datetime import datetime
 from itertools import combinations, permutations, product
@@ -100,6 +100,8 @@ from learning.test import (
     summarize as summarize_evaluation,
 )
 import learning.test as evaluation_module
+from learning.task_progress import TaskProgressRecorder
+from learning.test_single_detailed import evaluate as evaluate_single_detailed
 from simulation.agent import Agent
 from simulation.domain import UNKNOWN_TYPE, init_target_types
 from simulation.engine import run_simulation
@@ -435,6 +437,110 @@ def test_washington_suite_uses_the_opposite_corner_with_the_same_factorial_cases
     validate_evaluation_suite_locations(suite, graph)
 
 
+def test_kth_big_suite_crosses_three_eight_agent_profiles_with_three_fourteen_target_layouts():
+    suite, _path = load_evaluation_suite("learning/evaluation_suites/KTH_indoor_big.json")
+    assert suite.suite_id == "kth_indoor_big_factorial_v2"
+    assert suite.source_position == (43, 77)
+    assert suite.num_target_types == 5
+    assert len(suite.agent_configurations) == len(suite.target_configurations) == 3
+    assert {agent.agent_count for agent in suite.agent_configurations} == {8}
+    assert {agent.id for agent in suite.agent_configurations} == {
+        "agents_08_a", "agents_08_b", "agents_08_c"}
+    agents = {agent.profile: agent for agent in suite.agent_configurations}
+    assert set(agents) == {"specialists", "balanced_hybrid", "scout_redundant"}
+    for profile, scout_count in (("specialists", 2), ("balanced_hybrid", 3),
+                                 ("scout_redundant", 4)):
+        capabilities = agents[profile].capabilities
+        assert len(capabilities) == 8
+        assert sum(0 in values for values in capabilities) == scout_count
+        assert sum(map(len, capabilities)) == 16  # Mean 2, including scouting.
+        assert all(1 <= len(values) <= 3 and values - {0} for values in capabilities)
+        assert set.union(*(set(values) for values in capabilities)) == set(range(6))
+        coverage = Counter(value for values in capabilities for value in values if value > 0)
+        assert min(coverage.values()) >= 2
+        assert max(coverage.values()) - min(coverage.values()) <= 1
+    layouts = {layout.profile: layout for layout in suite.target_configurations}
+    assert set(layouts) == {"balanced", "types_1_2_heavy", "multi_cluster_balanced"}
+    for layout in layouts.values():
+        assert layout.target_count == 14
+        assert len({target.position for target in layout.targets}) == 14
+    for profile in ("balanced", "multi_cluster_balanced"):
+        counts = Counter(t.target_type for t in layouts[profile].targets)
+        assert set(counts) == set(range(1, 6))
+        assert max(counts.values()) - min(counts.values()) <= 1
+    heavy = Counter(t.target_type for t in layouts["types_1_2_heavy"].targets)
+    assert heavy == {1: 5, 2: 5, 3: 2, 4: 1, 5: 1}
+    cases = select_evaluation_cases(suite)
+    assert len(cases) == 9
+    assert len({case.scenario_id for case in cases}) == 9
+    batches = _cuda_batch_plan(cases)
+    assert len(batches) == 3
+    assert all(len(agent_batches) == 1 and len(agent_batches[0]) == 3
+               for _target_id, agent_batches in batches)
+
+
+def test_kth_big_targets_respect_room_walls_visibility_and_safe_reachability():
+    from scipy import ndimage
+    from Real_Life_Maps.indoor_map_generation import load_walkable
+    from simulation.visibility import visible_nodes, visible_targets
+
+    suite, suite_path = load_evaluation_suite("learning/evaluation_suites/KTH_indoor_big.json")
+    payload = json.loads(suite_path.read_text())
+    _path, graph, _metadata, identity = inspect_prepared_map("Real_Life_Maps/KTH_Indoor_map.pkl.gz")
+    validate_evaluation_suite_locations(suite, graph)
+    assert payload["placement_design"]["prepared_map_sha256"] == identity["sha256"]
+    rasters = Path(__file__).parents[1] / "Real_Life_Maps" / "50052749"
+    walkable, _raster_metadata = load_walkable(rasters)
+    zones = np.load(rasters / "valid_space.npy", allow_pickle=False)
+    wall_clearance = ndimage.distance_transform_edt(walkable)
+    initially_visible = visible_nodes(graph, suite.source_position)
+    custom, _custom_path = load_evaluation_suite(suite_path.with_name("KTH_indoor_big_single.json"))
+    custom_positions = {target.position for layout in custom.target_configurations
+                        for target in layout.targets}
+    all_positions = set()
+    for layout, definition in zip(suite.target_configurations, payload["target_configurations"]):
+        positions = {target.position for target in layout.targets}
+        assert not positions & all_positions
+        assert not positions & initially_visible
+        assert not positions & custom_positions
+        all_positions.update(positions)
+        safe_graph = nx.subgraph_view(graph, filter_node=lambda n: n not in positions)
+        reachable = nx.descendants(safe_graph, suite.source_position) | {suite.source_position}
+        room_counts = Counter()
+        for target, record in zip(layout.targets, definition["targets"]):
+            anchor = graph.nodes[target.position]["dense_anchor"]
+            assert walkable[anchor]
+            assert 2 <= wall_clearance[anchor] <= 10
+            room = int(zones[anchor])
+            assert room > 0 and record["room_zone_id"] == room
+            room_counts[room] += 1
+            assert all(max(abs(target.position[i] - old[i]) for i in (0, 1)) >= 3
+                       for old in custom_positions)
+            assert any(node in reachable for node in graph.predecessors(target.position))
+            assert any(node in reachable for node in graph.successors(target.position))
+            witnesses = visible_nodes(graph, target.position) & reachable
+            assert witnesses
+            assert target.position in visible_targets(graph, min(witnesses), {target.position})
+        if layout.profile == "multi_cluster_balanced":
+            assert set(room_counts) == {7, 16, 29, 34}
+            assert sorted(room_counts.values()) == [3, 3, 4, 4]
+            assert len(definition["clusters"]) == 4
+            cluster_positions = set()
+            for cluster in definition["clusters"]:
+                nodes = [tuple(position) for position in cluster["positions"]]
+                assert len(nodes) in (3, 4)
+                assert all(int(zones[graph.nodes[node]["dense_anchor"]]) == cluster["room_zone_id"]
+                           for node in nodes)
+                first = np.array(graph.nodes[nodes[0]]["dense_anchor"])
+                assert all(np.linalg.norm(np.array(graph.nodes[node]["dense_anchor"]) - first) <= 25
+                           for node in nodes)
+                cluster_positions.update(nodes)
+            assert cluster_positions == positions
+        else:
+            assert len(room_counts) == 14
+    assert len(all_positions) == 42
+
+
 def test_factorial_targets_have_one_alternating_heavy_and_multi_clusters():
     suite, _path = load_evaluation_suite("test")
     expected_heavy_type = {5: 1, 6: 2, 7: 1, 8: 2, 9: 1}
@@ -576,6 +682,212 @@ def test_cuda_evaluation_executes_compatible_cases_in_one_batch():
     assert len(records) == 2
     assert {record["evaluation_batch_id"] for record in records} == {0}
     assert {record["evaluation_batch_size"] for record in records} == {2}
+
+
+def test_detailed_evaluation_requires_one_scenario_and_one_episode():
+    missing = Path("/definitely/missing/checkpoint.pt")
+    for options in ({}, {"limit": 1, "episodes": 2}):
+        try:
+            evaluate_single_detailed(missing, suite="test", **options)
+        except ValueError as error:
+            assert "exactly one scenario and --episodes 1" in str(error)
+        else:
+            raise AssertionError("multiple detailed episodes were accepted")
+    try:
+        evaluate_single_detailed(missing, suite="test", limit=1)
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("a single detailed case did not reach checkpoint loading")
+
+
+def test_detailed_kth_defaults_allow_explicit_overrides():
+    import learning.test_single_detailed as detailed
+
+    suite, path = load_evaluation_suite(detailed.DEFAULT_SUITE)
+    assert path.name == "KTH_indoor_big.json"
+    cases = select_evaluation_cases(
+        suite, agent_config=detailed.DEFAULT_AGENT_CONFIG,
+        target_config=detailed.DEFAULT_TARGET_CONFIG)
+    assert len(cases) == 1
+    assert cases[0].agent.profile == "balanced_hybrid"
+    assert cases[0].agent.agent_count == 8
+    assert cases[0].target.profile == "balanced"
+    assert cases[0].target.target_count == 14
+    assert detailed.DEFAULT_MAP_PATH.name == "KTH_Indoor_map.pkl.gz"
+    assert detailed.DEFAULT_OUTPUT_DIR.parts[-2:] == ("evaluation", "KTH-detailed")
+    with patch.object(detailed, "_evaluate", return_value="recorded") as evaluate:
+        assert detailed.evaluate(policy="scout-then-execute") == "recorded"
+        assert evaluate.call_args.kwargs["suite"] == detailed.DEFAULT_SUITE
+        assert evaluate.call_args.kwargs["map_path"] == detailed.DEFAULT_MAP_PATH
+        assert evaluate.call_args.kwargs["agent_config"] == "agents_08_b"
+        assert evaluate.call_args.kwargs["target_config"] == "targets_14_a"
+        detailed.evaluate(agent_config="agents_08_c", target_config="targets_14_c")
+        assert evaluate.call_args.kwargs["agent_config"] == "agents_08_c"
+        assert evaluate.call_args.kwargs["target_config"] == "targets_14_c"
+        detailed.evaluate(suite="development", map_path="other-map.pkl.gz")
+        assert evaluate.call_args.kwargs["suite"] == "development"
+        assert evaluate.call_args.kwargs["map_path"] == "other-map.pkl.gz"
+        assert "agent_config" not in evaluate.call_args.kwargs
+        assert "target_config" not in evaluate.call_args.kwargs
+    for flags, agent_id, target_id in (
+        ([], "agents_08_b", "targets_14_a"),
+        (["--agent-config", "agents_08_c", "--target-config", "targets_14_c"],
+         "agents_08_c", "targets_14_c"),
+    ):
+        with patch.object(evaluation_module, "evaluate", side_effect=ValueError("checked")) as run, \
+                patch("sys.stderr"):
+            try:
+                detailed.main(["--policy", "fi-opt", *flags])
+            except SystemExit as error:
+                assert error.code == 2
+            else:
+                raise AssertionError("the evaluation stub did not run")
+        assert run.call_args.kwargs["agent_config"] == [agent_id]
+        assert run.call_args.kwargs["target_config"] == [target_id]
+
+
+def test_detailed_task_progress_matches_cpu_and_tensor_transitions():
+    truth = _line(5)
+    truth.nodes[0]["visible_nodes"] = [0, 2]
+    truth.nodes[1]["visible_nodes"] = [1, 4]
+    for node in (2, 4):
+        truth.nodes[node].update(type="target_unreached", rps_type=1)
+    env = truth.copy()
+    for node in (2, 4):
+        env.nodes[node]["rps_type"] = UNKNOWN_TYPE
+    # Suite order intentionally differs from the tensor world's target order.
+    targets = (4, 2)
+    cpu = TaskProgressRecorder(targets, truth)
+    cpu.initialize(env)
+    agent = Agent(0, capabilities={0, 1})
+    agent.planned_path = [0, 1, 2, 3, 4]
+    result = run_simulation(
+        env, truth, [agent], policy=evaluation_module._PreserveFullInformationRoutes())
+    cpu.consume_cpu_events(result["events"])
+    expected = cpu.finish(result["makespan"])
+    assert [(e["time"], e["event"], e["target_id"]) for e in expected["events"]] == [
+        (0.0, "task_discovered", 1), (1.0, "task_discovered", 0),
+        (2.0, "task_completed", 1), (4.0, "task_completed", 0),
+    ]
+    assert expected["timeline"][0]["scouted_count"] == 1
+    assert expected["timeline"][-1]["completed_count"] == 2
+
+    config = replace(load_config().candidates, staging_per_target=0,
+                     include_pair_staging=False)
+    with patch("learning.gpu_sim.world.CuGraphRouter", _ReferenceRouter):
+        world = TensorWorld.from_networkx(env, config, device="cpu")
+    state = TensorEpisodeState.create(world, [world.node_index[0]],
+                                     [[[True, True]]], [[1, 1]])
+    tensor = TaskProgressRecorder(targets, truth)
+    tensor.initialize(env)
+    tensor.capture_tensor_state(state)
+    for node in (1, 2, 3, 4):
+        state.dispatch_next_hops(
+            [[world.node_index[node]]], torch.tensor([[True]]))
+        state.advance()
+        tensor.capture_tensor_state(state)
+        tensor.capture_tensor_state(state)  # Repeated callbacks must not duplicate facts.
+    assert tensor.finish(float(state.clock[0])) == expected
+    json.dumps(expected)  # The complete progress object is JSON serializable.
+
+
+def test_detailed_progress_handles_contact_death_simultaneity_and_incompletion():
+    truth = _line(3)
+    for node in (1, 2):
+        truth.nodes[node].update(type="target_unreached", rps_type=1)
+    env = truth.copy()
+    for node in (1, 2):
+        env.nodes[node]["rps_type"] = UNKNOWN_TYPE
+    progress = TaskProgressRecorder((1, 2), truth)
+    progress.initialize(env)
+    progress.consume_cpu_events([
+        {"time": 1.0, "event": "agent_dies", "node": 1},
+        {"time": 1.0, "event": "reveal", "node": 2},
+        {"time": 1.0, "event": "agent_wins", "node": 2},
+    ])
+    result = progress.finish(5.0)
+    assert [p["time"] for p in result["timeline"]] == [0.0, 1.0, 5.0]
+    last = result["timeline"][-1]
+    assert last["discovered_count"] == 2 and last["scouted_count"] == 1
+    assert last["completed_count"] == 1 and last["remaining_count"] == 1
+    assert result["targets"][0]["discovery_source"] == "contact"
+    assert result["targets"][0]["completed_at"] is None
+    assert result["targets"][1]["completed_at"] == 1.0
+
+
+def test_detailed_episode_hooks_preserve_learned_cpu_tensor_and_classical_results():
+    truth = _line(3)
+    truth.nodes[0]["visible_nodes"] = [0, 2]
+    truth.nodes[2].update(type="target_unreached", rps_type=1)
+    env = truth.copy()
+    env.nodes[2]["rps_type"] = UNKNOWN_TYPE
+    model = _graph_model(num_target_types=1, use_critic=False)
+    config = replace(
+        load_config(), model=model.config,
+        candidates=replace(load_config().candidates, staging_per_target=0,
+                           include_pair_staging=False, include_wait=False))
+
+    def recorder():
+        return TaskProgressRecorder([2], truth)
+
+    with torch.no_grad():
+        cpu = evaluation_module._cpu_episode(
+            model, config, env, truth, [Agent(0, capabilities={0, 1})],
+            "cpu", task_progress=recorder())
+        with patch("learning.gpu_sim.world.CuGraphRouter", _ReferenceRouter):
+            tensor, _terrain, _world = evaluation_module._gpu_episode(
+                model, config, env, truth, [Agent(0, capabilities={0, 1})],
+                "cpu", task_progress=recorder())
+        classical = evaluation_module._classical_episode(
+            "scout-then-execute", config, env, truth,
+            [Agent(0, capabilities={0, 1})], task_progress=recorder())
+    for record in (cpu, tensor, classical):
+        assert record["completed"] and record["makespan"] == 2.0
+        assert record["task_progress"] == cpu["task_progress"]
+        assert record["task_progress"]["targets"][0]["discovered_at"] == 0.0
+        assert record["task_progress"]["targets"][0]["completed_at"] == 2.0
+
+
+def test_detailed_cli_exports_classical_progress_and_refuses_overwrite():
+    from learning.test_single_detailed import main as detailed_main
+
+    directory = Path(tempfile.mkdtemp(prefix="detailed-evaluation-"))
+    map_path = _save_prepared_grid(directory, "terrain.pkl.gz", 2)
+    suite_path = _write_single_case_suite(directory)
+    output = directory / "detailed.json"
+    detailed_main([
+        "--policy", "fi-opt", "--suite", str(suite_path),
+        "--map-path", str(map_path), "--output", str(output), "--no-progress",
+    ])
+    original = output.read_bytes()
+    payload = json.loads(original)
+    assert payload["detailed"]
+    scenario = payload["scenarios"][0]
+    progress = scenario["task_progress"]
+    assert progress["targets"][0]["discovery_source"] == "full_information"
+    assert progress["timeline"][0]["discovered_count"] == 1
+    assert progress["timeline"][0]["scouted_count"] == 0
+    assert progress["timeline"][-1]["completed_count"] == 1
+    assert progress["targets"][0]["completed_at"] == scenario["makespan"]
+    # Defaults choose the output directory, while explicit suite/map flags win.
+    with patch("learning.test_single_detailed.DEFAULT_OUTPUT_DIR", directory / "default"):
+        detailed_main([
+            "--policy", "fi-opt", "--suite", str(suite_path),
+            "--map-path", str(map_path), "--no-progress",
+        ])
+    default_outputs = list((directory / "default").glob("*_detailed.json"))
+    assert len(default_outputs) == 1
+    assert json.loads(default_outputs[0].read_text())["suite_id"] == "temporary_suite"
+    with patch.object(evaluation_module, "evaluate", side_effect=AssertionError), \
+            patch("sys.stderr"):
+        try:
+            detailed_main(["--policy", "fi-opt", "--output", str(output)])
+        except SystemExit as error:
+            assert error.code == 2
+        else:
+            raise AssertionError("existing detailed results were overwritten")
+    assert output.read_bytes() == original
 
 
 def test_evaluation_render_requires_one_filtered_scenario():
@@ -1455,8 +1767,9 @@ def test_yaml_configuration_loads_and_validates():
     config = load_config()
     assert config.model.model_dim % config.model.num_heads == 0
     assert config.model.feature_schema_version == CURRENT_FEATURE_SCHEMA_VERSION
-    assert config.model.edge_normalization == RAW_EDGE_NORMALIZATION
-    assert not config.model.use_position
+    assert config.model.edge_normalization in {
+        RAW_EDGE_NORMALIZATION, PER_DECISION_EDGE_NORMALIZATION, MAX_EDGE_NORMALIZATION}
+    assert isinstance(config.model.use_position, bool)
     assert config.model.edge_normalization_epsilon > 0
     assert config.candidates.include_wait
     assert not config.candidates.include_pair_staging
@@ -2345,6 +2658,8 @@ def test_task_graph_normalization_has_zero_variance_and_no_edge_fallbacks():
 
 def test_no_edge_normalization_retains_raw_travel_times_in_the_current_schema():
     config = load_config()
+    config = replace(config, model=replace(
+        config.model, edge_normalization=RAW_EDGE_NORMALIZATION, use_position=False))
     assert config.model.feature_schema_version == CURRENT_FEATURE_SCHEMA_VERSION
     assert config.model.edge_normalization == RAW_EDGE_NORMALIZATION
     graph = _line(6)
@@ -2353,7 +2668,8 @@ def test_no_edge_normalization_retains_raw_travel_times_in_the_current_schema():
     graph.edges[4, 5]["distance"] = 3.0
     observation = build_observation(
         graph, [Agent(3, capabilities={1})], 1,
-        transit=[(3, 4, 0.0, 2.0)], clock=0.5, replan_transit=True)
+        transit=[(3, 4, 0.0, 2.0)], clock=0.5, replan_transit=True,
+        edge_normalization=RAW_EDGE_NORMALIZATION)
     target_action = next(i for i, candidate in enumerate(observation.candidates[0])
                          if candidate.is_target)
     assert observation.task_agent_features[0, 0, 1] == 1.5
@@ -2378,7 +2694,8 @@ def test_no_edge_normalization_retains_raw_travel_times_in_the_current_schema():
         attributes["distance"] *= 10.0
     enlarged = build_observation(
         scaled, [Agent(3, capabilities={1})], 1,
-        transit=[(3, 4, 0.0, 20.0)], clock=5.0, replan_transit=True)
+        transit=[(3, 4, 0.0, 20.0)], clock=5.0, replan_transit=True,
+        edge_normalization=RAW_EDGE_NORMALIZATION)
     for name in ("agent_target_distances", "agent_action_distances",
                  "action_target_distances"):
         assert torch.allclose(getattr(enlarged, name), 10.0 * getattr(observation, name))

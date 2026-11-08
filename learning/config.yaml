@@ -14,13 +14,13 @@ model:
   edge_normalization_epsilon: 1.0E-6
   dropout: 0.0
   relation_hidden_dim: 64
-  decoder_mode: mlp
-  use_position: False # Append unit-square coordinates to agent and target inputs, not candidates.
+  decoder_mode: dot_product
+  use_position: True # Append unit-square coordinates to agent and target inputs, not candidates.
 
 candidates:
   staging_per_target: 2
   staging_capacity: 1
-  include_pair_staging: false
+  include_pair_staging: True
   include_wait: True
   allow_unknown_target_actions: False
 

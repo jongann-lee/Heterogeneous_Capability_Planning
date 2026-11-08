@@ -187,9 +187,10 @@ def _legend_handles():
     ]
 
 
-def render_frame(env_map, ground_truth, agents, turn_idx, output_path,
-                 title=None, agent_xy=None):
-    """Render one frame of the capability-based simulation to PNG.
+def draw_frame(ax, env_map, ground_truth, agents, *, agent_xy=None,
+               scale=1.0, labels_inside=False, show_source=True,
+               draw_background=True):
+    """Draw the evaluation scene on an existing Matplotlib axes.
 
     Agent colors identify trajectories only; they do not encode capabilities.
     Floating labels show ``A<index>: {capabilities}`` above each agent and
@@ -200,10 +201,19 @@ def render_frame(env_map, ground_truth, agents, turn_idx, output_path,
         ground_truth: reality (terrain, obstacles, roads, positions).
         agents: list of Agent (with .capabilities, .alive, .trajectory,
             .planned_path, .position).
+        ax: destination axes; figure creation and saving belong to the caller.
         agent_xy: optional list of (x, y) coordinates, one per agent, giving
             each agent's *interpolated* position (used by the continuous-time
             driver to draw agents mid-edge). When None, agents are drawn at
             their current node.
+        scale: marker area, line width, font, and label spacing scale relative
+            to the standard video frame (marker areas scale quadratically).
+        labels_inside: turn labels inward near map borders for compact figures.
+        show_source: draw the source star as well as the agents' circles.
+        draw_background: draw terrain and roads and set terrain bounds. Set
+            False to overlay the same actors on an existing indoor floor plan.
+
+    Returns the terrain ScalarMappable for a matching height colour bar.
     """
     pos = nx.get_node_attributes(ground_truth, 'pos')
     all_heights = [d.get('height', 0) for _, d in ground_truth.nodes(data=True)]
@@ -216,28 +226,37 @@ def render_frame(env_map, ground_truth, agents, turn_idx, output_path,
     cell_w = xs[1] - xs[0] if len(xs) > 1 else 1
     cell_h = ys[1] - ys[0] if len(ys) > 1 else 1
 
-    # A 9x9-inch map panel plus a compact legend column. Manual positioning
-    # avoids the large vertical whitespace produced by tight_layout + equal
-    # aspect while retaining identical dimensions across frames.
-    fig, ax = plt.subplots(figsize=(12, 10))
-    ax.set_position([0.025, 0.04, 0.75, 0.90])
+    if draw_background:
+        for node, data in ground_truth.nodes(data=True):
+            x, y = pos[node]
+            color = "black" if data.get("type") == "obstacle" else cmap_terrain(norm(data.get('height', 0)))
+            ax.add_patch(patches.Rectangle(
+                (x - cell_w / 2, y - cell_h / 2), cell_w, cell_h,
+                linewidth=0, facecolor=color))
 
-    for node, data in ground_truth.nodes(data=True):
-        x, y = pos[node]
-        color = "black" if data.get("type") == "obstacle" else cmap_terrain(norm(data.get('height', 0)))
-        ax.add_patch(patches.Rectangle(
-            (x - cell_w / 2, y - cell_h / 2), cell_w, cell_h,
-            linewidth=0, facecolor=color))
-
-    road_segments = [[pos[u], pos[v]] for u, v, d in ground_truth.edges(data=True) if d.get('is_road')]
-    if road_segments:
-        ax.add_collection(mc.LineCollection(road_segments, colors='#404040', linewidths=2.0, zorder=4))
+        road_segments = [[pos[u], pos[v]] for u, v, d in ground_truth.edges(data=True) if d.get('is_road')]
+        if road_segments:
+            ax.add_collection(mc.LineCollection(road_segments, colors='#404040', linewidths=2.0 * scale, zorder=4))
 
     def _apos(i, agent):
         return agent_xy[i] if agent_xy is not None else pos[agent.position]
 
     agent_points = [_apos(i, agent) for i, agent in enumerate(agents)]
-    agent_label_offsets = _stacked_agent_label_offsets(agent_points)
+    agent_label_offsets = _stacked_agent_label_offsets(
+        agent_points, base_offset=16 * scale, spacing=20 * scale)
+
+    def label_placement(point, offset):
+        if not labels_inside:
+            return offset, "center", "bottom"
+        # No changes to physical positions: only move the text into the map.
+        x_fraction = (point[0] - xs[0]) / (xs[-1] - xs[0] or 1)
+        y_fraction = (point[1] - ys[0]) / (ys[-1] - ys[0] or 1)
+        if not draw_background and ax.yaxis_inverted():
+            y_fraction = 1 - y_fraction
+        dx = 6 * scale if x_fraction < 0.15 else -6 * scale if x_fraction > 0.85 else 0
+        ha = "left" if dx > 0 else "right" if dx < 0 else "center"
+        dy = -offset[1] if y_fraction > 0.85 else offset[1]
+        return (dx, dy), ha, "top" if dy < 0 else "bottom"
 
     # Trajectory (solid) + planned path (dotted), colored per agent identity.
     for i, agent in enumerate(agents):
@@ -247,18 +266,18 @@ def render_frame(env_map, ground_truth, agents, turn_idx, output_path,
             traj_pts.append(agent_xy[i])   # extend the trail to the interpolated point
         if len(traj_pts) >= 2:
             segs = [[traj_pts[k], traj_pts[k + 1]] for k in range(len(traj_pts) - 1)]
-            ax.add_collection(mc.LineCollection(segs, colors=color, linewidths=4.0, zorder=5))
+            ax.add_collection(mc.LineCollection(segs, colors=color, linewidths=4.0 * scale, zorder=5))
         if agent.alive and len(agent.planned_path) >= 2:
             segs = [[pos[agent.planned_path[k]], pos[agent.planned_path[k + 1]]]
                     for k in range(len(agent.planned_path) - 1)]
-            ax.add_collection(mc.LineCollection(segs, colors=color, linewidths=3.2,
+            ax.add_collection(mc.LineCollection(segs, colors=color, linewidths=3.2 * scale,
                                                 zorder=6, linestyles='dotted'))
 
     # Source (star), targets (X by known/eliminated color), agents (circle).
     src_pts = [pos[n] for n, d in env_map.nodes(data=True) if d.get("type") == "source"]
-    if src_pts:
+    if src_pts and show_source:
         ax.scatter([p[0] for p in src_pts], [p[1] for p in src_pts], marker='*',
-                   s=420, facecolor='gold', edgecolor='black', linewidths=1.2, zorder=10)
+                   s=420 * scale ** 2, facecolor='gold', edgecolor='black', linewidths=1.2 * scale, zorder=10)
 
     # Agents first, then targets ON TOP: when an agent occupies a target node
     # (e.g. it just engaged, or died there) the target's revealed type stays
@@ -266,16 +285,18 @@ def render_frame(env_map, ground_truth, agents, turn_idx, output_path,
     for i, agent in enumerate(agents):
         point = agent_points[i]
         color = DEAD_AGENT_COLOR if not agent.alive else _agent_color(i)
-        ax.scatter([point[0]], [point[1]], marker='o', s=140,
-                   facecolor=color, edgecolor='black', linewidths=1.2, zorder=11)
+        ax.scatter([point[0]], [point[1]], marker='o', s=140 * scale ** 2,
+                   facecolor=color, edgecolor='black', linewidths=1.2 * scale,
+                   zorder=11, clip_on=not labels_inside)
+        offset, ha, va = label_placement(point, agent_label_offsets[i])
         ax.annotate(
             _agent_capability_text(i, agent),
             xy=point,
-            xytext=agent_label_offsets[i],
+            xytext=offset,
             textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=9,
+            ha=ha,
+            va=va,
+            fontsize=9 * scale,
             fontweight="bold",
             color="black",
             bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
@@ -290,16 +311,17 @@ def render_frame(env_map, ground_truth, agents, turn_idx, output_path,
         point = pos[n]
         color = "red" if state == "target_unreached" else DEAD_AGENT_COLOR
         target_type = d.get("rps_type", UNKNOWN_TYPE)
-        ax.scatter([point[0]], [point[1]], marker='X', s=200,
-                   facecolor=color, edgecolor='black', linewidths=1.0, zorder=12)
+        ax.scatter([point[0]], [point[1]], marker='X', s=200 * scale ** 2,
+                   facecolor=color, edgecolor='black', linewidths=1.0 * scale, zorder=12)
+        offset, ha, va = label_placement(point, (0, 7 * scale))
         ax.annotate(
             _target_type_text(target_type),
             xy=point,
-            xytext=(0, 7),
+            xytext=offset,
             textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=9,
+            ha=ha,
+            va=va,
+            fontsize=9 * scale,
             fontweight="bold",
             color="black",
             bbox=dict(boxstyle="round,pad=0.18", facecolor="white",
@@ -307,14 +329,25 @@ def render_frame(env_map, ground_truth, agents, turn_idx, output_path,
             zorder=14,
         )
 
+    if draw_background:
+        ax.set_xlim(xs[0] - cell_w / 2, xs[-1] + cell_w / 2)
+        ax.set_ylim(ys[0] - cell_h / 2, ys[-1] + cell_h / 2)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    return plt.cm.ScalarMappable(norm=norm, cmap=cmap_terrain)
+
+
+def render_frame(env_map, ground_truth, agents, turn_idx, output_path,
+                 title=None, agent_xy=None):
+    """Save the shared capability-based evaluation scene as a video frame."""
+    # A 9x9-inch map panel plus a compact legend column. Manual positioning
+    # keeps the video canvas and map dimensions fixed across frames.
+    fig, ax = plt.subplots(figsize=(12, 10))
+    ax.set_position([0.025, 0.04, 0.75, 0.90])
+    draw_frame(ax, env_map, ground_truth, agents, agent_xy=agent_xy)
     ax.legend(handles=_legend_handles(), loc="upper left",
               bbox_to_anchor=(1.01, 1.0), fontsize=10,
               frameon=True, title="legend")
-
-    ax.set_xlim(xs[0] - cell_w / 2, xs[-1] + cell_w / 2)
-    ax.set_ylim(ys[0] - cell_h / 2, ys[-1] + cell_h / 2)
-    ax.set_aspect('equal')
-    ax.axis('off')
     plt.title(title if title is not None else f"Turn {turn_idx}")
     # Do not call tight_layout: it recenters the equal-aspect map inside the
     # legend-reserved rectangle and recreates the excessive whitespace.
