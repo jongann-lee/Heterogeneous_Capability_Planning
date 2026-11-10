@@ -52,10 +52,12 @@ from simulation.rendering import draw_frame, _agent_color, _legend_handles
 
 
 FIGSIZE = (5.6, 4.8)
-# Match the outdoor axes' physical width and height to avoid equal-aspect
-# centering adding whitespace on either side of the square terrain.
-MAP_RECT = (0.025, 0.035, 0.775, 0.905)
-INDOOR_MAP_RECT = (0.025, 0.105, 0.95, 0.83)
+MAP_LABEL_SIZE = 9.5
+LEGEND_SIZE = 10
+TITLE_SIZE = 15
+# Reserve a compact left column for outdoor legends and the height scale.
+MAP_RECT = (0.235, 0.035, 0.74, 0.905)
+INDOOR_MAP_RECT = (0.025, 0.14, 0.95, 0.79)
 MAPS = (
     ("wv", "West Virginia (WV)", "WV_tobler_viewshed_64.pkl.gz",
      "wv_factorial_test_v1.json"),
@@ -79,6 +81,11 @@ def draw_scene(ax, graph, suite, agents, targets, *, indoor=False):
     image = draw_frame(
         ax, scene, scene, team, scale=0.8, labels_inside=True,
         show_source=False, draw_background=not indoor)
+    for label in ax.texts:
+        label.set_fontsize(MAP_LABEL_SIZE)
+        if label.get_text().startswith("T:"):
+            x_offset, y_offset = label.get_position()
+            label.set_position((x_offset, y_offset + (2 if y_offset >= 0 else -2)))
     # Replace the overlapping per-agent circles with a single physical-size
     # pie so every co-located agent is visible, independent of map coordinates.
     for collection in ax.collections:
@@ -125,10 +132,12 @@ def draw_outdoor(fig, ax, graph, suite, agents, targets):
     # Rasterize only the terrain to avoid seams between adjacent PDF cells.
     for patch in ax.patches:
         patch.set_rasterized(True)
-    colorbar = fig.colorbar(image, cax=fig.add_axes((0.835, 0.13, 0.023, 0.57)))
-    colorbar.set_label("Height", labelpad=5)
+    colorbar = fig.colorbar(image, cax=fig.add_axes((0.055, 0.12, 0.028, 0.43)))
+    colorbar.set_label("Height", fontsize=12, labelpad=7)
+    colorbar.ax.yaxis.set_label_position("left")
+    colorbar.ax.yaxis.set_ticks_position("right")
     colorbar.outline.set_linewidth(0.6)
-    colorbar.ax.tick_params(labelsize=9, width=0.6)
+    colorbar.ax.tick_params(labelsize=11, width=0.6)
     draw_legend(fig, agents)
 
 
@@ -149,30 +158,48 @@ def draw_indoor(ax, metadata):
 
 def draw_layout(fig, ax, graph, suite, agents, targets):
     draw_scene(ax, graph, suite, agents, targets, indoor=True)
+    # Use physical label clearance instead of a percentage of the tall raster.
+    # Most top-room labels fit above their targets; the source-adjacent target
+    # needs its label below to keep the team pie visible at the larger font.
+    ax.apply_aspect()
+    points_per_pixel = 72 / fig.dpi
+    source_x, source_y = ax.transData.transform(graph.nodes[suite.source_position]["pos"])
+    for label in ax.texts:
+        if not label.get_text().startswith("T:"):
+            continue
+        x, y = ax.transData.transform(label.xy)
+        top_gap = (ax.bbox.ymax - y) * points_per_pixel
+        dx = (x - source_x) * points_per_pixel
+        dy = (y - source_y) * points_per_pixel
+        below = top_gap < 26 or abs(dx) < 25 and -35 < dy < 0
+        label.set_position((label.get_position()[0], -8 if below else 8))
+        label.set_va("top" if below else "bottom")
     draw_legend(fig, agents, indoor=True)
 
 
 def draw_legend(fig, agents, *, indoor=False):
     handles = [Line2D(
-        [], [], linestyle="none", marker="o", markersize=7,
+        [], [], linestyle="none", marker="o", markersize=8,
         markerfacecolor="white", markeredgecolor="black", label="Agents:",
     )]
     for index, capabilities in enumerate(agents.capabilities):
         values = ",".join(map(str, sorted(capabilities)))
         handles.append(Line2D(
-            [], [], linestyle="none", marker="o", markersize=7,
+            [], [], linestyle="none", marker="o", markersize=8,
             markerfacecolor=_agent_color(index), markeredgecolor="black",
             markeredgewidth=0.7, label=f"A{index}: {{{values}}}",
         ))
     target_handle = _legend_handles()[1]
     target_handle.set_label("Tasks")
     handles.append(target_handle)
+    if not indoor:
+        handles.append(Line2D([], [], color="#404040", linewidth=1.6, label="Roads"))
     legend = fig.legend(
         handles=handles, loc="upper center" if indoor else "upper left",
-        bbox_to_anchor=(0.5, 0.085) if indoor else (0.805, 0.91),
-        ncols=(len(handles) + 1) // 2 if indoor else 1, fontsize=8,
-        frameon=False, borderaxespad=0, handletextpad=0.5, labelspacing=0.5,
-        handlelength=1, columnspacing=1.2,
+        bbox_to_anchor=(0.5, 0.115) if indoor else (0.025, 0.91),
+        ncols=(len(handles) + 1) // 2 if indoor else 1, fontsize=LEGEND_SIZE,
+        frameon=False, borderaxespad=0, handletextpad=0.4, labelspacing=0.5,
+        handlelength=1, columnspacing=0.7,
     )
     legend.get_texts()[0].set_fontweight("bold")
 
@@ -197,8 +224,8 @@ def render_map(name, title, map_name, suite_name, destination):
             draw_outdoor(fig, ax, graph, suite, agents, targets)
         ax.set_aspect("equal", adjustable="box")
         ax.set_axis_off()
-        fig.text(0.5 if name == "kth" else 0.4125, 0.99, title,
-                 ha="center", va="top", fontsize=12)
+        fig.text(0.5 if name == "kth" else MAP_RECT[0] + MAP_RECT[2] / 2,
+                 0.99, title, ha="center", va="top", fontsize=TITLE_SIZE)
         description = (
             f"{suite_path.name}: {agents.id} ({agents.agent_count} agents), "
             f"{targets.id} ({targets.target_count} tasks)"

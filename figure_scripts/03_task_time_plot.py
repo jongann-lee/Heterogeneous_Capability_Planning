@@ -1,15 +1,18 @@
-"""Compare task discovery and completion progress for two detailed KTH runs.
+"""Compare task discovery and completion progress for three detailed KTH runs.
 
     uv run python figure_scripts/03_task_time_plot.py
 
-Reads the two JSONs in outputs/evaluation/KTH-detailed and writes
-figure_scripts/outputs/03_KTH_task_time.pdf, overwriting it on reruns.
+Reads scout-then-engage.json, 1109-no-staging.json, and 1103-default.json
+from outputs/evaluation/KTH-detailed, in that panel order, and writes
+figure_scripts/outputs/03_KTH_task_time.pdf and .svg, overwriting on reruns.
 --results-dir and --output select other input and output paths.
+The SVG is 600 px wide, preserves proportions, and retains editable text and
+vector curves. All three panels have equal heights and matching axis layouts.
 
 Blue shows cumulative tasks discovered. Red shows total tasks minus cumulative
 completions (tasks remaining), so it decreases as tasks are completed. Curves
 use the saved post-event timeline, including simultaneous events, and stop at
-each run's makespan. Both panels share identical time and integer count axes.
+each run's makespan. All panels share identical time and integer count axes.
 Time is the prepared map's traversal time, not wall-clock time or seconds.
 """
 
@@ -20,6 +23,7 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import sys
 
 import matplotlib
 
@@ -30,9 +34,16 @@ from matplotlib.ticker import MaxNLocator
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from figure_scripts.export_utils import save_pdf_and_svg
+
+
 DISCOVERED_COLOR = "#7297B5"
 REMAINING_COLOR = "#B97676"
-POLICY_NAMES = {"scout-then-execute": "Scout-Then-Engage", "learned": "CAAT Graph + HGT"}
+POLICY_NAMES = {"scout-then-execute": "Scout Then Engage", "learned": "CAAT Graph + HGT"}
+RUN_FILES = ("scout-then-engage.json", "1109-no-staging.json", "1103-default.json")
 
 
 @dataclass(frozen=True)
@@ -115,49 +126,68 @@ def load_run(path):
 
 
 def validate_runs(runs):
-    if len(runs) != 2:
-        raise ValueError("expected exactly two detailed JSONs in --results-dir")
-    first, second = runs
-    if not first.map_hash or first.map_hash != second.map_hash:
-        raise ValueError("detailed runs must use the same prepared map")
-    if not first.instance or first.instance != second.instance:
-        raise ValueError("detailed runs must use the same agent and task setup")
-    if first.total != second.total or not first.time_units or first.time_units != second.time_units:
-        raise ValueError("detailed runs must have the same task count and time units")
+    if len(runs) != len(RUN_FILES):
+        raise ValueError("expected exactly three detailed runs")
+    first = runs[0]
+    for run, expected_policy in zip(runs, ("scout-then-execute", "learned", "learned")):
+        if run.policy != expected_policy:
+            raise ValueError(f"{run.path}: expected policy {expected_policy}")
+        if not first.map_hash or first.map_hash != run.map_hash:
+            raise ValueError("detailed runs must use the same prepared map")
+        if not first.instance or first.instance != run.instance:
+            raise ValueError("detailed runs must use the same agent and task setup")
+        if first.total != run.total or not first.time_units or first.time_units != run.time_units:
+            raise ValueError("detailed runs must have the same task count and time units")
+
+
+def run_title(run):
+    if run.path.name == "1109-no-staging.json":
+        return "CAAT Graph + HGT (No Staging)"
+    return POLICY_NAMES.get(run.policy, run.policy)
 
 
 def render_plot(runs, output):
-    fig, axes = plt.subplots(2, 1, figsize=(6.4, 5.5), sharex=True, sharey=True)
+    panel_count = len(runs)
+    figure_height = 2.8 * panel_count + 0.4
+    fig, axes = plt.subplots(
+        panel_count, 1, figsize=(6.4, figure_height), sharex=True, sharey=True,
+        gridspec_kw={"height_ratios": (1,) * panel_count},
+    )
     try:
-        fig.subplots_adjust(left=0.12, right=0.98, bottom=0.11, top=0.88, hspace=0.30)
+        # Fixed physical header/footer margins preserve each panel's size as
+        # another comparison is added, including in the 600 px-wide SVG.
+        fig.subplots_adjust(left=0.12, right=0.98, bottom=0.66 / figure_height,
+                            top=1 - 0.72 / figure_height, hspace=0.50)
         horizon = math.ceil(max(run.makespan for run in runs) / 100) * 100 or 1
         for ax, run in zip(axes, runs):
             ax.step(run.times, run.discovered, where="post", color=DISCOVERED_COLOR,
                     linewidth=2, label="Tasks discovered", zorder=3)
             ax.step(run.times, run.remaining, where="post", color=REMAINING_COLOR,
                     linewidth=2, label="Tasks remaining", zorder=3)
-            ax.set_title(POLICY_NAMES.get(run.policy, run.policy), loc="left", fontsize=11)
+            ax.set_title(run_title(run), loc="left", fontsize=11)
             ax.set_xlim(0, horizon)
             ax.set_ylim(-0.3, run.total + 0.3)
             ax.yaxis.set_major_locator(MaxNLocator(nbins=8, integer=True))
             ax.xaxis.set_major_locator(MaxNLocator(nbins=7, integer=True))
             ax.set_ylabel("Number of tasks", fontsize=10)
+            ax.set_xlabel("Time", fontsize=10)
             ax.tick_params(labelsize=9)
+            ax.tick_params(axis="x", labelbottom=True)
             ax.grid(color="#DDDDDD", linewidth=0.6, zorder=0)
             ax.spines[["top", "right"]].set_visible(False)
-        axes[-1].set_xlabel("Time", fontsize=10)
         handles, labels = axes[0].get_legend_handles_labels()
         fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.55, 0.99),
                    ncols=2, frameon=False, fontsize=10)
         output.parent.mkdir(parents=True, exist_ok=True)
-        with output.open("wb") as stream:
-            fig.savefig(stream, format="pdf", bbox_inches=None, metadata={
+        return save_pdf_and_svg(
+            fig, output, metadata={
                 "Title": "KTH task discovery and completion over time",
                 "Subject": ("Blue: cumulative discoveries. Red: total tasks minus completions. "
                             "Time: " + runs[0].time_units + ". Inputs: "
                             + "; ".join(str(run.path) for run in runs)),
                 "Creator": "figure_scripts/03_task_time_plot.py",
-            })
+            },
+        )
     finally:
         plt.close(fig)
 
@@ -167,18 +197,20 @@ def main(argv=None):
     parser.add_argument("--results-dir", type=Path,
                         default=ROOT / "outputs" / "evaluation" / "KTH-detailed")
     parser.add_argument("--output", type=Path,
-                        default=Path(__file__).resolve().parent / "outputs" / "03_KTH_task_time.pdf")
+                        default=Path(__file__).resolve().parent / "outputs" / "03_KTH_task_time.pdf",
+                        help="PDF path; a 600 px-wide SVG is also written alongside it")
     args = parser.parse_args(argv)
-    paths = sorted(args.results_dir.expanduser().resolve().glob("*.json"))
+    paths = [args.results_dir.expanduser().resolve() / name for name in RUN_FILES]
     runs = [load_run(path) for path in paths]
     validate_runs(runs)
     output = args.output.expanduser().resolve()
     with plt.rc_context({"font.family": "DejaVu Sans", "pdf.fonttype": 42,
                          "savefig.bbox": None}):
-        render_plot(runs, output)
+        svg_output = render_plot(runs, output)
     print(output)
+    print(svg_output)
     for run in runs:
-        print(f"  {POLICY_NAMES.get(run.policy, run.policy)}: {run.total} tasks, "
+        print(f"  {run_title(run)}: {run.total} tasks, "
               f"makespan {run.makespan:g}; {run.path.name}")
 
 

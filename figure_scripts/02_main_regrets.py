@@ -49,15 +49,18 @@ from figure_scripts.export_utils import save_pdf_and_svg
 
 
 FIGSIZE = (5.6, 4.0)
+LABEL_SIZE = 12
+TICK_SIZE = 11
+TITLE_SIZE = 15
 POLICIES = ("fi-opt", "scout-then-execute", "learned")
-LABELS = ("Oracle", "Scout-Then-Engage", "CAAT Graph + HGT")
+LABELS = ("Oracle", "Scout Then Engage", "CAAT Graph + HGT")
 COLORS = ("#A7ABB0", "#7A9E7E", "#0072B2")
-# File order is bar order: oracle, Scout-Then-Engage, and 1103.
+# File order is bar order: oracle, Scout Then Engage, and 1103.
 RESULT_FILES = {
     "WA": (
         "WA/WA-Oracle.json",
         "WA/WA-scout-then-execute.json",
-        "WA/WA-1103-position-best.json",
+        "WA/WA-1103-position-best-rerun.json",
     ),
     "WV": (
         "2026-09-09-FI-OPT.json",
@@ -171,18 +174,18 @@ def render_chart(map_name, stats, paths, start_note, destination, y_max):
         ax.axhline(1, color="#555555", linestyle="--", linewidth=0.9, zorder=2)
         ax.set_ylim(0, y_max)
         ax.set_xlim(-0.6, 2.6)
-        ax.set_ylabel("Regret (makespan / oracle)", fontsize=10)
-        ax.set_xticks(range(3), [label.replace("-Engage", "-\nEngage")
-                                for label in LABELS], fontsize=10)
+        ax.set_ylabel("Regret (makespan / oracle)", fontsize=LABEL_SIZE)
+        ax.set_xticks(range(3), [label.replace("Then Engage", "Then\nEngage")
+                                for label in LABELS], fontsize=LABEL_SIZE)
         ax.yaxis.set_major_locator(MultipleLocator(0.5))
-        ax.tick_params(axis="y", labelsize=9)
+        ax.tick_params(axis="y", labelsize=TICK_SIZE)
         ax.grid(axis="y", color="#DADADA", linewidth=0.6, zorder=0)
         ax.spines[["top", "right"]].set_visible(False)
         for bar, item in zip(bars, stats):
             ax.text(bar.get_x() + bar.get_width() / 2,
                     item.mean + item.std + 0.035 * y_max,
-                    f"{item.mean:.2f}", ha="center", va="bottom", fontsize=10)
-        fig.text(0.56, 0.96, TITLES[map_name], ha="center", va="top", fontsize=12)
+                    f"{item.mean:.2f}", ha="center", va="bottom", fontsize=LABEL_SIZE)
+        fig.text(0.56, 0.96, TITLES[map_name], ha="center", va="top", fontsize=TITLE_SIZE)
         subject = (
             "Metric: per-scenario makespan / FI-OPT; bars: mean; errors: population SD. "
             + "Inputs: " + "; ".join(str(path) for path in paths)
