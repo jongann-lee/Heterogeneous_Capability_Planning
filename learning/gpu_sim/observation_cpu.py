@@ -179,6 +179,8 @@ def attach_task_graph_fields(observation: PlannerObservation,
                              agent_remaining_times: torch.Tensor | None = None,
                              edge_normalization: str = RAW_EDGE_NORMALIZATION,
                              edge_normalization_epsilon: float = 1.0e-6,
+                             use_agent_alive: bool = True,
+                             use_task_completed: bool = True,
                              ) -> PlannerObservation:
     """Attach the geometry-free heterogeneous task-graph view in-place.
 
@@ -192,6 +194,15 @@ def attach_task_graph_fields(observation: PlannerObservation,
     agent = observation.agent_features
     target = observation.target_features
     action = observation.action_features
+    # Fixed tensor slots may remain allocated, but inactive entities have no
+    # task-graph nodes, incident relations, or normalization contributions.
+    if not use_agent_alive:
+        observation.agent_mask = observation.agent_mask & agent[..., 2].bool()
+    if not use_task_completed:
+        observation.target_mask = observation.target_mask & ~target[..., 3].bool()
+    observation.feasible_action_mask = (
+        observation.feasible_action_mask & observation.agent_mask[..., None]
+        & observation.action_mask[:, None])
     num_target_types = agent.shape[-1] - 9
 
     remaining_feature = (
@@ -318,6 +329,8 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
                       replan_transit: bool = False,
                       edge_normalization: str | None = None,
                       edge_normalization_epsilon: float | None = None,
+                      use_agent_alive: bool = True,
+                      use_task_completed: bool = True,
                       ) -> PlannerObservation:
     """Build one observation using only ``graph`` (the planner's view)."""
     defaults = None
@@ -546,7 +559,9 @@ def build_observation(graph: nx.Graph, agents, num_target_types: int,
         action_target_distances=task_ct_distance.unsqueeze(0),
         agent_remaining_times=raw_remaining.unsqueeze(0),
         edge_normalization=edge_normalization,
-        edge_normalization_epsilon=edge_normalization_epsilon)
+        edge_normalization_epsilon=edge_normalization_epsilon,
+        use_agent_alive=use_agent_alive,
+        use_task_completed=use_task_completed)
 
 
 def batch_observations(items: list[PlannerObservation]) -> PlannerObservation:

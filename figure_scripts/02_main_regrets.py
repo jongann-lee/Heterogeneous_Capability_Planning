@@ -1,4 +1,4 @@
-"""Plot one three-policy regret comparison PDF and SVG for each map.
+"""Plot one four-policy regret comparison PDF and SVG for each map.
 
 Run from any working directory::
 
@@ -8,7 +8,9 @@ Outputs: figure_scripts/outputs/02_{WA,WV,KTH}_regret.pdf and .svg. SVGs are
 600 px wide with preserved proportions, editable text, and vector plot elements.
 Reruns overwrite both formats. --results-dir and --output-dir override the
 default directories.
-The learned-policy default is 1103; KTH uses the factorial v2 results.
+The learned-policy default is 1103; KTH uses the factorial v2 results. Policy
+colors are identified by a shared legend on WA only, without labels below
+individual bars. Every map keeps the same page dimensions and plot bounds.
 
 Regret here is makespan / FI-OPT, i.e. the stored normalized regret plus one.
 Each bar averages the per-scenario ratios, with population standard deviation
@@ -46,30 +48,34 @@ if str(ROOT) not in sys.path:
 
 from learning.analyze import analyze_evaluation
 from figure_scripts.export_utils import save_pdf_and_svg
+from figure_scripts.policy_labels import OPT_BY_PART_LABEL
 
 
 FIGSIZE = (5.6, 4.0)
 LABEL_SIZE = 12
+LEGEND_SIZE = 14
 TICK_SIZE = 11
-TITLE_SIZE = 15
-POLICIES = ("fi-opt", "scout-then-execute", "learned")
-LABELS = ("Oracle", "Scout Then Engage", "CAAT Graph + HGT")
-COLORS = ("#A7ABB0", "#7A9E7E", "#0072B2")
-# File order is bar order: oracle, Scout Then Engage, and 1103.
+POLICIES = ("fi-opt", "scout-then-execute", "opt-by-part", "learned")
+LABELS = ("Oracle", "Scout Then Engage", OPT_BY_PART_LABEL, "CAAT Graph + HGT")
+COLORS = ("#A7ABB0", "#B97676", "#7A9E7E", "#0072B2")
+# File order is bar order: Oracle, Scout Then Engage, Engage While Scout, 1103.
 RESULT_FILES = {
     "WA": (
         "WA/WA-Oracle.json",
         "WA/WA-scout-then-execute.json",
+        "WA/WA-opt-by-part.json",
         "WA/WA-1103-position-best-rerun.json",
     ),
     "WV": (
-        "2026-09-09-FI-OPT.json",
-        "2026-09-09-scout-then-execute.json",
+        "WV/2026-09-09-FI-OPT.json",
+        "WV/2026-09-09-scout-then-execute.json",
+        "WV/WV-opt-by-part.json",
         "WV/WV-1103-position-best.json",
     ),
     "KTH": (
         "KTH-Factorial-v2/fi-opt.json",
         "KTH-Factorial-v2/scout-then-execute.json",
+        "KTH-Factorial-v2/opt-by-part.json",
         "KTH-Factorial-v2/1103-position-pair-staging-best.json",
     ),
 }
@@ -164,19 +170,26 @@ def validate_comparison(map_name, payloads):
 def render_chart(map_name, stats, paths, start_note, destination, y_max):
     fig = plt.figure(figsize=FIGSIZE, facecolor="white")
     try:
-        ax = fig.add_axes((0.15, 0.17, 0.82, 0.73))
+        ax = fig.add_axes((0.15, 0.07, 0.82, 0.83))
         bars = ax.bar(
-            range(3), [item.mean for item in stats],
+            range(len(POLICIES)), [item.mean for item in stats],
             yerr=[item.std for item in stats], width=0.62, color=COLORS,
             edgecolor="black", linewidth=0.6, capsize=4,
             error_kw={"elinewidth": 1.1, "capthick": 1.1}, zorder=3,
         )
         ax.axhline(1, color="#555555", linestyle="--", linewidth=0.9, zorder=2)
         ax.set_ylim(0, y_max)
-        ax.set_xlim(-0.6, 2.6)
+        ax.set_xlim(-0.6, len(POLICIES) - 0.4)
         ax.set_ylabel("Regret (makespan / oracle)", fontsize=LABEL_SIZE)
-        ax.set_xticks(range(3), [label.replace("Then Engage", "Then\nEngage")
-                                for label in LABELS], fontsize=LABEL_SIZE)
+        ax.set_xticks([])
+        if map_name == "WA":
+            # Matplotlib fills legend columns first. Reorder so the legend
+            # reads in bar order across its two rows.
+            order = (0, 2, 1, 3)
+            fig.legend([bars[index] for index in order], [LABELS[index] for index in order],
+                       loc="upper center", bbox_to_anchor=(0.56, 0.995), ncols=2,
+                       frameon=False, fontsize=LEGEND_SIZE, borderaxespad=0,
+                       handlelength=1, handletextpad=0.4, columnspacing=0.9, labelspacing=0.25)
         ax.yaxis.set_major_locator(MultipleLocator(0.5))
         ax.tick_params(axis="y", labelsize=TICK_SIZE)
         ax.grid(axis="y", color="#DADADA", linewidth=0.6, zorder=0)
@@ -185,7 +198,6 @@ def render_chart(map_name, stats, paths, start_note, destination, y_max):
             ax.text(bar.get_x() + bar.get_width() / 2,
                     item.mean + item.std + 0.035 * y_max,
                     f"{item.mean:.2f}", ha="center", va="bottom", fontsize=LABEL_SIZE)
-        fig.text(0.56, 0.96, TITLES[map_name], ha="center", va="top", fontsize=TITLE_SIZE)
         subject = (
             "Metric: per-scenario makespan / FI-OPT; bars: mean; errors: population SD. "
             + "Inputs: " + "; ".join(str(path) for path in paths)

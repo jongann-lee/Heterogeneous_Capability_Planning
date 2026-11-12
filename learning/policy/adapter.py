@@ -24,6 +24,9 @@ class LearnedPolicyAdapter:
         self.edge_normalization = model_config.edge_normalization
         self.edge_normalization_epsilon = (
             model_config.edge_normalization_epsilon)
+        task_graph = model_config.architecture == "task_graph"
+        self.use_agent_alive = model_config.use_agent_alive or not task_graph
+        self.use_task_completed = model_config.use_task_completed or not task_graph
         self.device = device or next(model.parameters()).device
         self.decision_log_probs = []
         self.decision_entropies = []
@@ -68,6 +71,8 @@ class LearnedPolicyAdapter:
             candidates=candidates, transit=transit, clock=self._clock,
             candidate_config=self.candidate_config,
             replan_transit=True,
+            use_agent_alive=self.use_agent_alive,
+            use_task_completed=self.use_task_completed,
             edge_normalization=self.edge_normalization,
             edge_normalization_epsilon=(
                 self.edge_normalization_epsilon)).to(self.device)

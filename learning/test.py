@@ -181,6 +181,8 @@ def _gpu_episode(model, config, env, truth, agents, device, terrain=None,
         TensorObservationBuilder(
             world, config.model.num_target_types,
             task_graph=config.model.architecture == "task_graph",
+            use_agent_alive=config.model.use_agent_alive,
+            use_task_completed=config.model.use_task_completed,
             edge_normalization=config.model.edge_normalization,
             edge_normalization_epsilon=(
                 config.model.edge_normalization_epsilon)),
@@ -273,6 +275,8 @@ def _gpu_suite_records(model, config, cases, device, progress=None,
         builder = TensorObservationBuilder(
             world, config.model.num_target_types,
             task_graph=config.model.architecture == "task_graph",
+            use_agent_alive=config.model.use_agent_alive,
+            use_task_completed=config.model.use_task_completed,
             edge_normalization=config.model.edge_normalization,
             edge_normalization_epsilon=(
                 config.model.edge_normalization_epsilon))
@@ -502,6 +506,7 @@ def _classical_episode(policy_name, config, env, truth, agents,
                        render_dir=None, render_dt=1.0,
                        frame_renderer=None, task_progress=None):
     from planning.full_information import solve_full_information
+    from planning.policies.opt_by_part import OptByPartPolicy
     from planning.policies.scout_then_execute import ScoutThenExecutePolicy
     from simulation.engine import run_simulation
 
@@ -528,6 +533,8 @@ def _classical_episode(policy_name, config, env, truth, agents,
         }
     elif policy_name == "scout-then-execute":
         policy = ScoutThenExecutePolicy()
+    elif policy_name == "opt-by-part":
+        policy = OptByPartPolicy()
     else:
         raise ValueError(f"unknown classical policy: {policy_name}")
 
@@ -540,7 +547,7 @@ def _classical_episode(policy_name, config, env, truth, agents,
         frame_renderer=frame_renderer,
         measure_policy_time=policy_name != "fi-opt",
     )
-    if policy_name == "scout-then-execute":
+    if policy_name in {"scout-then-execute", "opt-by-part"}:
         diagnostics = dict(policy.diagnostics)
     normalized_regret = (
         result["makespan"] / oracle_makespan - 1.0
@@ -658,7 +665,7 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
              render_dt=1.0, policy="learned", episodes=1, progress=False,
              map_path=None, allow_map_mismatch=False,
              allow_feature_schema_mismatch=False, detailed=False):
-    if policy not in {"learned", "fi-opt", "scout-then-execute"}:
+    if policy not in {"learned", "fi-opt", "scout-then-execute", "opt-by-part"}:
         raise ValueError(f"unknown evaluation policy: {policy}")
     if episodes < 1:
         raise ValueError("episodes must be positive")
@@ -919,7 +926,7 @@ def main(argv=None, *, detailed=False, default_suite="development",
         help="timestamped checkpoint directory or weights file (learned policy only)")
     parser.add_argument(
         "--policy", default="learned",
-        choices=["learned", "fi-opt", "scout-then-execute"],
+        choices=["learned", "fi-opt", "scout-then-execute", "opt-by-part"],
         help="policy to evaluate; learned is the default")
     parser.add_argument(
         "--episodes", type=int, default=1,

@@ -97,12 +97,35 @@ for rectangular or sparse maps. A constant axis produces zero. Positions
 refer to the last reached node while an agent is in transit. CPU and CUDA
 observations use the same convention. Target locations are known even when
 their types are hidden, so target coordinates use only planner-visible state.
-Set `use_position: false` to recover the original three agent features and two
-target features. The toggle is recorded in both model config and feature-schema
-metadata, and evaluation rejects incompatible overrides. The current config
-disables position inputs. Agent-only position checkpoints
+`model.use_agent_alive` and `model.use_task_completed` independently control
+the alive input on agent nodes and completed input on target nodes. With both
+enabled, the base inputs are `[alive, remaining_transit_time, scout_capable]`
+and `[completed, type_known]`. Turning off `use_agent_alive` removes that
+column and excludes dead agents from the task graph. Turning off
+`use_task_completed` removes that column and excludes completed targets.
+Their incident relations are masked before travel-time normalization, graph
+messages, and critic pooling. CPU and CUDA retain masked tensor slots for
+batching; these slots are not active graph entities. Completed tasks already
+generate no active target, observation, or staging actions.
+
+With both status flags off, the base inputs are `[remaining_transit_time,
+scout_capable]` and `[type_known]`; `use_position: true` appends two coordinates
+to each. Canonical observations retain status for simulator and mask logic,
+but the disabled columns never reach the learned entity encoders. The current
+config disables both status inputs. Old checkpoint configs that omit these
+options default to `true`, retaining their original input widths and graph
+behavior. Position and both status toggles are recorded in model config and
+feature-schema metadata; evaluation rejects incompatible overrides.
+Agent-only position checkpoints
 are unsupported. An existing running training process retains its loaded
 architecture; the corrected ablation needs a new training run.
+
+These feature toggles do not change the return: death and incompletion
+penalties are independent of node inputs. `incomplete_penalty` is charged per
+remaining target, including stalled episodes; dropping it can make an early
+stop appear better than completing a mission. With safe unknown-target
+decoding, zero-death episodes contribute no death penalty, but retaining the
+penalty covers policies or settings that permit risky contact.
 
 `candidates.allow_unknown_target_actions` controls risky direct contact with
 unrevealed targets. The default `false` requires scouting first. When enabled,

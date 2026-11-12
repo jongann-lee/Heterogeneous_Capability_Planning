@@ -2,10 +2,10 @@
 
     uv run python figure_scripts/03_task_time_plot.py
 
-Reads scout-then-engage.json, 1109-no-staging.json, and 1103-default.json
+Reads scout-then-engage.json, engage-while-scout.json, and 1103-default.json
 from outputs/evaluation/KTH-detailed, in that panel order, and writes
 figure_scripts/outputs/03_KTH_task_time.pdf and .svg, overwriting on reruns.
---results-dir and --output select other input and output paths.
+--results-dir, --engage-while-scout, and --output select other paths.
 The SVG is 600 px wide, preserves proportions, and retains editable text and
 vector curves. All three panels have equal heights and matching axis layouts.
 
@@ -13,6 +13,8 @@ Blue shows cumulative tasks discovered. Red shows total tasks minus cumulative
 completions (tasks remaining), so it decreases as tasks are completed. Curves
 use the saved post-event timeline, including simultaneous events, and stop at
 each run's makespan. All panels share identical time and integer count axes.
+Dashed vertical lines mark finish times; the shared time axis includes padding
+beyond the longest run.
 Time is the prepared map's traversal time, not wall-clock time or seconds.
 """
 
@@ -38,12 +40,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from figure_scripts.export_utils import save_pdf_and_svg
+from figure_scripts.policy_labels import OPT_BY_PART_LABEL
 
 
 DISCOVERED_COLOR = "#7297B5"
 REMAINING_COLOR = "#B97676"
-POLICY_NAMES = {"scout-then-execute": "Scout Then Engage", "learned": "CAAT Graph + HGT"}
-RUN_FILES = ("scout-then-engage.json", "1109-no-staging.json", "1103-default.json")
+POLICY_NAMES = {"scout-then-execute": "Scout Then Engage",
+                "opt-by-part": OPT_BY_PART_LABEL, "learned": "CAAT Graph + HGT"}
+RUN_FILES = ("scout-then-engage.json", "engage-while-scout.json", "1103-default.json")
+DEFAULT_ENGAGE_WHILE_SCOUT = ROOT / "outputs/evaluation/KTH-detailed/engage-while-scout.json"
 
 
 @dataclass(frozen=True)
@@ -129,7 +134,7 @@ def validate_runs(runs):
     if len(runs) != len(RUN_FILES):
         raise ValueError("expected exactly three detailed runs")
     first = runs[0]
-    for run, expected_policy in zip(runs, ("scout-then-execute", "learned", "learned")):
+    for run, expected_policy in zip(runs, ("scout-then-execute", "opt-by-part", "learned")):
         if run.policy != expected_policy:
             raise ValueError(f"{run.path}: expected policy {expected_policy}")
         if not first.map_hash or first.map_hash != run.map_hash:
@@ -141,8 +146,6 @@ def validate_runs(runs):
 
 
 def run_title(run):
-    if run.path.name == "1109-no-staging.json":
-        return "CAAT Graph + HGT (No Staging)"
     return POLICY_NAMES.get(run.policy, run.policy)
 
 
@@ -156,14 +159,18 @@ def render_plot(runs, output):
     try:
         # Fixed physical header/footer margins preserve each panel's size as
         # another comparison is added, including in the 600 px-wide SVG.
-        fig.subplots_adjust(left=0.12, right=0.98, bottom=0.66 / figure_height,
+        fig.subplots_adjust(left=0.12, right=0.95, bottom=0.66 / figure_height,
                             top=1 - 0.72 / figure_height, hspace=0.50)
-        horizon = math.ceil(max(run.makespan for run in runs) / 100) * 100 or 1
+        longest = max(run.makespan for run in runs)
+        horizon = math.ceil((longest + max(100, 0.05 * longest)) / 100) * 100
         for ax, run in zip(axes, runs):
             ax.step(run.times, run.discovered, where="post", color=DISCOVERED_COLOR,
                     linewidth=2, label="Tasks discovered", zorder=3)
             ax.step(run.times, run.remaining, where="post", color=REMAINING_COLOR,
                     linewidth=2, label="Tasks remaining", zorder=3)
+            finish = ax.axvline(run.makespan, color="#666666", linestyle="--",
+                                linewidth=1.1, zorder=2)
+            finish.set_gid(f"finish-{run.policy}")
             ax.set_title(run_title(run), loc="left", fontsize=11)
             ax.set_xlim(0, horizon)
             ax.set_ylim(-0.3, run.total + 0.3)
@@ -183,7 +190,7 @@ def render_plot(runs, output):
             fig, output, metadata={
                 "Title": "KTH task discovery and completion over time",
                 "Subject": ("Blue: cumulative discoveries. Red: total tasks minus completions. "
-                            "Time: " + runs[0].time_units + ". Inputs: "
+                            "Dashed gray: finish time. Time: " + runs[0].time_units + ". Inputs: "
                             + "; ".join(str(run.path) for run in runs)),
                 "Creator": "figure_scripts/03_task_time_plot.py",
             },
@@ -196,11 +203,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results-dir", type=Path,
                         default=ROOT / "outputs" / "evaluation" / "KTH-detailed")
+    parser.add_argument("--engage-while-scout", type=Path, default=DEFAULT_ENGAGE_WHILE_SCOUT,
+                        help="detailed opt-by-part JSON for the middle panel")
     parser.add_argument("--output", type=Path,
                         default=Path(__file__).resolve().parent / "outputs" / "03_KTH_task_time.pdf",
                         help="PDF path; a 600 px-wide SVG is also written alongside it")
     args = parser.parse_args(argv)
     paths = [args.results_dir.expanduser().resolve() / name for name in RUN_FILES]
+    paths[1] = args.engage_while_scout.expanduser().resolve()
     runs = [load_run(path) for path in paths]
     validate_runs(runs)
     output = args.output.expanduser().resolve()

@@ -15,10 +15,13 @@ from learning.policy.configuration import (
 class TensorObservationBuilder:
     def __init__(self, world, num_target_types, task_graph=True,
                  edge_normalization=PER_DECISION_EDGE_NORMALIZATION,
-                 edge_normalization_epsilon=1.0e-6):
+                 edge_normalization_epsilon=1.0e-6,
+                 use_agent_alive=True, use_task_completed=True):
         self.world = world
         self.num_target_types = int(num_target_types)
         self.task_graph = bool(task_graph)
+        self.use_agent_alive = bool(use_agent_alive) or not self.task_graph
+        self.use_task_completed = bool(use_task_completed) or not self.task_graph
         self.edge_normalization = edge_normalization
         self.edge_normalization_epsilon = float(edge_normalization_epsilon)
         self._relation_distances = None
@@ -470,7 +473,9 @@ class TensorObservationBuilder:
             action_target_distances=task_ct_distance,
             agent_remaining_times=remaining,
             edge_normalization=self.edge_normalization,
-            edge_normalization_epsilon=self.edge_normalization_epsilon)
+            edge_normalization_epsilon=self.edge_normalization_epsilon,
+            use_agent_alive=self.use_agent_alive,
+            use_task_completed=self.use_task_completed)
         return (observation, route_distances, predecessors,
                 target_route_distances, target_entries,
                 candidate_entry_nodes)

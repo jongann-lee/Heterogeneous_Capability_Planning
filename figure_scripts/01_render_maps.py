@@ -53,17 +53,17 @@ from simulation.rendering import draw_frame, _agent_color, _legend_handles
 
 FIGSIZE = (5.6, 4.8)
 MAP_LABEL_SIZE = 9.5
-LEGEND_SIZE = 10
+LEGEND_SIZE = 12
 TITLE_SIZE = 15
 # Reserve a compact left column for outdoor legends and the height scale.
 MAP_RECT = (0.235, 0.035, 0.74, 0.905)
-INDOOR_MAP_RECT = (0.025, 0.14, 0.95, 0.79)
+INDOOR_MAP_RECT = (0.025, 0.21, 0.95, 0.72)
 MAPS = (
-    ("wv", "West Virginia (WV)", "WV_tobler_viewshed_64.pkl.gz",
+    ("wv", "WV - training", "WV_tobler_viewshed_64.pkl.gz",
      "wv_factorial_test_v1.json"),
-    ("wa", "Washington (WA)", "WA_tobler_viewshed_64.pkl.gz",
+    ("wa", "WA - test (similar to training)", "WA_tobler_viewshed_64.pkl.gz",
      "wa_factorial_test_v1.json"),
-    ("kth", "KTH indoor", "KTH_Indoor_map.pkl.gz", "KTH_indoor_big.json"),
+    ("kth", "KTH- test (different from training)", "KTH_Indoor_map.pkl.gz", "KTH_indoor_big.json"),
 )
 
 
@@ -133,11 +133,11 @@ def draw_outdoor(fig, ax, graph, suite, agents, targets):
     for patch in ax.patches:
         patch.set_rasterized(True)
     colorbar = fig.colorbar(image, cax=fig.add_axes((0.055, 0.12, 0.028, 0.43)))
-    colorbar.set_label("Height", fontsize=12, labelpad=7)
+    colorbar.set_label("Height", fontsize=14, labelpad=7)
     colorbar.ax.yaxis.set_label_position("left")
-    colorbar.ax.yaxis.set_ticks_position("right")
+    colorbar.set_ticks([image.norm.vmin, image.norm.vmax], labels=["Low", "High"])
+    colorbar.ax.tick_params(labelsize=12, length=0)
     colorbar.outline.set_linewidth(0.6)
-    colorbar.ax.tick_params(labelsize=11, width=0.6)
     draw_legend(fig, agents)
 
 
@@ -179,13 +179,13 @@ def draw_layout(fig, ax, graph, suite, agents, targets):
 
 def draw_legend(fig, agents, *, indoor=False):
     handles = [Line2D(
-        [], [], linestyle="none", marker="o", markersize=8,
+        [], [], linestyle="none", marker="o", markersize=9.5,
         markerfacecolor="white", markeredgecolor="black", label="Agents:",
     )]
     for index, capabilities in enumerate(agents.capabilities):
         values = ",".join(map(str, sorted(capabilities)))
         handles.append(Line2D(
-            [], [], linestyle="none", marker="o", markersize=8,
+            [], [], linestyle="none", marker="o", markersize=9.5,
             markerfacecolor=_agent_color(index), markeredgecolor="black",
             markeredgewidth=0.7, label=f"A{index}: {{{values}}}",
         ))
@@ -196,8 +196,8 @@ def draw_legend(fig, agents, *, indoor=False):
         handles.append(Line2D([], [], color="#404040", linewidth=1.6, label="Roads"))
     legend = fig.legend(
         handles=handles, loc="upper center" if indoor else "upper left",
-        bbox_to_anchor=(0.5, 0.115) if indoor else (0.025, 0.91),
-        ncols=(len(handles) + 1) // 2 if indoor else 1, fontsize=LEGEND_SIZE,
+        bbox_to_anchor=(0.5, 0.19) if indoor else (0.025, 0.91),
+        ncols=min(4, (len(handles) + 1) // 2) if indoor else 1, fontsize=LEGEND_SIZE,
         frameon=False, borderaxespad=0, handletextpad=0.4, labelspacing=0.5,
         handlelength=1, columnspacing=0.7,
     )

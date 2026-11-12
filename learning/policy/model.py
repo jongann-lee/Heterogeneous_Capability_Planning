@@ -100,8 +100,10 @@ class HeterogeneousGraphPolicy(nn.Module):
         self.has_critic = config.use_critic
         d = config.model_dim
         edge_dim = config.distance_embedding_dim
-        self.agent_encoder = EntityEncoder(5 if config.use_position else 3, d)
-        self.target_encoder = EntityEncoder(4 if config.use_position else 2, d)
+        self.agent_encoder = EntityEncoder(
+            2 + int(config.use_agent_alive) + 2 * int(config.use_position), d)
+        self.target_encoder = EntityEncoder(
+            1 + int(config.use_task_completed) + 2 * int(config.use_position), d)
         self.action_encoder = EntityEncoder(4, d)
         self.capability_embedding = nn.Parameter(torch.empty(d))
         nn.init.normal_(self.capability_embedding, std=1.0 / math.sqrt(d))
@@ -148,6 +150,12 @@ class HeterogeneousGraphPolicy(nn.Module):
         self._require_task_graph(observation)
         agent_features = observation.task_agent_features
         target_features = observation.task_target_features
+        # Canonical observations retain status for simulation/masks; these
+        # switches control only which columns reach the learned encoders.
+        if not self.config.use_agent_alive:
+            agent_features = agent_features[..., 1:]
+        if not self.config.use_task_completed:
+            target_features = target_features[..., 1:]
         if self.config.use_position:
             if getattr(observation, "agent_positions", None) is None:
                 raise ValueError(

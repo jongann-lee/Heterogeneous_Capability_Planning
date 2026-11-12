@@ -1022,7 +1022,7 @@ def test_rendering_uses_distinct_agent_colors_and_stacks_shared_labels():
 
 
 def _graph_model(num_target_types=2, use_critic=True, decoder_mode="mlp",
-                 use_position=False):
+                 use_position=False, use_agent_alive=True, use_task_completed=True):
     torch.manual_seed(11)
     config = replace(
         load_config().model,
@@ -1036,6 +1036,8 @@ def _graph_model(num_target_types=2, use_critic=True, decoder_mode="mlp",
         use_critic=use_critic,
         decoder_mode=decoder_mode,
         use_position=use_position,
+        use_agent_alive=use_agent_alive,
+        use_task_completed=use_task_completed,
     )
     model = HeterogeneousGraphPolicy(config)
     model.eval()
@@ -1772,7 +1774,7 @@ def test_yaml_configuration_loads_and_validates():
     assert isinstance(config.model.use_position, bool)
     assert config.model.edge_normalization_epsilon > 0
     assert config.candidates.include_wait
-    assert not config.candidates.include_pair_staging
+    assert isinstance(config.candidates.include_pair_staging, bool)
     assert not config.candidates.allow_unknown_target_actions
     assert config.instances.min_targets == 5
     assert config.instances.max_targets == 9
@@ -2116,12 +2118,15 @@ def test_task_graph_decoder_config_validates_and_preserves_legacy_checkpoints():
     payload = asdict(config)
     payload["model"].pop("decoder_mode")
     payload["model"].pop("use_position")
+    payload["model"].pop("use_agent_alive")
+    payload["model"].pop("use_task_completed")
     with tempfile.TemporaryDirectory() as directory:
         legacy_path = Path(directory) / "legacy.yaml"
         legacy_path.write_text(yaml.safe_dump(payload))
         legacy = load_config(legacy_path)
         assert legacy.model.decoder_mode == "mlp"
         assert not legacy.model.use_position
+        assert legacy.model.use_agent_alive and legacy.model.use_task_completed
         model = _graph_model()
         restored = build_policy(replace(
             legacy.model, model_dim=32, message_passing_blocks=2,
@@ -2135,6 +2140,229 @@ def test_task_graph_decoder_config_validates_and_preserves_legacy_checkpoints():
         assert dot_product_config.model.decoder_mode == "dot_product"
         saved = _serialized_run_config(dot_product_config)
         assert saved["model"]["decoder_mode"] == "dot_product"
+
+
+def test_status_feature_toggles_control_encoder_columns_and_gradients():
+    graph, agents = _instance()
+    graph.nodes[3].update(type="target_unreached", rps_type=2)
+    for alive, completed, position, mode in product(
+            (False, True), (False, True), (False, True), ("mlp", "dot_product")):
+        observation = build_observation(
+            graph, agents, 2, use_agent_alive=alive, use_task_completed=completed)
+        model = _graph_model(use_agent_alive=alive, use_task_completed=completed,
+                             use_position=position, decoder_mode=mode)
+        inputs = {}
+        hooks = [
+            model.agent_encoder.register_forward_pre_hook(
+                lambda _module, args: inputs.update(agent=args[0])),
+            model.target_encoder.register_forward_pre_hook(
+                lambda _module, args: inputs.update(target=args[0])),
+        ]
+        try:
+            logits, value = model.actor_critic(observation)
+        finally:
+            for hook in hooks:
+                hook.remove()
+        expected_agent = observation.task_agent_features[..., 0 if alive else 1:]
+        expected_target = observation.task_target_features[..., 0 if completed else 1:]
+        if position:
+            expected_agent = torch.cat((expected_agent, observation.agent_positions), dim=-1)
+            expected_target = torch.cat((expected_target, observation.target_positions), dim=-1)
+        assert torch.equal(inputs["agent"], expected_agent)
+        assert torch.equal(inputs["target"], expected_target)
+        assert inputs["agent"].shape[-1] == 2 + int(alive) + 2 * int(position)
+        assert inputs["target"].shape[-1] == 1 + int(completed) + 2 * int(position)
+        (logits[observation.feasible_action_mask].sum() + value.square().mean()).backward()
+        assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+
+
+def test_status_toggles_mask_inactive_graph_relations_before_cpu_tensor_normalization():
+    graph = _line(5)
+    graph.nodes[2].update(type="target_reached", rps_type=1)
+    graph.nodes[4].update(type="target_unreached", rps_type=2)
+    agents = [Agent(0, capabilities={1, 2}), Agent(1, capabilities={0, 1})]
+    agents[1].alive = False
+    candidates = replace(load_config().candidates, staging_per_target=0,
+                         include_pair_staging=False)
+    with patch("learning.gpu_sim.world.CuGraphRouter", _ReferenceRouter):
+        world = TensorWorld.from_networkx(graph, candidates, device="cpu")
+    state = TensorEpisodeState.create(
+        world, [world.node_index[0]],
+        [[[False, True, True], [True, True, False]]], [[1, 2]])
+    state.positions[0, 1] = world.node_index[1]
+    state.alive[0, 1] = False
+    state.target_live[0, 0] = False
+    state.target_known[:] = True
+    raw = build_observation(
+        graph, agents, 2, candidate_config=candidates,
+        edge_normalization=RAW_EDGE_NORMALIZATION,
+        use_agent_alive=False, use_task_completed=False)
+    raw_values = _valid_task_distances(raw)
+    for mode in (RAW_EDGE_NORMALIZATION, PER_DECISION_EDGE_NORMALIZATION, MAX_EDGE_NORMALIZATION):
+        cpu = build_observation(
+            graph, agents, 2, candidate_config=candidates, edge_normalization=mode,
+            use_agent_alive=False, use_task_completed=False)
+        tensor = TensorObservationBuilder(
+            world, 2, edge_normalization=mode,
+            use_agent_alive=False, use_task_completed=False).build(state)[0]
+        for observation in (cpu, tensor):
+            assert observation.agent_mask.tolist() == [[True, False]]
+            assert observation.target_mask.tolist() == [[False, True]]
+            assert not observation.agent_target_distance_mask[0, 1].any()
+            assert not observation.agent_target_distance_mask[0, :, 0].any()
+            assert not observation.agent_action_distance_mask[0, 1].any()
+            assert not observation.action_target_distance_mask[0, :, 0].any()
+            assert not observation.serves_mask[0, :, 0].any()
+            assert not observation.reveals_mask[0, :, 0].any()
+            assert not observation.stages_for_mask[0, :, 0].any()
+            assert not observation.feasible_action_mask[0, 1].any()
+        assert [c.key for c in cpu.candidates[0]] == [c.key for c in tensor.candidates[0]]
+        assert all(c.node != 2 for c in cpu.candidates[0] if c.is_target)
+        for name, mask_name in (
+                ("agent_target_distances", "agent_target_distance_mask"),
+                ("agent_action_distances", "agent_action_distance_mask"),
+                ("action_target_distances", "action_target_distance_mask")):
+            mask = getattr(cpu, mask_name)
+            assert torch.equal(mask, getattr(tensor, mask_name))
+            assert torch.allclose(getattr(cpu, name)[mask], getattr(tensor, name)[mask], atol=1e-6)
+        expected = raw_values
+        if mode == PER_DECISION_EDGE_NORMALIZATION:
+            expected = (expected - expected.mean()) / expected.std(unbiased=False).clamp_min(1e-6)
+        elif mode == MAX_EDGE_NORMALIZATION:
+            expected = expected / expected.max()
+        assert torch.allclose(_valid_task_distances(cpu), expected)
+
+        model = _graph_model(use_agent_alive=False, use_task_completed=False, use_position=True)
+        logits, value = model.actor_critic(cpu)
+        perturbed = copy.deepcopy(cpu)
+        perturbed.task_agent_features[0, 1] = 17.0
+        perturbed.task_target_features[0, 0] = 31.0
+        perturbed.agent_positions[0, 1] = 11.0
+        perturbed.target_positions[0, 0] = 13.0
+        perturbed.agent_capability_membership[0, 1] = True
+        perturbed.target_capability_beliefs[0, 0] = 27.0
+        changed_logits, changed_value = model.actor_critic(perturbed)
+        assert torch.allclose(logits, changed_logits, atol=1e-6)
+        assert torch.allclose(value, changed_value, atol=1e-6)
+
+
+def test_completed_tasks_have_no_target_observation_or_staging_action_links():
+    graph = _line(7)
+    for node in (2, 4, 6):
+        graph.nodes[node].update(type="target_unreached", rps_type=UNKNOWN_TYPE)
+    for node, visible in {0: [2, 4], 1: [2], 3: [4, 6], 5: [6]}.items():
+        graph.nodes[node]["visible_nodes"] = visible
+    config = replace(load_config().candidates, staging_per_target=2,
+                     include_pair_staging=True, include_wait=True)
+    cache = CandidateScenarioCache(graph, include_pair_staging=True)
+    with patch("learning.gpu_sim.world.CuGraphRouter", _ReferenceRouter):
+        world = TensorWorld.from_networkx(graph, config, device="cpu")
+    state = TensorEpisodeState.create(
+        world, [world.node_index[0]], [[[True, True]]], [[1, 1, 1]])
+    done = world.targets.index(2)
+    state.target_live[0, done] = False
+    state.target_known[0, done] = True
+    current = graph
+    current.nodes[2].update(type="target_reached", rps_type=1)
+    candidates = generate_candidates(current, config, scenario_cache=cache)
+    assert any(c.is_staging and c.staging_arity == 2 for c in candidates)
+    assert any(c.is_observation and c.observed_targets == {4} for c in candidates)
+    for candidate in candidates:
+        assert not (candidate.is_target and candidate.node == 2)
+        assert 2 not in candidate.associated_targets
+        assert 2 not in candidate.observed_targets
+        assert 2 not in candidate.staging_targets
+    builder = TensorObservationBuilder(
+        world, 1, use_agent_alive=False, use_task_completed=False)
+    (_target, _observation, _staging, active, associated,
+     observed_links, staging_links) = builder.candidate_roles(state)
+    assert not associated[..., done].any()
+    assert not observed_links[..., done].any()
+    assert not staging_links[..., done].any()
+    assert not active[0, world.target_candidate_mask[:, done]].any()
+    assert not active[0, world.candidate_staging_mask[:, done]].any()
+    observation = builder.build(state)[0]
+    assert not observation.target_mask[0, done]
+    assert not observation.agent_target_distance_mask[..., done].any()
+    assert not observation.action_target_distance_mask[..., done].any()
+    for relation in (observation.serves_mask, observation.reveals_mask,
+                     observation.stages_for_mask):
+        assert not relation[..., done].any()
+
+
+def test_status_toggles_checkpoint_roundtrip_and_old_defaults():
+    from learning.policy.evaluation import load_policy
+
+    root = Path(tempfile.mkdtemp(prefix="status-feature-checkpoints-"))
+    for alive, completed in product((False, True), repeat=2):
+        model = _graph_model(use_agent_alive=alive, use_task_completed=completed)
+        config = replace(load_config(), model=model.config)
+        for name in ("use_agent_alive", "use_task_completed"):
+            for invalid in ("false", 0, None):
+                try:
+                    replace(model.config, **{name: invalid})
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f"invalid {name} accepted")
+        run = root / f"{alive}-{completed}"
+        run.mkdir()
+        serialized = _serialized_run_config(config)
+        assert serialized["feature_schema"]["use_agent_alive"] == alive
+        assert serialized["feature_schema"]["use_task_completed"] == completed
+        (run / "config.yaml").write_text(yaml.safe_dump(serialized))
+        torch.save(model.state_dict(), run / "best_weights.pt")
+        loaded, adapter = load_policy(run)
+        assert loaded.config.use_agent_alive == adapter.use_agent_alive == alive
+        assert loaded.config.use_task_completed == adapter.use_task_completed == completed
+        assert loaded.agent_encoder.network[0].in_features == 2 + int(alive)
+        assert loaded.target_encoder.network[0].in_features == 1 + int(completed)
+    legacy = root / "legacy"
+    legacy.mkdir()
+    model = _graph_model()
+    serialized = _serialized_run_config(replace(load_config(), model=model.config))
+    for name in ("use_agent_alive", "use_task_completed"):
+        serialized["model"].pop(name)
+        serialized["feature_schema"].pop(name)
+    (legacy / "config.yaml").write_text(yaml.safe_dump(serialized))
+    torch.save(model.state_dict(), legacy / "best_weights.pt")
+    loaded, adapter = load_policy(legacy)
+    assert loaded.config.use_agent_alive and loaded.config.use_task_completed
+    assert adapter.use_agent_alive and adapter.use_task_completed
+    override = root / "override.yaml"
+    config = replace(load_config(), model=replace(
+        model.config, use_agent_alive=False, use_task_completed=False))
+    override.write_text(yaml.safe_dump(_serialized_run_config(config)))
+    try:
+        evaluate_suite(legacy, config_path=override, suite="development", device="cpu")
+    except ValueError as error:
+        assert "feature schema is incompatible" in str(error)
+    else:
+        raise AssertionError("status feature override was silently accepted")
+
+
+def test_status_toggles_prune_completed_targets_during_tensor_gradient_replay():
+    graph = _line(5)
+    for node in (2, 4):
+        graph.nodes[node].update(type="target_unreached", rps_type=UNKNOWN_TYPE)
+    candidates = replace(load_config().candidates, staging_per_target=0,
+                         include_pair_staging=False, include_wait=False)
+    with patch("learning.gpu_sim.world.CuGraphRouter", _ReferenceRouter):
+        world = TensorWorld.from_networkx(graph, candidates, device="cpu")
+    state = TensorEpisodeState.create(world, [world.node_index[0]], [[[False, True]]], [[1, 1]])
+    state.target_known[:] = True
+    model = _graph_model(num_target_types=1, use_agent_alive=False, use_task_completed=False)
+    builder = TensorObservationBuilder(world, 1, use_agent_alive=False, use_task_completed=False)
+    rollout = collect_tensor_episodes(model, state, builder, training=True, oracle_makespans=4.0)
+    assert rollout.completed.all() and len(rollout.decision_traces) == 2
+    assert rollout.decision_traces[0].observation.target_mask.tolist() == [[True, True]]
+    last = rollout.decision_traces[1].observation
+    assert last.target_mask.tolist() == [[False, True]]
+    completed_actions = world.target_candidate_mask[:, 0]
+    assert not last.action_mask[0, completed_actions].any()
+    assert not last.feasible_action_mask[0, :, completed_actions].any()
+    replay_tensor_gradients(model, rollout, rollout.returns, 0.01, 1, "cpu")
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
 
 
 def test_agent_positions_use_full_rectangular_map_bounds_and_handle_flat_axes():
@@ -2659,7 +2887,8 @@ def test_task_graph_normalization_has_zero_variance_and_no_edge_fallbacks():
 def test_no_edge_normalization_retains_raw_travel_times_in_the_current_schema():
     config = load_config()
     config = replace(config, model=replace(
-        config.model, edge_normalization=RAW_EDGE_NORMALIZATION, use_position=False))
+        config.model, edge_normalization=RAW_EDGE_NORMALIZATION, use_position=False,
+        use_agent_alive=True, use_task_completed=True))
     assert config.model.feature_schema_version == CURRENT_FEATURE_SCHEMA_VERSION
     assert config.model.edge_normalization == RAW_EDGE_NORMALIZATION
     graph = _line(6)

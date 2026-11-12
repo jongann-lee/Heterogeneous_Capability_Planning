@@ -321,6 +321,8 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
     builder = TensorObservationBuilder(
         world, model_config.num_target_types,
         task_graph=model_config.architecture == "task_graph",
+        use_agent_alive=model_config.use_agent_alive,
+        use_task_completed=model_config.use_task_completed,
         edge_normalization=model_config.edge_normalization,
         edge_normalization_epsilon=(
             model_config.edge_normalization_epsilon))
@@ -392,6 +394,8 @@ def train_gpu(env, truth, agents, episodes, simulation_batch_size,
                             world, model_config.num_target_types,
                             task_graph=(
                                 model_config.architecture == "task_graph"),
+                            use_agent_alive=model_config.use_agent_alive,
+                            use_task_completed=model_config.use_task_completed,
                             edge_normalization=(
                                 model_config.edge_normalization),
                             edge_normalization_epsilon=(

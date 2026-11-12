@@ -38,6 +38,9 @@ class ModelConfig:
     # Task-graph scoring; omitted fields preserve the original MLP checkpoints.
     decoder_mode: str = "mlp"
     use_position: bool = False
+    # Omitted fields retain the original input widths and graph membership.
+    use_agent_alive: bool = True
+    use_task_completed: bool = True
 
     def __post_init__(self):
         if self.num_target_types < 1:
@@ -68,6 +71,9 @@ class ModelConfig:
                 "model.decoder_mode must be 'mlp' or 'dot_product'")
         if not isinstance(self.use_position, bool):
             raise ValueError("model.use_position must be a boolean")
+        for name in ("use_agent_alive", "use_task_completed"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"model.{name} must be a boolean")
         if self.feature_schema_version not in {
                 RAW_DISTANCE_FEATURE_SCHEMA_VERSION,
                 CURRENT_FEATURE_SCHEMA_VERSION}:
@@ -214,6 +220,8 @@ def feature_schema_metadata(model_config: ModelConfig) -> dict[str, Any]:
         "edge_normalization_epsilon": float(
             model_config.edge_normalization_epsilon),
         "use_position": model_config.use_position,
+        "use_agent_alive": model_config.use_agent_alive,
+        "use_task_completed": model_config.use_task_completed,
     }
 
 
