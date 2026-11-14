@@ -20,7 +20,7 @@ from learning.policy.model import (
     VanillaTransformerPolicy,
     build_policy,
 )
-from learning.policy.oracle import compute_oracle_makespan
+from planning.oracle import compute_oracle_makespan
 
 __all__ = [
     "Candidate",

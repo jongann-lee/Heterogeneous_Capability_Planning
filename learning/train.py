@@ -25,7 +25,7 @@ from learning.gpu_sim.instances import (
     inspect_prepared_map,
     make_prepared_map_instance,
 )
-from learning.policy.oracle import compute_oracle_makespan
+from planning.oracle import compute_oracle_makespan
 from learning.policy.adapter import LearnedPolicyAdapter
 from learning.policy.reinforce import (EMABaseline, batched_optimization_step,
                                        optimization_step)

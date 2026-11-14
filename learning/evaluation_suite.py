@@ -10,7 +10,6 @@ from simulation.domain import validate_capabilities
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SUITE_ROOT = Path(__file__).resolve().parent / "evaluation_suites"
 SUITE_ALIASES = {
-    "development": SUITE_ROOT / "wv_rps_fixed_v1.json",
     "test": SUITE_ROOT / "wv_factorial_test_v1.json",
 }
 
@@ -73,9 +72,9 @@ class EvaluationCase:
         }
 
 
-def resolve_suite_path(suite="development"):
+def resolve_suite_path(suite="test"):
     """Resolve a built-in alias or an explicit suite JSON path."""
-    suite_value = "development" if suite is None else str(suite)
+    suite_value = "test" if suite is None else str(suite)
     if suite_value in SUITE_ALIASES:
         return SUITE_ALIASES[suite_value].resolve()
     candidate = Path(suite_value).expanduser()
@@ -164,7 +163,7 @@ def _parse_target_configuration(payload, num_target_types, source_position):
     return TargetConfiguration(identifier, count, profile, tuple(targets))
 
 
-def load_evaluation_suite(suite="development"):
+def load_evaluation_suite(suite="test"):
     """Load and validate one fixed evaluation suite."""
     path = resolve_suite_path(suite)
     if not path.is_file():

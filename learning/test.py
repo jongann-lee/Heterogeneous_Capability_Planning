@@ -35,7 +35,7 @@ from learning.gpu_sim.instances import (
     make_prepared_map_instance,
 )
 from learning.policy.model import build_policy
-from learning.policy.oracle import compute_oracle_makespan
+from planning.oracle import compute_oracle_makespan
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -656,7 +656,7 @@ def _episode_output_path(path, episode, episodes):
     return path.with_name(f"{path.stem}_episode_{episode:04d}{path.suffix}")
 
 
-def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
+def evaluate(checkpoint=None, config_path=None, suite="test", seed=None,
              device=None, agent_config=None, target_config=None,
              agent_count=None, target_count=None, limit=None,
              render=False, render_dir=None, output_mp4=None, mp4_fps=4,
@@ -911,7 +911,7 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
             suite_definition, suite_path)
 
 
-def main(argv=None, *, detailed=False, default_suite="development",
+def main(argv=None, *, detailed=False, default_suite="test",
          default_map_path=None, default_output_dir=None,
          default_agent_config=None, default_target_config=None):
     parser = argparse.ArgumentParser(
@@ -942,7 +942,7 @@ def main(argv=None, *, detailed=False, default_suite="development",
               "schema; retraining is recommended"))
     parser.add_argument(
         "--suite", default=default_suite,
-        help="development, test, or a factorized suite JSON path")
+        help="test (WV), or a factorized suite JSON path")
     parser.add_argument(
         "--agent-config", action="append",
         help="select an agent configuration ID; may be repeated")

@@ -75,7 +75,7 @@ def _load_background(graph, map_path, metadata, raster_path):
     for directory in candidates:
         if ((directory / "occ_map.npy").is_file()
                 and (directory / "valid_space.npy").is_file()):
-            from Real_Life_Maps.indoor_map_generation import load_walkable
+            from Real_Life_Maps.indoor_background import load_walkable
             walkable, _ = load_walkable(directory)
             if walkable.shape == shape:
                 return walkable.astype(bool)
