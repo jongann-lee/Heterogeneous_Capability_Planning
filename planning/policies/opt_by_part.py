@@ -1,9 +1,9 @@
-"""Concurrent optimal-by-part scouting and known-target execution.
+"""engage-while-scout: concurrent scouting and known-target execution.
 
 At each simulator replan, pure scouts cover unknown targets and service-only
 agents execute known targets. Known-task counts by type minus service-only
 capability counts determine the gap that hybrids fill. Remaining hybrids scout.
-The routing solvers are shared with Scout-Then-Execute; the combined mission is
+The routing solvers are shared with scout-then-engage; the combined mission is
 not jointly optimal.
 """
 
@@ -15,8 +15,8 @@ from typing import Any
 
 import networkx as nx
 
-from planning.full_information import solve_full_information
-from planning.policies.scout_then_execute import solve_cooperative_scouting
+from planning.oracle import solve_oracle
+from planning.policies.scout_then_engage import solve_cooperative_scouting
 from planning.policies.scout_wrp import (
     DEFAULT_EXACT_TARGET_CAP,
     DEFAULT_SUBOPT_WEIGHT,
@@ -29,7 +29,7 @@ def _select_hybrid_executors(env_map, roster, known):
 
     One service-only agent with capabilities {1, 2} subtracts one unit of each
     type, as does a selected hybrid with those positive capabilities. This is a
-    role-selection heuristic; FI-OPT still lets an agent service multiple tasks.
+    role-selection heuristic; oracle still lets an agent service multiple tasks.
     Prefer the hybrid covering the most remaining deficit units, breaking ties
     uniformly at random using Python's seeded RNG. Never recruit a hybrid whose
     marginal contribution is zero.
@@ -69,7 +69,7 @@ def _select_hybrid_executors(env_map, roster, known):
     return selected, demand, service_supply, gap, remaining
 
 
-class OptByPartPolicy:
+class EngageWhileScoutPolicy:
     """Recompute both parts on every callback, preserving committed edges.
 
     Only planner-visible state is used. Unknown and deferred known targets are
@@ -94,7 +94,7 @@ class OptByPartPolicy:
         self._transit: list[Any] = []
         self._clock = 0.0
         self._scout_plan = None
-        self._fi_plan = None
+        self._oracle_plan = None
 
     def set_runtime_state(self, agents, transit, clock):
         self._roster = list(agents)
@@ -179,14 +179,14 @@ class OptByPartPolicy:
         execution_graph = nx.subgraph_view(
             env_map, filter_node=lambda node: node not in blocked
         )
-        self._fi_plan = solve_full_information(
+        self._oracle_plan = solve_oracle(
             execution_graph,
             [roster[index] for index in executors],
             start_nodes=[starts[index] for index in executors],
             release_times=[releases[index] for index in executors],
         )
-        if self._fi_plan.feasible:
-            for index, path in zip(executors, self._fi_plan.paths):
+        if self._oracle_plan.feasible:
+            for index, path in zip(executors, self._oracle_plan.paths):
                 roster[index].planned_path = list(path)
 
         scout_plan = self._scout_plan
@@ -215,17 +215,17 @@ class OptByPartPolicy:
             ),
             "scout_routes": [list(path) for path in scout_plan.paths] if scout_plan else [],
             "scouting": dict(scout_plan.diagnostic) if scout_plan else {},
-            "execution_feasible": self._fi_plan.feasible,
-            "execution_exact": self._fi_plan.exact,
-            "execution_makespan_estimate": self._fi_plan.makespan,
-            "fi_assignments": [list(values) for values in self._fi_plan.assignments],
-            "fi_paths": [list(path) for path in self._fi_plan.paths],
-            "full_information": dict(self._fi_plan.diagnostic),
+            "execution_feasible": self._oracle_plan.feasible,
+            "execution_exact": self._oracle_plan.exact,
+            "execution_makespan_estimate": self._oracle_plan.makespan,
+            "oracle_assignments": [list(values) for values in self._oracle_plan.assignments],
+            "oracle_paths": [list(path) for path in self._oracle_plan.paths],
+            "oracle": dict(self._oracle_plan.diagnostic),
         }
 
 
-def make_policy(**kwargs) -> OptByPartPolicy:
-    return OptByPartPolicy(**kwargs)
+def make_policy(**kwargs) -> EngageWhileScoutPolicy:
+    return EngageWhileScoutPolicy(**kwargs)
 
 
-__all__ = ["OptByPartPolicy", "make_policy"]
+__all__ = ["EngageWhileScoutPolicy", "make_policy"]

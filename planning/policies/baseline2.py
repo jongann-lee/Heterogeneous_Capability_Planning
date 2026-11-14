@@ -1,6 +1,6 @@
-"""Public entry point for baseline 2.
+"""Public entry point for watchman routing.
 
-Baseline 2 is implemented in :mod:`planning.policies.scout_wrp`: the scout-capable
+Watchman routing helper is implemented in :mod:`planning.policies.scout_wrp`: the scout-capable
 agent with the fewest positive service capabilities performs the WRP covering
 walk first, then joins the capability-aware attacker layer.
 """

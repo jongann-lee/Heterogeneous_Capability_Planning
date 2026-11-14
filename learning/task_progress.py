@@ -59,10 +59,10 @@ class TaskProgressRecorder:
         self._event(time, "task_completed", node)
         task["completed_at"] = float(time)
 
-    def initialize(self, env, *, full_information=False):
+    def initialize(self, env, *, oracle=False):
         for node in self.targets:
-            if full_information:
-                self.discover(0.0, node, "full_information")
+            if oracle:
+                self.discover(0.0, node, "oracle")
             elif env.nodes[node].get("rps_type", UNKNOWN_TYPE) != UNKNOWN_TYPE:
                 self.discover(0.0, node, "initial_knowledge")
             if env.nodes[node].get("type") == "target_reached":

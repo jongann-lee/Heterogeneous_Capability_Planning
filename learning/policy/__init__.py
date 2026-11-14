@@ -20,7 +20,7 @@ from learning.policy.model import (
     VanillaTransformerPolicy,
     build_policy,
 )
-from learning.policy.oracle import full_information_makespan, parallel_tsp
+from learning.policy.oracle import compute_oracle_makespan
 
 __all__ = [
     "Candidate",
@@ -36,7 +36,6 @@ __all__ = [
     "VanillaTransformerPolicy",
     "build_policy",
     "generate_candidates",
-    "full_information_makespan",
+    "compute_oracle_makespan",
     "load_config",
-    "parallel_tsp",
 ]

@@ -4,8 +4,8 @@ Map-agnostic capability-based simulation core.
 This is the continuous-time, discrete-event driver for heterogeneous agents.
 It is deliberately decoupled from the real-DEM benchmark so the mechanics can
 be exercised on a tiny synthetic graph in ``tests/test_simulation.py``. The
-real-map entry point in ``simulation.real_map_benchmark`` only builds the two
-graphs and hands them here.
+CPU evaluation path in ``learning.test`` builds the two episode graphs and
+hands them here.
 
 Two-graph partial observability (same contract as the base multi-agent sim):
   * ``env_map``      -- the planner's view. Targets start with
@@ -308,7 +308,7 @@ def naive_type_aware_replan(env_map, agents, reward_ratio=1.0,
     # NOTE: non-scout agents are blind, so only capability 0 reveals a type
     # without an encounter. This stub therefore needs a scout in the roster to
     # make progress safely; with none, its combat agents idle on unknown-only
-    # maps. (baseline1_all_key instead has blind attackers charge unknowns and
+    # maps. (independent_routing instead has blind attackers charge unknowns and
     # accept the gamble.)
 
 

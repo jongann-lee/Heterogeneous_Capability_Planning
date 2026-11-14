@@ -83,34 +83,20 @@ targets may be occluded from every vantage. So a good policy is fundamentally
 about **managing information vs. risk**: how much scouting to buy before
 committing attackers, and which gambles are worth taking.
 
-## 6. Current baseline (this is what a better policy should beat)
+## 6. Evaluation baselines
 
-**"baseline-1"** — simple, uncoordinated, deliberately weak:
+- `oracle` knows the true target types from time zero and computes exact,
+  independently executable min-max routes. A route cannot cross a live target
+  outside its assignment or depend on another agent clearing a transit target.
+- `scout-then-engage` cooperatively scouts until every remaining target type is
+  revealed, then installs one oracle plan. Service-only agents wait during
+  scouting; agents in transit must finish their committed edge.
+- `engage-while-scout` scouts and services known targets concurrently. A
+  capability-gap rule assigns hybrid agents to execution or scouting, and the
+  shared oracle solver routes the execution team over currently known tasks.
 
-- **Attacker:** rank live targets by the outcome category **win > draw >
-  unknown > lose**; pick the closest target in the best non-empty category;
-  then **engage it literally** — walk all the way on. So a blind attacker that
-  picks an *unknown* target which turns out to beat it **dies** (intended
-  weakness). Routes detour around *other* live targets so it doesn't die on a
-  target it didn't choose.
-- **Scout:** go to the single **tallest node** on the map (best static vantage,
-  since visibility is height-gated) and observe from there.
-- No coordination between attackers (each chooses independently); no use of the
-  base problem's visibility/observation reward.
-
-### Where it's weak (good discussion seeds)
-
-- The scout optimizes **vantage height**, not **information** — it doesn't tour
-  to maximize the number/priority of targets revealed, and it ignores which
-  targets are still unknown.
-- Attackers **gamble greedily** on the nearest unknown with no notion of "is
-  this bet worth it?" or "should I wait for the scout?".
-- **No joint assignment**: which attacker type should take which target, and in
-  what order, to avoid deadlock and wasted deaths, is left to chance.
-- **Occluded targets** (never seen by the scout) are handled only by attackers
-  blundering into them.
-- The base problem also rewards **observing high-traffic edges** (reducing
-  blockage uncertainty); baseline-1 ignores this entirely.
+The independent-routing and watchman-routing helpers remain for shared routing
+and regression coverage. The fixed-suite CLI exposes the three names above.
 
 ## 7. Open questions to discuss
 
@@ -140,7 +126,7 @@ committing attackers, and which gambles are worth taking.
   (`-1`/UNKNOWN until revealed).
 - The current implementation is split by responsibility: `simulation/domain.py`
   (rules), `simulation/engine.py` (event loop), `planning/policies/` (baselines),
-  `simulation/real_map_benchmark.py` (real-DEM runner), and
+  `learning/test.py` (fixed-suite evaluator), and
   `tests/test_simulation.py` (fast synthetic tests).
 - Run tests with `uv run python -m tests.test_simulation`; run on the map with
-  `uv run python -m simulation.real_map_benchmark --policy baseline1 --render`.
+  `uv run python -m learning.test --policy scout-then-engage --suite test`.

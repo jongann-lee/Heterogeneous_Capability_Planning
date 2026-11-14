@@ -72,7 +72,6 @@ def collect_episode(env_map, ground_truth, agents, adapter,
     episode_return = calculate_episode_return(
         result, death_penalty, incomplete_penalty, oracle_makespan)
     result["oracle_makespan"] = oracle_makespan
-    result["fi_opt_makespan"] = oracle_makespan
     result["normalized_regret"] = (
         None if oracle_makespan is None else
         0.0 if float(oracle_makespan) == 0.0 else

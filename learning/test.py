@@ -35,7 +35,7 @@ from learning.gpu_sim.instances import (
     make_prepared_map_instance,
 )
 from learning.policy.model import build_policy
-from learning.policy.oracle import full_information_makespan
+from learning.policy.oracle import compute_oracle_makespan
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +43,9 @@ DEFAULT_RENDER_ROOT = PROJECT_ROOT / "cache" / "evaluation_render"
 DEFAULT_RENDER_DIR = DEFAULT_RENDER_ROOT / "frames"
 DEFAULT_OUTPUT_MP4 = DEFAULT_RENDER_ROOT / "render_result.mp4"
 DEFAULT_EVALUATION_DIR = PROJECT_ROOT / "outputs" / "evaluation"
+EVALUATION_POLICIES = (
+    "learned", "oracle", "scout-then-engage", "engage-while-scout",
+)
 
 
 def _resolve_checkpoint(path):
@@ -175,7 +178,7 @@ def _gpu_episode(model, config, env, truth, agents, device, terrain=None,
 
     if task_progress is not None:
         task_progress.initialize(env)
-    oracle_makespan = full_information_makespan(truth, agents)
+    oracle_makespan = compute_oracle_makespan(truth, agents)
     rollout = collect_tensor_episodes(
         model, state,
         TensorObservationBuilder(
@@ -205,7 +208,6 @@ def _tensor_rollout_record(rollout, index):
         "return": float(rollout.returns[index]),
         "makespan": float(rollout.makespans[index]),
         "oracle_makespan": float(rollout.oracle_makespans[index]),
-        "fi_opt_makespan": float(rollout.oracle_makespans[index]),
         "normalized_regret": float(rollout.normalized_regrets[index]),
         "completed": bool(rollout.completed[index]),
         "deaths": int(rollout.deaths[index]),
@@ -300,7 +302,7 @@ def _gpu_suite_records(model, config, cases, device, progress=None,
                     for capability in agent.capabilities:
                         capabilities[row, agent_index, capability] = True
             oracle_makespans = torch.tensor([
-                full_information_makespan(truth, agents) for agents in case_agents
+                compute_oracle_makespan(truth, agents) for agents in case_agents
             ], dtype=torch.float32, device=device)
             state = TensorEpisodeState.create(
                 world,
@@ -461,7 +463,7 @@ def _cpu_episode(model, config, env, truth, agents, device,
     adapter = LearnedPolicyAdapter(
         model, config.model.num_target_types, training=False,
         candidate_config=config.candidates, device=device)
-    oracle_makespan = full_information_makespan(truth, agents)
+    oracle_makespan = compute_oracle_makespan(truth, agents)
     if task_progress is not None:
         task_progress.initialize(env)
     rollout = collect_episode(
@@ -477,7 +479,6 @@ def _cpu_episode(model, config, env, truth, agents, device,
         "return": float(rollout.episode_return),
         "makespan": float(result["makespan"]),
         "oracle_makespan": float(oracle_makespan),
-        "fi_opt_makespan": float(oracle_makespan),
         "normalized_regret": float(result["normalized_regret"]),
         "completed": bool(result["completed"]),
         "deaths": int(result["num_deaths"]),
@@ -493,7 +494,7 @@ def _cpu_episode(model, config, env, truth, agents, device,
     return record
 
 
-class _PreserveFullInformationRoutes:
+class _PreserveOracleRoutes:
     """Simulator policy adapter for routes committed before time zero."""
 
     def __call__(self, _env_map, _agents, **_kwargs):
@@ -505,25 +506,25 @@ class _PreserveFullInformationRoutes:
 def _classical_episode(policy_name, config, env, truth, agents,
                        render_dir=None, render_dt=1.0,
                        frame_renderer=None, task_progress=None):
-    from planning.full_information import solve_full_information
-    from planning.policies.opt_by_part import OptByPartPolicy
-    from planning.policies.scout_then_execute import ScoutThenExecutePolicy
+    from planning.oracle import solve_oracle
+    from planning.policies.engage_while_scout import EngageWhileScoutPolicy
+    from planning.policies.scout_then_engage import ScoutThenEngagePolicy
     from simulation.engine import run_simulation
 
-    oracle_makespan = full_information_makespan(truth, agents)
+    oracle_makespan = compute_oracle_makespan(truth, agents)
     diagnostics = {}
-    if policy_name == "fi-opt":
+    if policy_name == "oracle":
         planning_start = perf_counter()
-        plan = solve_full_information(truth, agents)
+        plan = solve_oracle(truth, agents)
         planning_time_seconds = perf_counter() - planning_start
         if not plan.feasible:
             raise ValueError(plan.diagnostic.get(
-                "message", "FI-OPT evaluation instance is infeasible"))
+                "message", "oracle evaluation instance is infeasible"))
         for agent, path in zip(agents, plan.paths):
             agent.planned_path = list(path)
-        policy = _PreserveFullInformationRoutes()
+        policy = _PreserveOracleRoutes()
         diagnostics = {
-            "phase": "full_information",
+            "phase": "oracle",
             "predicted_makespan": plan.makespan,
             "assignments": [list(values) for values in plan.assignments],
             "target_orders": [list(values) for values in plan.target_orders],
@@ -531,23 +532,23 @@ def _classical_episode(policy_name, config, env, truth, agents,
             "per_agent_finish_times": list(plan.finish_times),
             "solver": dict(plan.diagnostic),
         }
-    elif policy_name == "scout-then-execute":
-        policy = ScoutThenExecutePolicy()
-    elif policy_name == "opt-by-part":
-        policy = OptByPartPolicy()
+    elif policy_name == "scout-then-engage":
+        policy = ScoutThenEngagePolicy()
+    elif policy_name == "engage-while-scout":
+        policy = EngageWhileScoutPolicy()
     else:
         raise ValueError(f"unknown classical policy: {policy_name}")
 
     if task_progress is not None:
-        task_progress.initialize(env, full_information=policy_name == "fi-opt")
+        task_progress.initialize(env, oracle=policy_name == "oracle")
     result = run_simulation(
         env, truth, agents, policy=policy,
         death_penalty=config.reinforce.death_penalty,
         render_dir=render_dir, render_dt=render_dt,
         frame_renderer=frame_renderer,
-        measure_policy_time=policy_name != "fi-opt",
+        measure_policy_time=policy_name != "oracle",
     )
-    if policy_name in {"scout-then-execute", "opt-by-part"}:
+    if policy_name in {"scout-then-engage", "engage-while-scout"}:
         diagnostics = dict(policy.diagnostics)
     normalized_regret = (
         result["makespan"] / oracle_makespan - 1.0
@@ -566,7 +567,6 @@ def _classical_episode(policy_name, config, env, truth, agents,
         "return": float(episode_return),
         "makespan": float(result["makespan"]),
         "oracle_makespan": float(oracle_makespan),
-        "fi_opt_makespan": float(oracle_makespan),
         "normalized_regret": float(normalized_regret),
         "completed": bool(result["completed"]),
         "deaths": int(result["num_deaths"]),
@@ -576,9 +576,9 @@ def _classical_episode(policy_name, config, env, truth, agents,
         "policy_diagnostics": diagnostics,
     }
     record.update(_planning_metrics(
-        planning_time_seconds if policy_name == "fi-opt"
+        planning_time_seconds if policy_name == "oracle"
         else result["policy_time_seconds"],
-        1 if policy_name == "fi-opt" else result["policy_calls"]))
+        1 if policy_name == "oracle" else result["policy_calls"]))
     if task_progress is not None:
         task_progress.consume_cpu_events(result["events"])
         record["task_progress"] = task_progress.finish(record["makespan"])
@@ -596,7 +596,6 @@ def _std(records, key):
 
 
 def _attach_case_metadata(record, suite, case):
-    record.setdefault("fi_opt_makespan", record["oracle_makespan"])
     record.update({
         "suite_id": suite.suite_id,
         "scenario_id": case.scenario_id,
@@ -638,7 +637,6 @@ def summarize(records):
         "mean_makespan": _mean(records, "makespan"),
         "makespan_std": _std(records, "makespan"),
         "mean_oracle_makespan": _mean(records, "oracle_makespan"),
-        "mean_fi_opt_makespan": _mean(records, "fi_opt_makespan"),
         "mean_normalized_regret": _mean(records, "normalized_regret"),
         "normalized_regret_std": _std(records, "normalized_regret"),
         "mean_deaths": _mean(records, "deaths"),
@@ -665,7 +663,7 @@ def evaluate(checkpoint=None, config_path=None, suite="development", seed=None,
              render_dt=1.0, policy="learned", episodes=1, progress=False,
              map_path=None, allow_map_mismatch=False,
              allow_feature_schema_mismatch=False, detailed=False):
-    if policy not in {"learned", "fi-opt", "scout-then-execute", "opt-by-part"}:
+    if policy not in EVALUATION_POLICIES:
         raise ValueError(f"unknown evaluation policy: {policy}")
     if episodes < 1:
         raise ValueError("episodes must be positive")
@@ -926,7 +924,7 @@ def main(argv=None, *, detailed=False, default_suite="development",
         help="timestamped checkpoint directory or weights file (learned policy only)")
     parser.add_argument(
         "--policy", default="learned",
-        choices=["learned", "fi-opt", "scout-then-execute", "opt-by-part"],
+        choices=EVALUATION_POLICIES,
         help="policy to evaluate; learned is the default")
     parser.add_argument(
         "--episodes", type=int, default=1,

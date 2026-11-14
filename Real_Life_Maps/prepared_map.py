@@ -157,12 +157,12 @@ def validate_prepared_map(payload: dict) -> tuple[nx.DiGraph, dict]:
 
 
 def load_prepared_map(path=DEFAULT_PREPARED_MAP_PATH) -> tuple[nx.DiGraph, dict]:
-    """Load a map produced by ``Real_Life_Maps.build_map``."""
+    """Load a bundled, precomputed simulator terrain map."""
     path = resolve_prepared_map_path(path)
     if not path.is_file():
         raise FileNotFoundError(
-            f"prepared terrain map not found: {path}. Build it with "
-            "`python -m Real_Life_Maps.build_map`."
+            f"prepared terrain map not found: {path}. Supply one of the "
+            "bundled WV, WA, or KTH artifacts with --map-path."
         )
     try:
         with gzip.open(path, "rb") as stream:

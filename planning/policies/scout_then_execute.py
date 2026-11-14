@@ -1,8 +1,8 @@
-"""Strict cooperative Scout-Then-Execute benchmark policy.
+"""Strict cooperative scout-then-engage benchmark policy.
 
 Every service-only agent waits while all scout-capable agents jointly minimize
 the time of the last target-type reveal.  Once no live target remains unknown,
-the policy commits to the exact executable full-information plan.
+the policy commits to the exact executable oracle plan.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import heapq
 import math
 from typing import Any, Hashable, Mapping, Sequence
 
-from planning.full_information import FullInformationPlan, solve_full_information
+from planning.oracle import OraclePlan, solve_oracle
 from planning.policies.scout_wrp import (
     DEFAULT_EXACT_TARGET_CAP,
     DEFAULT_SUBOPT_WEIGHT,
@@ -375,7 +375,7 @@ def solve_cooperative_scouting(
     )
 
 
-class ScoutThenExecutePolicy:
+class ScoutThenEngagePolicy:
     """Stateful strict two-phase benchmark compatible with ``run_simulation``."""
 
     replan_in_transit = True
@@ -399,7 +399,7 @@ class ScoutThenExecutePolicy:
         self._roster_ids: tuple[int, ...] | None = None
         self._scout_plan: ScoutCoveragePlan | None = None
         self._scout_plan_key = None
-        self._fi_plan: FullInformationPlan | None = None
+        self._oracle_plan: OraclePlan | None = None
 
     def set_runtime_state(self, agents, transit, clock):
         roster_ids = tuple(id(agent) for agent in agents)
@@ -515,28 +515,28 @@ class ScoutThenExecutePolicy:
                 starts.append(destination)
                 releases.append(max(0.0, float(arrival) - self._clock))
 
-        self._fi_plan = solve_full_information(
+        self._oracle_plan = solve_oracle(
             env_map, living, start_nodes=starts, release_times=releases
         )
         self.diagnostics.update({
             "phase": self.phase,
             "scouting_completion_time": self._clock,
             "scout_executed_routes": scouting_routes,
-            "execution_makespan_estimate": self._fi_plan.makespan,
-            "execution_exact": self._fi_plan.exact,
-            "predicted_makespan": self._clock + self._fi_plan.makespan,
-            "full_information": dict(self._fi_plan.diagnostic),
-            "fi_assignments": [list(values) for values in self._fi_plan.assignments],
-            "fi_target_orders": [list(values) for values in self._fi_plan.target_orders],
-            "fi_paths": [list(path) for path in self._fi_plan.paths],
+            "execution_makespan_estimate": self._oracle_plan.makespan,
+            "execution_exact": self._oracle_plan.exact,
+            "predicted_makespan": self._clock + self._oracle_plan.makespan,
+            "oracle": dict(self._oracle_plan.diagnostic),
+            "oracle_assignments": [list(values) for values in self._oracle_plan.assignments],
+            "oracle_target_orders": [list(values) for values in self._oracle_plan.target_orders],
+            "oracle_paths": [list(path) for path in self._oracle_plan.paths],
         })
-        if not self._fi_plan.feasible:
+        if not self._oracle_plan.feasible:
             self._mark_infeasible(
-                self._fi_plan.diagnostic.get("message", "execution is infeasible"),
-                self._fi_plan.diagnostic,
+                self._oracle_plan.diagnostic.get("message", "execution is infeasible"),
+                self._oracle_plan.diagnostic,
             )
             return
-        for agent, path in zip(living, self._fi_plan.paths):
+        for agent, path in zip(living, self._oracle_plan.paths):
             agent.planned_path = list(path)
 
     def __call__(self, env_map, agents, **_kwargs):
@@ -570,13 +570,13 @@ class ScoutThenExecutePolicy:
                     self._begin_scouting(env_map)
 
 
-def make_policy(**kwargs) -> ScoutThenExecutePolicy:
-    return ScoutThenExecutePolicy(**kwargs)
+def make_policy(**kwargs) -> ScoutThenEngagePolicy:
+    return ScoutThenEngagePolicy(**kwargs)
 
 
 __all__ = [
     "ScoutCoveragePlan",
-    "ScoutThenExecutePolicy",
+    "ScoutThenEngagePolicy",
     "make_policy",
     "solve_cooperative_scouting",
 ]

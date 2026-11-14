@@ -1,4 +1,4 @@
-"""Baseline 2: WRP scouting followed by capability-aware target service.
+"""Watchman routing helper: WRP scouting followed by capability-aware target service.
 
 The scout plans the PROVABLY OPTIMAL covering walk by heuristic search over
 coverage-augmented states, in the style of the Watchman Route Problem on
@@ -59,10 +59,10 @@ reveal / blockage / plan deviation; the scout publishes
 ``scout.reveal_schedule`` ({target: time-from-now}) and
 ``scout.unscoutable`` (targets with no reachable witness cell).
 
-    from planning.policies import baseline2
+    from planning.policies import watchman_routing
     from simulation.engine import run_simulation
-    run_simulation(env_map, ground_truth, agents, policy=baseline2.replan)
-    pol = baseline2.make_policy(
+    run_simulation(env_map, ground_truth, agents, policy=watchman_routing.replan)
+    pol = watchman_routing.make_policy(
         exact_target_cap=12, suboptimal_weight=1.5)
 """
 
@@ -72,7 +72,7 @@ import math
 
 from simulation.domain import UNKNOWN_TYPE, capability_label
 from simulation.visibility import visible_targets
-from planning.policies.baseline1 import _route_attacker
+from planning.policies.independent_routing import _route_attacker
 
 INF = float("inf")
 
@@ -711,9 +711,9 @@ def make_policy(exact_target_cap=DEFAULT_EXACT_TARGET_CAP,
 
     attacker_mode:
       "ptsp"      -- route/hedge/gamble attacker layer (default).
-      "baseline1" -- baseline1's greedy attackers (ablation reference).
+      "independent_routing" -- independent_routing's greedy attackers (ablation reference).
     """
-    if attacker_mode not in ("ptsp", "baseline1"):
+    if attacker_mode not in ("ptsp", "independent_routing"):
         raise ValueError(f"unknown attacker_mode {attacker_mode!r}")
     state = {}   # shared belief, roster, claims, and scout phase
 
@@ -784,7 +784,7 @@ def make_policy(exact_target_cap=DEFAULT_EXACT_TARGET_CAP,
         ]
         if not attackers or not live_targets:
             return
-        if attacker_mode == "baseline1":
+        if attacker_mode == "independent_routing":
             for a in attackers:
                 a.planned_path = []
                 _route_attacker(env_map, a, live_targets, live_set, verbose)
@@ -792,7 +792,7 @@ def make_policy(exact_target_cap=DEFAULT_EXACT_TARGET_CAP,
         _plan_attackers_ptsp(env_map, attackers, live_targets, live_set,
                              unknown_live, state, hedge_tau, verbose)
 
-    replan.__name__ = "baseline2_wrp_replan"
+    replan.__name__ = "watchman_routing_wrp_replan"
     replan.hyperparameters = {
         "exact_target_cap": exact_target_cap,
         "suboptimal_weight": suboptimal_weight,

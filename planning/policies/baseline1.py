@@ -1,4 +1,4 @@
-"""Baseline 1: independent nearest-target routing with a static scout vantage.
+"""Independent routing helper: independent nearest-target routing with a static scout vantage.
 
 This deliberately simple baseline makes no joint assignment and does not wait
 for information before taking risk.
@@ -25,14 +25,14 @@ Hybrid agents
 -------------
 Agents with capability ``0`` plus positive target capabilities follow the
 service-agent rule. Their scouting capability still applies automatically at
-every node they visit, but baseline 1 does not plan a dedicated scouting tour
+every node they visit, but independent routing does not plan a dedicated scouting tour
 for them.
 
 Usage::
 
-    from planning.policies import baseline1
+    from planning.policies import independent_routing
     from simulation.engine import run_simulation
-    run_simulation(env_map, ground_truth, agents, policy=baseline1.replan)
+    run_simulation(env_map, ground_truth, agents, policy=independent_routing.replan)
 """
 
 import networkx as nx
@@ -125,7 +125,7 @@ def _route_attacker(env_map, agent, live_targets, live_set, verbose):
 
         agent.planned_path = best_path  # walk all the way onto the target
         if verbose:
-            print(f"  [b1] {capability_label(agent.capabilities)} @ {agent.position} "
+            print(f"  [independent] {capability_label(agent.capabilities)} @ {agent.position} "
                   f"-> engage {cat} target {best_t} (cost {best_cost:.2f})")
         return
     # no reachable target in any category -> idle
@@ -139,7 +139,7 @@ def _route_scout(env_map, scout, tallest, live_set, verbose):
     if path is not None and len(path) >= 2:
         scout.planned_path = path
         if verbose:
-            print(f"  [b1] scout @ {scout.position} -> tallest point {tallest} "
+            print(f"  [independent] scout @ {scout.position} -> tallest point {tallest} "
                   f"(h={env_map.nodes[tallest].get('height')})")
 
 
@@ -150,7 +150,7 @@ def _route_scout(env_map, scout, tallest, live_set, verbose):
 def replan(env_map: nx.Graph, agents, reward_ratio=1.0, obs_discount_factor=1.0,
            sample_recursion=0, sample_num_obstacle=0, sample_obstacle_hop=0,
            verbose=False):
-    """Assign every living agent a planned_path under the baseline-1 rules.
+    """Assign every living agent a planned_path under the independent routing rules.
 
     The reward / sampling kwargs are accepted for interface compatibility with
     reward-driven policies but ignored -- this baseline scores by distance.
@@ -165,7 +165,7 @@ def replan(env_map: nx.Graph, agents, reward_ratio=1.0, obs_discount_factor=1.0,
 
     if verbose:
         print("=" * 60)
-        print("baseline1 replan "
+        print("independent_routing replan "
               "(agent: supported>unknown>unsupported; pure scout: tallest)")
 
     for agent in agents:

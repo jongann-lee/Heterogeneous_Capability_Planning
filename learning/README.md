@@ -8,9 +8,9 @@ autoregressive joint assignment:
   edge-conditioned heterogeneous GNN over agent, target, and action nodes.
   Its graph critic is implemented but currently disabled in the default
   configuration, so training uses the scalar EMA REINFORCE baseline.
-- `transformer` is the original set-attention control architecture. Its
-  preserved configuration is `learning/config_transformer.yaml`; it retains
-  the scalar EMA REINFORCE baseline for checkpoint compatibility.
+- `transformer` is the original set-attention control architecture, retained
+  for regression tests and checkpoint compatibility. Select it through
+  `model.architecture`; it uses a scalar EMA REINFORCE baseline.
 
 Set `model.architecture` in a configuration file to select the implementation.
 The task graph is not the terrain graph: routing, visibility, candidate
@@ -29,8 +29,8 @@ and pair minimax locations are computed once per sampled target layout; replans
 only filter that scenario cache using the current live/known target beliefs.
 
 Staging ablations use the existing candidate switches. For single-target
-staging only, set `staging_per_target: 2` and `include_pair_staging: false`
-(the current config). To disable all staging, set `staging_per_target: 0` and
+staging only, set `staging_per_target: 2` and `include_pair_staging: false`.
+To disable all staging, set `staging_per_target: 0` and
 keep `include_pair_staging: false`. A zero single-target count alone does not
 disable pair staging. Target, observation, and wait actions remain available
 according to their existing settings. CPU and tensor candidate generation
@@ -68,7 +68,7 @@ and standard deviation over all finite, reachable agent-target, agent-action,
 and action-target edges in that episode. CUDA batches compute those statistics
 independently per episode. Wait, unreachable, and padded relations are excluded.
 The normalization changes neural features only; terrain edges, routing,
-makespan, FI-OPT, and reports continue to use real seconds.
+makespan, the oracle, and reports continue to use real seconds.
 
 The third mode, `model.edge_normalization: per_decision_max`, divides the same
 three edge families and remaining transit times by the largest valid travel
@@ -81,9 +81,9 @@ For the no-normalization task-graph ablation, `edge_normalization: none`
 passes raw traversal times and remaining transit times directly to the neural
 encoders, without centering or scaling. The saved
 normalization identity prevents silently evaluating weights with another mode.
-The current config uses `per_decision_zscore` for the single-target staging
-ablation. Select `none` or `per_decision_max` in `learning/config.yaml` for the
-other normalization ablations.
+The current config uses `per_decision_max` with single-target and pair staging.
+Select `none` or `per_decision_zscore` for normalization ablations. Evaluation
+normally uses the checkpoint's saved config, including its normalization mode.
 
 `model.decoder_mode` selects the task-graph scoring head: `mlp` (the default)
 or `dot_product`, which uses the agent/candidate dot product divided by
@@ -139,9 +139,9 @@ position input uses normalized coordinates; it receives no heights or ground
 truth.
 
 Training returns are normalized against
-`planning.full_information.full_information_makespan`, the exact FI-OPT
+`planning.oracle.compute_oracle_makespan`, the exact oracle
 heterogeneous min-max open-route result. Unlike the retired optimistic metric
-closure, FI-OPT returns executable target-aware routes: crossing a supported
+closure, the oracle returns executable target-aware routes: crossing a supported
 live target records it in that agent's assignment, while targets outside the
 assignment cannot be transit nodes. The logged `normalized_regret` is
 `makespan / oracle_makespan - 1`; zero matches the oracle. Death and incomplete
@@ -155,14 +155,14 @@ but `instances.map_path` or `--map-path` may select another artifact size:
 ```bash
 uv run python -m learning.train --episodes 100
 uv run python -m learning.train --config learning/config.yaml
-uv run python -m learning.train --config learning/config_transformer.yaml
 uv run python -m learning.train \
   --map-path Real_Life_Maps/WV_tobler_viewshed_64.pkl.gz
 uv run python -m learning.test learning/checkpoints/<run-timestamp> --device cuda
 uv run python -m learning.test learning/checkpoints/<run-timestamp> \
   --map-path Real_Life_Maps/WV_tobler_viewshed_64.pkl.gz --device cuda
-uv run python -m learning.test --policy fi-opt --suite test
-uv run python -m learning.test --policy scout-then-execute --suite test
+uv run python -m learning.test --policy oracle --suite test
+uv run python -m learning.test --policy scout-then-engage --suite test
+uv run python -m learning.test --policy engage-while-scout --suite test
 uv run python -m learning.test learning/checkpoints/<run-timestamp> \
   --suite test --output outputs/evaluation/<checkpoint-name>.json
 uv run python -m learning.analyze outputs/evaluation/<checkpoint-name>.json
@@ -172,11 +172,13 @@ uv run python -m learning.test learning/checkpoints/<run-timestamp> \
 ```
 
 Evaluation always uses a validated fixed suite. `learned` is the default policy
-and requires the positional checkpoint; `fi-opt` and `scout-then-execute` do
-not load model weights and currently execute in the CPU simulator. FI-OPT knows
-all target types at time zero. Scout-Then-Execute jointly routes every living
+and requires the positional checkpoint; the three classical policies do
+not load model weights and currently execute in the CPU simulator. The `oracle`
+knows all target types at time zero. `scout-then-engage` jointly routes every living
 scout-capable agent, forces all service-only agents to wait for the last reveal,
-and then invokes the same FI-OPT solver. `--episodes N` repeats each selected
+and then invokes the same oracle solver. `engage-while-scout` scouts and executes
+known tasks concurrently, assigning hybrids using the capability gap.
+`--episodes N` repeats each selected
 case with consecutive recorded seeds. The default
 `development` alias resolves to the original single RPS scenario in
 `learning/evaluation_suites/wv_rps_fixed_v1.json`. The `test` alias resolves to
@@ -202,9 +204,10 @@ three eight-agent profiles crossed with three fourteen-target layouts, using
 five target types and source `(43, 77)`. `agents_08_a` mixes specialist and
 multi-type service agents with two scout-capable agents. `agents_08_b` has
 three scout-service hybrids and five dual-type workers. `agents_08_c` has
-four scout-service hybrids and four dual-type workers. Every team has exactly
-two capabilities per agent on average (including scouting capability `0`),
-and every service type is supported by at least two agents. The suite ID is
+one pure scout, three scout-service hybrids, and four service-only agents.
+The first two teams have 16 capabilities each, and the scout-redundant team has
+15, including scouting capability `0`. Every service type is supported by at
+least two agents. The suite ID is
 `kth_indoor_big_factorial_v2` to distinguish these cases from the earlier
 five-agent results.
 
@@ -240,7 +243,7 @@ targets). Explicit agent/target filters replace these defaults; selecting a
 different suite disables the default filters.
 
 ```bash
-uv run python -m learning.test_single_detailed --policy scout-then-execute
+uv run python -m learning.test_single_detailed --policy scout-then-engage
 uv run python -m learning.test_single_detailed learning/checkpoints/<run-timestamp> \
   --allow-map-mismatch --device cuda
 ```
@@ -258,8 +261,8 @@ source observations at time zero, and extend to the final makespan even on
 an incomplete run. Times use the prepared map's traversal units, not wall time.
 
 `scouted_count` counts tasks first revealed by scout sensing. `discovered_count`
-also includes types learned by contact or known initially. FI-OPT knows all
-types at time zero (`source: full_information`), which is not counted as
+also includes types learned by contact or known initially. The `oracle` knows all
+types at time zero (`source: oracle`), which is not counted as
 scouting. A contact discovery and completion may share a timestamp. The learned
 CUDA path records task transitions directly from tensor state; learned CPU and
 classical policies use the event-driven simulator's event log. Recording does
@@ -320,13 +323,6 @@ Neither path depends on Gym or another RL framework.
 Although this change preserves model tensor dimensions, checkpoints trained
 before semantic staging and physical-location decoding should be treated as a
 different policy version and retrained for performance comparisons.
-
-Fast checks:
-
-```bash
-uv run python -m tests.test_learning
-uv run python -m tests.test_simulation
-```
 
 ## Synchronizing with DeltaAI
 

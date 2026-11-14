@@ -1,4 +1,4 @@
-"""Exact full-information heterogeneous makespan planning.
+"""Exact oracle heterogeneous makespan planning.
 
 Routes are executable in the simulator. Search states are physical nodes plus
 the exact mask of targets already serviced, so every supported target crossed
@@ -23,16 +23,16 @@ Node = Hashable
 _EPS = 1.0e-12
 
 
-class FullInformationInfeasibleError(ValueError):
+class OracleInfeasibleError(ValueError):
     """Raised by the scalar interface when no executable plan exists."""
 
     def __init__(self, diagnostic: Mapping[str, Any]):
         self.diagnostic = dict(diagnostic)
-        super().__init__(self.diagnostic.get("message", "full-information problem is infeasible"))
+        super().__init__(self.diagnostic.get("message", "oracle problem is infeasible"))
 
 
 @dataclass(frozen=True)
-class FullInformationPlan:
+class OraclePlan:
     """An exact plan and the evidence needed to execute or inspect it."""
 
     feasible: bool
@@ -43,10 +43,6 @@ class FullInformationPlan:
     finish_times: tuple[float, ...]
     diagnostic: Mapping[str, Any]
     exact: bool = True
-
-
-# Descriptive compatibility name used by the public-interface documentation.
-OraclePlan = FullInformationPlan
 
 
 @dataclass
@@ -71,7 +67,7 @@ def _target_type(graph: nx.Graph, node: Node) -> int:
     value = graph.nodes[node].get("rps_type")
     if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
         raise ValueError(
-            f"full-information target {node!r} needs a known positive integer "
+            f"oracle target {node!r} needs a known positive integer "
             f"rps_type, got {value!r}"
         )
     return int(value)
@@ -199,8 +195,8 @@ def _infeasible_plan(
     starts: Sequence[Node],
     releases: Sequence[float],
     diagnostic: Mapping[str, Any],
-) -> FullInformationPlan:
-    return FullInformationPlan(
+) -> OraclePlan:
+    return OraclePlan(
         feasible=False,
         makespan=math.inf,
         assignments=tuple(() for _ in range(agent_count)),
@@ -218,7 +214,7 @@ def _solve(
     start_nodes: Sequence[Node] | None,
     release_times: Sequence[float] | None,
     reconstruct: bool,
-) -> FullInformationPlan:
+) -> OraclePlan:
     agents = tuple(agents)
     starts = tuple(start_nodes) if start_nodes is not None else tuple(
         agent.position for agent in agents
@@ -239,7 +235,7 @@ def _solve(
     _validate_edge_weights(graph)
     targets = _live_targets(graph)
     if not targets:
-        return FullInformationPlan(
+        return OraclePlan(
             feasible=True,
             makespan=0.0,
             assignments=tuple(() for _ in agents),
@@ -384,7 +380,7 @@ def _solve(
         travel = options[agent_index].costs[subset]
         finish_times.append(releases[agent_index] + (travel if subset else 0.0))
 
-    return FullInformationPlan(
+    return OraclePlan(
         feasible=True,
         makespan=dp[full_mask],
         assignments=tuple(assignments),
@@ -392,20 +388,20 @@ def _solve(
         paths=tuple(paths),
         finish_times=tuple(finish_times),
         diagnostic={
-            "message": "optimal executable full-information plan",
+            "message": "optimal executable oracle plan",
             "target_count": len(targets),
             "scope": "no route crosses a live target outside its assignment",
         },
     )
 
 
-def solve_full_information(
+def solve_oracle(
     graph: nx.Graph,
     agents: Sequence[Any],
     *,
     start_nodes: Sequence[Node] | None = None,
     release_times: Sequence[float] | None = None,
-) -> FullInformationPlan:
+) -> OraclePlan:
     """Return an exact heterogeneous min--max plan with physical routes."""
 
     return _solve(
@@ -414,7 +410,7 @@ def solve_full_information(
     )
 
 
-def full_information_makespan(
+def compute_oracle_makespan(
     graph: nx.Graph,
     agents: Sequence[Any],
     *,
@@ -428,14 +424,13 @@ def full_information_makespan(
         reconstruct=False,
     )
     if not plan.feasible:
-        raise FullInformationInfeasibleError(plan.diagnostic)
+        raise OracleInfeasibleError(plan.diagnostic)
     return plan.makespan
 
 
 __all__ = [
-    "FullInformationInfeasibleError",
-    "FullInformationPlan",
+    "OracleInfeasibleError",
     "OraclePlan",
-    "full_information_makespan",
-    "solve_full_information",
+    "compute_oracle_makespan",
+    "solve_oracle",
 ]
